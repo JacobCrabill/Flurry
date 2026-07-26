@@ -22,10 +22,11 @@ pub fn Matrix(T: type) type {
                 .stride = stride,
                 .data = try gpa.alloc(T, rows * stride), // TODO: allocAligned needed?
             };
-            @memset(mat.data, 0.0);
+            @memset(mat.data, @as(T, 0));
             return mat;
         }
 
+        /// Free the data and clear the dimensions
         pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
             self.rows = 0;
             self.cols = 0;

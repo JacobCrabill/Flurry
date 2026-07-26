@@ -1,0 +1,11 @@
+*~
+*.swp
+*.o
+*.so
+*.a
+zig-out/
+.zig-cache/
+zig-pkg/
+.ccls-cache/
+docs/
+.worktrees/

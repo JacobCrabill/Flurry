@@ -1,11 +1,19 @@
+# Zig build system
+zig-out/
+zig-pkg/
+.zig-cache/
+
+# LSP
+.ccls-cache/
+
+# Misc. compiler artifacts
 *~
 *.swp
 *.o
 *.so
 *.a
-zig-out/
-.zig-cache/
-zig-pkg/
-.ccls-cache/
-docs/
+
+# Typical temporary/staging dirs
+tmp/
 .worktrees/
+

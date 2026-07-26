@@ -4,11 +4,27 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ------ Dependencies ------
+
+    // Spock
+    const gen_vk = b.option(bool, "gen-vk", "Regenerate vulkan-zig bindings from the registry instead of using the vendored src/vulkan/vk.zig") orelse false;
+    const vk_registry = b.option([]const u8, "vk-registry", "Path to the Vulkan registry (vk.xml) used by -Dgen-vk") orelse "/usr/share/vulkan/registry/vk.xml";
+    const spock = b.dependency("spock", .{
+        .target = target,
+        .optimize = optimize,
+        .@"gen-vk" = gen_vk,
+        .@"vk-registry" = vk_registry,
+    });
+
     // ------ Core Library ------
 
     const mod = b.addModule("zfd", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/lib/zfd.zig"),
         .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "spock", .module = spock.module("spock") },
+        },
     });
 
     // ------ Executable ------

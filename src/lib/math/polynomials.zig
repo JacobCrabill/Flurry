@@ -13,7 +13,7 @@ pub fn Legendre(P: u32, xi: f64) f64 {
 }
 
 /// 1D Legendre polynomial derivative
-pub fn Legendre_d1(P: u32, xi: f64) f64 {
+pub fn dLegendre(P: u32, xi: f64) f64 {
     if (P == 0) {
         return 0.0;
     } else if (P == 1) {
@@ -21,7 +21,66 @@ pub fn Legendre_d1(P: u32, xi: f64) f64 {
     }
 
     const p: f64 = @floatFromInt(P);
-    return ((2.0 * p - 1.0) / p) * (Legendre(P - 1, xi) + xi * Legendre_d1(P - 1, xi)) - ((p - 1.0) / p) * Legendre_d1(P - 2, xi);
+    return ((2.0 * p - 1.0) / p) * (Legendre(P - 1, xi) + xi * dLegendre(P - 1, xi)) - ((p - 1.0) / p) * dLegendre(P - 2, xi);
+}
+
+/// 2D Legendre polynomial
+pub fn Legendre2D(P: u32, xi: f64, eta: f64, mode: u32) f64 {
+    var val: f64 = undefined;
+    const nModes: u32 = (P + 1) * (P + 1);
+    if (mode >= nModes)
+        @panic("ERROR: mode value is too high for given P!");
+
+    var m: u32 = 0;
+
+    for (0..2 * P + 1) |k| {
+        for (0..k + 1) |j| {
+            const i: u32 = @intCast(k - j);
+            if (i <= P and j <= P) { // Order would be (0,2) (1,1) (2,0) ... any hierarchical ordering is fine
+                if (m == mode) { // found the correct mode
+                    const fi: f64 = @floatFromInt(i);
+                    const fj: f64 = @floatFromInt(j);
+                    const normCi: f64 = @sqrt(2.0 / (2.0 * fi + 1.0));
+                    const normCj: f64 = @sqrt(2.0 / (2.0 * fj + 1.0));
+                    val = Legendre(i, xi) * Legendre(@intCast(j), eta) / (normCi * normCj);
+                }
+                m += 1;
+            }
+        }
+    }
+
+    return val;
+}
+
+/// 3D Legendre polynomial
+pub fn Legendre3D(P: u32, xi: f64, eta: f64, mu: f64, mode: u32) f64 {
+    var val: f64 = undefined;
+    const nModes: u32 = (P + 1) * (P + 1) * (P + 1);
+    if (mode >= nModes)
+        @panic("ERROR: mode value is too high for given P!");
+
+    var m: u32 = 0;
+    for (0..3 * P + 1) |l| {
+        for (0..l + 1) |k| {
+            for (0..l - k + 1) |j| {
+                const i: u32 = @intCast(l - k - j);
+                if (i <= P and j <= P and k <= P) {
+                    if (m == mode) { // found the correct mode
+                        const fi: f64 = @floatFromInt(i);
+                        const fj: f64 = @floatFromInt(j);
+                        const fk: f64 = @floatFromInt(k);
+                        const normCi: f64 = @sqrt(2.0 / (2.0 * fi + 1.0));
+                        const normCj: f64 = @sqrt(2.0 / (2.0 * fj + 1.0));
+                        const normCk: f64 = @sqrt(2.0 / (2.0 * fk + 1.0));
+                        val = Legendre(i, xi) * Legendre(@intCast(j), eta) * Legendre(@intCast(k), mu) / (normCi * normCj * normCk);
+                    }
+                    m += 1;
+                }
+            }
+        }
+    }
+
+    return val;
 }
 
 /// Jacobi polynomial evaluatoin
@@ -50,37 +109,35 @@ pub fn Jacobi(xi: f64, a: f64, b: f64, mode: u32) f64 {
 
         val = 0.5 * @sqrt(d[0] * (d[1] / d[2])) * @sqrt(d[3] / d[4]) * d[5];
     } else {
-        var d: [15]f64 = undefined;
+        var d: [14]f64 = undefined;
         const m: f64 = @floatFromInt(mode);
 
         d[0] = m * (m + a + b) * (m + a) * (m + b);
         d[1] = ((2 * m) + a + b - 1) * ((2 * m) + a + b + 1);
-        // d[2] is intentionally unused here; the original declared `d2` in this
-        // branch but never assigned or read it.
-        d[3] = (2 * m) + a + b;
+        d[2] = (2 * m) + a + b;
 
-        d[4] = (m - 1) * ((m - 1) + a + b) * ((m - 1) + a) * ((m - 1) + b);
-        d[5] = ((2 * (m - 1)) + a + b - 1) * ((2 * (m - 1)) + a + b + 1);
-        d[6] = (2 * (m - 1)) + a + b;
+        d[3] = (m - 1) * ((m - 1) + a + b) * ((m - 1) + a) * ((m - 1) + b);
+        d[4] = ((2 * (m - 1)) + a + b - 1) * ((2 * (m - 1)) + a + b + 1);
+        d[5] = (2 * (m - 1)) + a + b;
 
-        d[7] = -((a * a) - (b * b));
-        d[8] = ((2 * (m - 1)) + a + b) * ((2 * (m - 1)) + a + b + 2);
+        d[6] = -((a * a) - (b * b));
+        d[7] = ((2 * (m - 1)) + a + b) * ((2 * (m - 1)) + a + b + 2);
 
-        d[9] = (2.0 / d[3]) * @sqrt(d[0] / d[1]);
-        d[10] = (2.0 / d[6]) * @sqrt(d[4] / d[5]);
-        d[11] = d[7] / d[8];
+        d[8] = (2.0 / d[2]) * @sqrt(d[0] / d[1]);
+        d[9] = (2.0 / d[5]) * @sqrt(d[3] / d[4]);
+        d[10] = d[6] / d[7];
 
-        d[12] = xi * Jacobi(xi, a, b, mode - 1);
-        d[13] = d[10] * Jacobi(xi, a, b, mode - 2);
-        d[14] = d[11] * Jacobi(xi, a, b, mode - 1);
+        d[11] = xi * Jacobi(xi, a, b, mode - 1);
+        d[12] = d[9] * Jacobi(xi, a, b, mode - 2);
+        d[13] = d[10] * Jacobi(xi, a, b, mode - 1);
 
-        val = (1.0 / d[9]) * (d[12] - d[13] - d[14]);
+        val = (1.0 / d[8]) * (d[11] - d[12] - d[13]);
     }
 
     return val;
 }
 
-/// 1D Jacobi
+/// 1D Jacobi derivative
 pub fn dJacobi(xi: f64, a: f64, b: f64, mode: u32) f64 {
     if (mode == 0)
         return 0.0;
@@ -493,59 +550,42 @@ pub fn divRTMonomial3D(P: u32, xi: f64, eta: f64, zeta: f64, mode: u32) f64 {
     return 0.0;
 }
 
-pub fn Legendre2D(P: u32, xi: f64, eta: f64, mode: u32) f64 {
-    var val: f64 = undefined;
-    const nModes: u32 = (P + 1) * (P + 1);
-    if (mode >= nModes)
-        @panic("ERROR: mode value is too high for given P!");
-
-    var m: u32 = 0;
-
-    for (0..2 * P + 1) |k| {
-        for (0..k + 1) |j| {
-            const i: u32 = @intCast(k - j);
-            if (i <= P and j <= P) { // Order would be (0,2) (1,1) (2,0) ... any hierarchical ordering is fine
-                if (m == mode) { // found the correct mode
-                    const fi: f64 = @floatFromInt(i);
-                    const fj: f64 = @floatFromInt(j);
-                    const normCi: f64 = @sqrt(2.0 / (2.0 * fi + 1.0));
-                    const normCj: f64 = @sqrt(2.0 / (2.0 * fj + 1.0));
-                    val = Legendre(i, xi) * Legendre(@intCast(j), eta) / (normCi * normCj);
-                }
-                m += 1;
-            }
-        }
+/// VCJH correction functdion (1D)
+pub fn Vcjh(xi: f64, mode: u32, order: u32, eta: f64) f64 {
+    if (mode == 0) {
+        // Left correction function
+        return std.math.pow(-1.0, order) / 2.0 * (Legendre(xi, order) -
+            (eta * Legendre(xi, order - 1) + Legendre(xi, order + 1)) / (1.0 + eta));
+    } else {
+        // Right correction function
+        return 0.5 * (Legendre(xi, order) + (eta * Legendre(xi, order - 1) + Legendre(xi, order + 1))) /
+            (1 + eta);
     }
-
-    return val;
 }
 
-pub fn Legendre3D(P: u32, xi: f64, eta: f64, mu: f64, mode: u32) f64 {
-    var val: f64 = undefined;
-    const nModes: u32 = (P + 1) * (P + 1) * (P + 1);
-    if (mode >= nModes)
-        @panic("ERROR: mode value is too high for given P!");
-
-    var m: u32 = 0;
-    for (0..3 * P + 1) |l| {
-        for (0..l + 1) |k| {
-            for (0..l - k + 1) |j| {
-                const i: u32 = @intCast(l - k - j);
-                if (i <= P and j <= P and k <= P) {
-                    if (m == mode) { // found the correct mode
-                        const fi: f64 = @floatFromInt(i);
-                        const fj: f64 = @floatFromInt(j);
-                        const fk: f64 = @floatFromInt(k);
-                        const normCi: f64 = @sqrt(2.0 / (2.0 * fi + 1.0));
-                        const normCj: f64 = @sqrt(2.0 / (2.0 * fj + 1.0));
-                        const normCk: f64 = @sqrt(2.0 / (2.0 * fk + 1.0));
-                        val = Legendre(i, xi) * Legendre(@intCast(j), eta) * Legendre(@intCast(k), mu) / (normCi * normCj * normCk);
-                    }
-                    m += 1;
-                }
-            }
+/// Derivative of the VCJH correction functdion (1D)
+pub fn dVcjh(in_r: f64, in_mode: u32, in_order: u32, in_eta: f64) f64 {
+    if (in_mode == 0) {
+        // Left correction function
+        if (in_order == 0) {
+            return 0.5 * std.math.pow(-1.0, in_order) *
+                (dLegendre(in_r, in_order) - ((dLegendre(in_r, in_order + 1)) / (1.0 + in_eta)));
+        } else {
+            return 0.5 * std.math.pow(-1.0, in_order) * (dLegendre(in_r, in_order) -
+                (((in_eta * dLegendre(in_r, in_order - 1)) + dLegendre(in_r, in_order + 1)) /
+                    (1.0 + in_eta)));
+        }
+    } else if (in_mode == 1) {
+        // Right correction function
+        if (in_order == 0) {
+            return 0.5 *
+                (dLegendre(in_r, in_order) + ((dLegendre(in_r, in_order + 1)) / (1.0 + in_eta)));
+        } else {
+            return 0.5 * (dLegendre(in_r, in_order) +
+                (((in_eta * dLegendre(in_r, in_order - 1)) + dLegendre(in_r, in_order + 1)) /
+                    (1.0 + in_eta)));
         }
     }
 
-    return val;
+    return 0.0;
 }

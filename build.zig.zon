@@ -1,6 +1,6 @@
 .{
-    .name = .zfd,
-    .fingerprint = 0xdf5f5df4285e66f4,
+    .name = .flurry,
+    .fingerprint = 0xce9e9d4c916a44a,
     .version = "0.0.0",
     .minimum_zig_version = "0.17.0-dev.1454+5faa79730",
     .dependencies = .{

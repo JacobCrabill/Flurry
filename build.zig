@@ -18,8 +18,8 @@ pub fn build(b: *std.Build) void {
 
     // ------ Core Library ------
 
-    const mod = b.addModule("zfd", .{
-        .root_source_file = b.path("src/lib/zfd.zig"),
+    const mod = b.addModule("flurry", .{
+        .root_source_file = b.path("src/lib/flurry.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -30,13 +30,13 @@ pub fn build(b: *std.Build) void {
     // ------ Executable ------
 
     const exe = b.addExecutable(.{
-        .name = "zfd",
+        .name = "flurry",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zfd", .module = mod },
+                .{ .name = "flurry", .module = mod },
             },
         }),
     });

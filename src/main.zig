@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const zfd = @import("zfd");
+const flurry = @import("flurry");
 
 pub fn main(init: std.process.Init) !void {
     _ = init;

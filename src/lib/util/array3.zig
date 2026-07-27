@@ -1,5 +1,11 @@
 const std = @import("std");
 
+pub const Array3d = Array3(f64);
+pub const Array3f = Array3(f32);
+pub const Array3u = Array3(u32);
+pub const Array3i = Array3(i32);
+pub const Array3z = Array3(usize);
+
 /// Simple template for a 3D row-major array
 pub fn Array3(T: type) type {
     return struct {

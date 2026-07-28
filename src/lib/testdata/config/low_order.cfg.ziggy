@@ -1,0 +1,87 @@
+.{
+  .core = .{
+      .n_dims = 2,
+      .mesh_file = "x.mesh",
+      .order = 1,
+  },
+
+  .equation = .{
+      .equation = .euler_ns,
+  },
+
+  .time = .{
+      .dt_scheme = .rk44,
+      .n_steps = 100,
+  },
+
+  .multigrid = .{
+      .mg_levels = [2],
+      .mg_steps = [4],
+  },
+
+  .output = .{
+      .output_prefix = "out",
+      .write_freq = 100,
+      .report_freq = 50,
+  },
+
+  .test_case = .{
+      .test_case = 0,
+      .err_field = 0,
+      .n_qpts_1d = 5,
+  },
+
+  .flux = .{
+      .fconv_type = .rusanov,
+      .fvisc_type = .ldg,
+      .rus_k = 0.0,
+      .ldg_b = 0.5,
+      .ldg_tau = 1.0,
+      .spt_type = "Legendre",
+  },
+
+  .gas_properties = .{
+      .T_gas = 291.15,
+      .gamma = 1.4,
+      .R = 286.9,
+      .prandtl = 0.72,
+      .S = 120.0,
+  },
+
+  .freestream = .{
+      .rho_fs = 1.4,
+      .P_fs = 1.0,
+      .mach_fs = 0.2,
+      .Re_fs = 200.0,
+      .L_fs = 1.0,
+      .T_fs = 300.0,
+      .norm_fs = [1.0, 0.0, 0.0],
+      .fix_vis = false,
+  },
+
+  .wall_conditions = .{
+      .mach_wall = 0.0,
+      .T_wall = 300.0,
+      .norm_wall = [1.0, 0.0, 0.0],
+  },
+
+  .filtering = .{
+      .filt_on = 1,
+      .sen_write = 1,
+      .sen_norm = 1,
+      .sen_Jfac = 1.0,
+      .alpha = 1.0,
+      .filtexp = 2.0,
+      .nonlin_exp = 2.0,
+  },
+
+  .boundary_conditions = .{
+      .mesh_bounds = {
+          "inlet": .sup_in,
+      },
+  },
+
+  .signals = .{
+      .catch_signals = false,
+  },
+}

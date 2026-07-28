@@ -5,6 +5,7 @@
     .minimum_zig_version = "0.17.0-dev.1454+5faa79730",
     .dependencies = .{
         .spock = .{ .path = "../spock" },
+        .ziggy = .{ .path = "../BUILD/ziggy" },
     },
     .paths = .{
         "build.zig",

@@ -16,6 +16,11 @@ pub fn build(b: *std.Build) void {
         .@"vk-registry" = vk_registry,
     });
 
+    const ziggy = b.dependency("ziggy", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ------ Core Library ------
 
     const mod = b.addModule("flurry", .{
@@ -24,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "spock", .module = spock.module("spock") },
+            .{ .name = "ziggy", .module = ziggy.module("ziggy") },
         },
     });
 

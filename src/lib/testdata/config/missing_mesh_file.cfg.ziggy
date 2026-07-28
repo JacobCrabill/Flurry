@@ -1,0 +1,46 @@
+.{
+    .core = .{
+        .n_dims = 2,
+        .order = 3,
+    },
+
+    .equation = .{
+        .equation = .euler_ns,
+    },
+
+    .time = .{
+        .dt_scheme = .rk44,
+        .n_steps = 100,
+    },
+
+    .multigrid = .{
+        .mg_levels = [2],
+        .mg_steps = [4],
+    },
+
+    .output = .{
+        .output_prefix = "out",
+        .write_freq = 100,
+        .report_freq = 50,
+    },
+
+    .test_case = .{},
+
+    .flux = .{},
+
+    .gas_properties = .{},
+
+    .freestream = .{},
+
+    .wall_conditions = .{},
+
+    .filtering = .{},
+
+    .boundary_conditions = .{
+        .mesh_bounds = {
+            "inlet": .sup_in,
+        },
+    },
+
+    .signals = .{},
+}

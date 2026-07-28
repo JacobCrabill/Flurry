@@ -1,0 +1,99 @@
+.{
+  .core = .{
+      .n_dims = 2,
+      .mesh_file = "cylinder_2d.mesh",
+      .order = 3,
+  },
+
+  .equation = .{
+      .equation = .euler_ns,
+      .viscous = true,
+      .disable_nondim = false,
+      .source = false,
+      .squeeze = false,
+  },
+
+  .time = .{
+      .dt_scheme = .rk44,
+      .n_steps = 1000,
+      .tfinal = 1e15,
+      .res_tol = 0.0,
+      .res_field = 0,
+      .dt = 1e-6,
+      .CFL = 0.5,
+  },
+
+  .multigrid = .{
+      .mg_cycle = .v,
+      .FMG_vcycles = 1,
+      .p_multi = false,
+      .rel_fac = 1.0,
+      .mg_levels = [4, 3, 2],
+      .mg_steps = [8, 6, 4],
+  },
+
+  .output = .{
+      .output_prefix = "cylinder_rk3",
+      .write_paraview = true,
+      .write_freq = 100,
+      .report_freq = 50,
+  },
+
+  .test_case = .{
+      .test_case = 0,
+      .err_field = 0,
+      .n_qpts_1d = 5,
+  },
+
+  .flux = .{
+      .fconv_type = .rusanov,
+      .fvisc_type = .ldg,
+      .rus_k = 0.0,
+      .ldg_b = 0.5,
+      .ldg_tau = 1.0,
+  },
+
+  .gas_properties = .{
+      .T_gas = 291.15,
+      .gamma = 1.4,
+      .R = 286.9,
+      .prandtl = 0.72,
+      .S = 120.0,
+  },
+
+  .freestream = .{
+      .rho_fs = 1.4,
+      .P_fs = 1.0,
+      .mach_fs = 0.2,
+      .Re_fs = 200.0,
+      .L_fs = 1.0,
+      .T_fs = 300.0,
+      .norm_fs = [1.0, 0.0, 0.0],
+  },
+
+  .wall_conditions = .{
+      .mach_wall = 0.0,
+      .T_wall = 300.0,
+      .norm_wall = [1.0, 0.0, 0.0],
+  },
+
+  .filtering = .{
+      .filt_on = 0,
+      .sen_write = 1,
+      .alpha = 1.0,
+      .filtexp = 2.0,
+  },
+
+  .boundary_conditions = .{
+      .mesh_bounds = {
+          "inlet": .sup_in,
+          "outlet": .sup_out,
+          "cylinder": .slip_wall,
+          "farfield": .char,
+      },
+  },
+
+  .signals = .{
+      .catch_signals = false,
+  },
+}

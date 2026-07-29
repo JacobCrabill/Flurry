@@ -2,6 +2,7 @@ const std = @import("std");
 const ziggy = @import("ziggy");
 
 pub const config = @import("config.zig");
+pub const geo = @import("geo.zig");
 pub const polynomials = @import("math/polynomials.zig");
 
 test {

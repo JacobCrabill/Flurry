@@ -4,10 +4,10 @@ const std = @import("std");
 pub fn Matrix(T: type) type {
     return struct {
         const Self = @This();
-        rows: usize,
-        cols: usize,
-        stride: usize, // TODO: decide if useful or not
-        data: []T,
+        rows: usize = 0,
+        cols: usize = 0,
+        stride: usize = 0, // TODO: decide if useful or not
+        data: []T = &.{},
 
         pub const empty: Matrix(T) = .{};
 

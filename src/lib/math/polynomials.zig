@@ -1,5 +1,58 @@
 const std = @import("std");
 
+/// 1D Lagrange polynomial defined at 'xi_grid'
+pub fn Lagrange(xi_grid: []const f64, xi: f64, mode: usize) f64 {
+    var val: f64 = 1.0;
+    for (0..mode) |i| {
+        val *= (xi - xi_grid[i]) / (xi_grid[mode] - xi_grid[i]);
+    }
+    for (mode + 1..xi_grid.len) |i| {
+        val *= (xi - xi_grid[i]) / (xi_grid[mode] - xi_grid[i]);
+    }
+    return val;
+}
+
+/// 1D Lagrange polynomial derivative defined at 'xi_grid'
+///
+/// Evaluates the first derivative of the Lagrange function corresponding to the specified mode
+/// on xiGrid at location xi.
+///
+/// @param xiGrid The grid of interpolation points. Sorted in domain [-1,1].
+/// @param mode Mode of the Lagrange function. Defined such that function is 1 at xiGrid[mode]
+/// zero at other grid points.
+/// @param xi  Point of evaluation in domain [-1,1].
+///
+/// @return Value of first derivative of the Lagrange function at xi.
+///
+pub fn dLagrange(xi_grid: []const f64, xi: f64, mode: usize) f64 {
+    var val: f64 = 0.0;
+    const npts = xi_grid.len;
+
+    // Compute normalization constant
+    var den: f64 = 1.0;
+    for (0..mode) |i| {
+        den *= (xi_grid[mode] - xi_grid[i]);
+    }
+    for (mode + 1..npts) |i| {
+        den *= (xi_grid[mode] - xi_grid[i]);
+    }
+
+    // Compute sum of products
+    for (0..npts) |j| {
+        if (j == mode)
+            continue;
+
+        var term: f64 = 1.0;
+        for (0..npts) |i| {
+            if (i != mode and i != j)
+                term *= (xi - xi_grid[i]);
+
+            val += term;
+        }
+    }
+    return val / den;
+}
+
 /// 1D Legendre polynomial
 pub fn Legendre(P: u32, xi: f64) f64 {
     if (P == 0) {

@@ -3,7 +3,7 @@ const std = @import("std");
 pub const Matrix = @import("util/matrix.zig").Matrix;
 
 /// Gauss-Legendre quadrature points (1D)
-pub fn gaussLegendrePts(gpa: std.mem.Allocator, P: u32) !Matrix(f64) {
+pub fn gaussLegendrePts(gpa: std.mem.Allocator, P: u32) Matrix(f64) {
     var pts = try Matrix(f64).init(gpa, P, 1, null);
     switch (P) {
         0 => {},
@@ -11,31 +11,81 @@ pub fn gaussLegendrePts(gpa: std.mem.Allocator, P: u32) !Matrix(f64) {
         2 => {
             const s: f64 = std.math.sqrt(1.0 / 3.0);
             pts.at(0, 0).* = -s;
-            pts.at(1, 0).* = s;
+            pts.at(0, 1).* = s;
         },
         3 => {
             const s = std.math.sqrt(3.0 / 5.0);
             pts.at(0, 0).* = -s;
-            pts.at(1, 0).* = 0.0;
-            pts.at(2, 0).* = s;
+            pts.at(0, 1).* = 0.0;
+            pts.at(0, 2).* = s;
         },
         4 => {
             const v6_5 = std.math.sqrt(6.0 / 5.0);
             pts.at(0, 0).* = -std.math.sqrt((3.0 + 2.0 * v6_5) / 7.0);
-            pts.at(1, 0).* = -std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
-            pts.at(2, 0).* = std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
-            pts.at(3, 0).* = std.math.sqrt((3.0 + 2.0 * v6_5) / 7.0);
+            pts.at(0, 1).* = -std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
+            pts.at(0, 2).* = std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
+            pts.at(0, 3).* = std.math.sqrt((3.0 + 2.0 * v6_5) / 7.0);
         },
         5 => {
             const s10_7 = std.math.sqrt(10.0 / 7.0);
             const one_third = 1.0 / 3.0;
             pts.at(0, 0).* = -one_third * std.math.sqrt(5.0 + 2.0 * s10_7);
-            pts.at(1, 0).* = -one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
-            pts.at(2, 0).* = 0.0;
-            pts.at(3, 0).* = one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
-            pts.at(4, 0).* = one_third * std.math.sqrt(5.0 + 2.0 * s10_7);
+            pts.at(0, 1).* = -one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
+            pts.at(0, 2).* = 0.0;
+            pts.at(0, 3).* = one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
+            pts.at(0, 4).* = one_third * std.math.sqrt(5.0 + 2.0 * s10_7);
         },
-        else => return error.GaussLegendrePtsNotSupported,
+        6 => {
+            pts.at(0, 0).* = -0.932469514203152;
+            pts.at(0, 1).* = -0.661209386466264;
+            pts.at(0, 2).* = -0.238619186083197;
+            pts.at(0, 3).* = 0.238619186083197;
+            pts.at(0, 4).* = 0.661209386466264;
+            pts.at(0, 5).* = 0.932469514203152;
+        },
+        7 => {
+            pts.at(0, 0).* = -0.949107912342758;
+            pts.at(0, 1).* = -0.741531185599394;
+            pts.at(0, 2).* = -0.405845151377397;
+            pts.at(0, 3).* = 0;
+            pts.at(0, 4).* = 0.405845151377397;
+            pts.at(0, 5).* = 0.741531185599394;
+            pts.at(0, 6).* = 0.949107912342758;
+        },
+        8 => {
+            pts.at(0, 0).* = -0.960289856497536;
+            pts.at(0, 1).* = -0.796666477413627;
+            pts.at(0, 2).* = -0.525532409916329;
+            pts.at(0, 3).* = -0.183434642495650;
+            pts.at(0, 4).* = 0.183434642495650;
+            pts.at(0, 5).* = 0.525532409916329;
+            pts.at(0, 6).* = 0.796666477413627;
+            pts.at(0, 7).* = 0.960289856497536;
+        },
+        9 => {
+            pts.at(0, 0).* = -0.968160239507626;
+            pts.at(0, 1).* = -0.836031107326636;
+            pts.at(0, 2).* = -0.613371432700590;
+            pts.at(0, 3).* = -0.324253423403809;
+            pts.at(0, 4).* = 0.0;
+            pts.at(0, 5).* = 0.324253423403809;
+            pts.at(0, 6).* = 0.613371432700590;
+            pts.at(0, 7).* = 0.836031107326636;
+            pts.at(0, 8).* = 0.968160239507626;
+        },
+        10 => {
+            pts.at(0, 0).* = -0.973906528517172;
+            pts.at(0, 1).* = -0.865063366688985;
+            pts.at(0, 2).* = -0.679409568299024;
+            pts.at(0, 3).* = -0.433895394129247;
+            pts.at(0, 4).* = -0.148874338981631;
+            pts.at(0, 5).* = 0.148874338981631;
+            pts.at(0, 6).* = 0.433895394129247;
+            pts.at(0, 7).* = 0.679409568299024;
+            pts.at(0, 8).* = 0.865063366688985;
+            pts.at(0, 9).* = 0.973906528517172;
+        },
+        else => @panic("Gauss-Legendre only supported up to degree 10"),
     }
     return pts;
 }

@@ -9,6 +9,8 @@ pub fn Matrix(T: type) type {
         stride: usize, // TODO: decide if useful or not
         data: []T,
 
+        pub const empty: Matrix(T) = .{};
+
         /// Initialize a new Matrix(T) with the given size and stride.
         ///
         /// If stride *not* given, defaults to `cols` (fully dense matrix).

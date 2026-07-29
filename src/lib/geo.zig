@@ -94,12 +94,14 @@ pub const Geo = struct {
     // face_type: std.ArrayList(FACE_TYPE) = .empty,
 
     pub fn readGmsh(geo: *Geo, file: []const u8) !void {
-
         const gpa = geo.gpa;
         const arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
 
         const mesh_file: []const u8 = try std.Io.Dir.cwd().readFileAlloc(arena, file, arena.allocator(), .{});
+
+        // var reader = std.Io.Reader.fixed(mesh_file);
+        // _ = reader; // autofix
 
         // if (grid_rank == 0)
         //   std::cout << "Geo: Reading mesh file " << file_name << std::endl;
@@ -107,9 +109,10 @@ pub const Geo = struct {
         // --- Read Boundary Conditions & Fluid Field(s) ---
 
         // Move cursor to $PhysicalNames
-        var iter = std.mem.tokenizeAny(u8, mesh_file, "\n");
+        var iter = std.mem.tokenizeScalar(u8, mesh_file, '\n');
         while (iter.next()) |line| {
-            if (std.mem.indexOf(u8, line, "$PhysicalNames")) |_| {
+            if (std.mem.find(u8, line, "$PhysicalNames")) |_| {
+                std.debug.print("Found '$PhysicalNames'\n", .{});
                 break;
             }
         }
@@ -117,458 +120,755 @@ pub const Geo = struct {
             @panic("$PhysicalNames tag not found in Gmsh file!");
         }
 
-        // // Read number of boundaries and fields defined
-        // mesh_file >> n_gmsh_bnds;
-        // getline(mesh_file, str); // clear rest of line
+        // Read the boundary count
+        var line = iter.next().?;
+        const n_bounds = try std.fmt.parseInt(usize, line, 10);
+        std.debug.print("{d} physical names\n", .{n_bounds});
 
-        // n_bounds = 0;
-        // for (int i = 0; i < n_gmsh_bnds; i++) {
-        //   std::string bc_str, bc_name;
-        //   std::stringstream ss;
-        //   int bcdim, bcid;
+        // Parse each boundary
+        var bc_names: std.ArrayList([]const u8) = .empty;
+        try bc_names.resize(arena.allocator(), n_bounds);
+        for (0..n_bounds) |_| {
+            line = iter.next().?;
+            // split by spaces
+            var split = std.mem.tokenizeAny(u8, line, " \t");
+            const ndim = try std.fmt.parseInt(usize, split.next().?, 10);
+            const bcid = try std.fmt.parseInt(usize, split.next().?, 10);
+            const name = split.next().?;
+            try bc_names.append(arena.allocator(), try arena.allocator().dupe(u8, name));
+            std.debug.print("{d} {d} {s}\n", .{ ndim, bcid, name });
+        }
 
-        //   getline(mesh_file, str);
-        //   ss << str;
-        //   ss >> bcdim >> bcid >> bc_str;
+        // // --- Read Node Positions ---
+        // try reader.readUntilDelimiterOrEof('$'); // skip header
 
-        //   // Remove quotation marks from around boundary condition
-        //   size_t ind = bc_str.find("\"");
-        //   while (ind != std::string::npos) {
-        //     bc_str.erase(ind, 1);
-        //     ind = bc_str.find("\"");
-        //   }
-        //   bc_name = bc_str;
+        // try expectTag(&reader, "$Nodes");
 
-        //   // Convert to lowercase to match Flurry's boundary condition strings
-        //   std::transform(bc_str.begin(), bc_str.end(), bc_str.begin(), ::tolower);
+        // n_verts = try readInt(&reader);
+        // _ = try reader.readUntilDelimiterAlloc(arena.allocator(), '\n', std.math.maxInt(u32)); // clear line
 
-        //   // First, map mesh boundary to boundary condition in input file
-        //   if (!params_->mesh_bounds.count(bc_str)) {
-        //     std::string err_s = "Unrecognized mesh boundary: \"" + bc_str + "\"\n";
-        //     err_s += "Boundary names in input file must match those in mesh file.";
-        //     FatalError(err_s.c_str());
-        //   }
-
-        //   // Map the Gmsh PhysicalName to the input-file-specified Flurry boundary condition
-        //   bc_str = params_->mesh_bounds[bc_str];
-
-        //   // Next, check that the requested boundary condition exists
-        //   if (!bc_str2_num.count(bc_str)) {
-        //     std::string const err_s = "Unrecognized boundary condition: \"" + bc_str + "\"";
-        //     FatalError(err_s.c_str());
-        //   }
-
-        //   if (bc_str.compare("fluid") == 0) {
-        //     n_dims = bcdim;
-        //     params_->n_dims = bcdim;
-        //     bc_id_map_[bcid] = -1;
-        //   } else {
-        //     bc_list.push_back(bc_str2_num[bc_str]);
-        //     bc_names.push_back(bc_name);
-        //     bc_id_map_[bcid] = n_bounds; // Map Gmsh bcid to Flurry bound index
-        //     n_bounds++;
-        //   }
-        // }
-
-        // // --- Read Mesh Vertex Locations ---
-
-        // // Move cursor to $Nodes
-        // mesh_file.clear();
-        // mesh_file.seekg(0, std::ios::beg);
-        // while (1) {
-        //   getline(mesh_file, str);
-        //   if (str.find("$Nodes") != std::string::npos)
-        //     break;
-        //   if (mesh_file.eof())
-        //     FatalError("$Nodes tag not found in Gmsh file!");
-        // }
-
-        // uint iv;
-        // mesh_file >> n_verts;
-        // xv.setup(n_verts, n_dims);
-        // getline(mesh_file, str); // Clear end of line, just in case
+        // xv = Matrix(f64).init(gpa, n_verts, n_dims, null);
 
         // for (0..n_verts) |i| {
-        //   mesh_file >> iv >> xv(i, 0) >> xv(i, 1);
-        //   if (n_dims == 3)
-        //     mesh_file >> xv(i, 2);
-        //   getline(mesh_file, str);
+        //     const iv: usize = try readInt(&reader);
+        //     _ = iv; // Gmsh node IDs are 1-indexed but we don't need them here
+
+        //     xv.data[i * n_dims + 0] = try readFloat(&reader);
+        //     if (n_dims > 1) {
+        //         xv.data[i * n_dims + 1] = try readFloat(&reader);
+        //     }
+        //     if (n_dims > 2) {
+        //         xv.data[i * n_dims + 2] = try readFloat(&reader);
+        //     }
+
+        //     _ = try reader.readUntilDelimiterAlloc(arena.allocator(), '\n', std.math.maxInt(u32)); // clear line
         // }
 
         // // --- Read Element Connectivity ---
+        // try expectTag(&reader, "$Elements");
 
-        // // Move cursor to $Elements
-        // mesh_file.clear();
-        // mesh_file.seekg(0, std::ios::beg);
-        // while (1) {
-        //   getline(mesh_file, str);
-        //   if (str.find("$Elements") != std::string::npos)
-        //     break;
-        //   if (mesh_file.eof())
-        //     FatalError("$Elements tag not found in Gmsh file!");
-        // }
+        // const n_eles_gmsh: usize = try readInt(&reader);
+        // _ = try reader.readUntilDelimiterAlloc(arena.allocator(), '\n', std.math.maxInt(u32)); // clear line
 
-        // int n_eles_gmsh;
-        // std::vector<int> c2v_tmp(27, 0); // Maximum number of nodes/element possible
-        // std::vector<std::set<int>> bound_points(n_bounds);
-        // //  bndPtsGmsh.resize(nGmshBnds);
-        // std::map<int, int> e_type2nv;
-        // e_type2nv[3] = 4;  // Linear quad
-        // e_type2nv[16] = 4; // Quadratic serendipity quad
-        // e_type2nv[10] = 4; // Quadratic Lagrange quad
-        // e_type2nv[8] = 8;  // Linear hex
+        // var c2v_tmp = std.ArrayList(usize).init(gpa);
+        // defer c2v_tmp.deinit();
 
-        // n_bnd_pts.resize(n_bounds);
+        // c2nv = std.ArrayList(usize).init(gpa);
+        // defer c2nv.deinit();
 
-        // // Read total number of interior + boundary elements
-        // mesh_file >> n_eles_gmsh;
-        // getline(mesh_file, str); // Clear end of line, just in case
+        // c2nf = std.ArrayList(usize).init(gpa);
+        // defer c2nf.deinit();
 
-        // // For Gmsh node ordering, see: http://geuz.org/gmsh/doc/texinfo/gmsh.html#Node-ordering
-        // int ic = 0;
-        // for (int k = 0; k < n_eles_gmsh; k++) {
-        //   int id, e_type, n_tags, bcid, tmp;
-        //   mesh_file >> id >> e_type >> n_tags;
-        //   mesh_file >> bcid;
-        //   bcid = bc_id_map_[bcid];
-        //   for (int tag = 0; tag < n_tags - 1; tag++)
-        //     mesh_file >> tmp;
+        // ctype = std.ArrayList(usize).init(gpa);
+        // defer ctype.deinit();
 
-        //   if (bcid == -1) {
-        //     // NOTE: Currently, only quads are supported
+        // for (0..n_eles_gmsh) |_| {
+        //     const id: usize = try readInt(&reader);
+        //     _ = id;
+        //     const e_type: i32 = @intCast(try readInt(&reader));
+        //     const n_tags: usize = try readInt(&reader);
+
+        //     // Skip tags (first tag is bcid, rest are additional tags)
+        //     var tmp: usize = 0;
+        //     for (0..n_tags) |_| {
+        //         tmp = try readInt(&reader);
+        //         _ = tmp;
+        //     }
+
         //     switch (e_type) {
-        //     case 2:
-        //       // linear triangle
-        //       c2nv.push_back(3);
-        //       c2nf.push_back(3);
-        //       ctype.push_back(TRI);
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2];
-        //       break;
+        //         // Linear triangle
+        //         2 => {
+        //             c2nv.append(3) catch unreachable;
+        //             c2nf.append(3) catch unreachable;
+        //             ctype.append(0) catch unreachable; // TRI
 
-        //     case 9:
-        //       // quadratic triangle -> quadratic quad  [corner nodes, then edge-center nodes]
-        //       c2nv.push_back(8);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[4] >> c2v_tmp[5] >>
-        //         c2v_tmp[7];
-        //       c2v_tmp[3] = c2v_tmp[2];
-        //       c2v_tmp[6] = c2v_tmp[2];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 3);
+        //         },
 
-        //     case 3:
-        //       // linear quadrangle
-        //       c2nv.push_back(4);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[3];
-        //       break;
+        //         // Quadratic triangle -> quadratic quad
+        //         9 => {
+        //             c2nv.append(8) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 16:
-        //       // quadratic 8-node (serendipity) quadrangle
-        //       c2nv.push_back(8);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[3] >> c2v_tmp[4] >>
-        //         c2v_tmp[5] >> c2v_tmp[6] >> c2v_tmp[7];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 6);
+        //             c2v_tmp.items[3] = c2v_tmp.items[2];
+        //             c2v_tmp.items[6] = c2v_tmp.items[2];
+        //         },
 
-        //     case 10:
-        //       // quadratic (9-node Lagrange) quadrangle (read as 8-node serendipity)
-        //       c2nv.push_back(9);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 9; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // Linear quadrangle
+        //         3 => {
+        //             c2nv.append(4) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 36:
-        //       // cubic (16-node Lagrange) quadrangle
-        //       c2nv.push_back(16);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 16; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 4);
+        //         },
 
-        //     case 37:
-        //       // quartic (25-node Lagrange) quadrangle
-        //       c2nv.push_back(25);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 25; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // Quadratic 8-node (serendipity) quadrangle
+        //         16 => {
+        //             c2nv.append(8) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 38:
-        //       // quintic (36-node Lagrange) quadrangle
-        //       c2nv.push_back(36);
-        //       c2v_tmp.resize(36);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 36; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 8);
+        //         },
 
-        //     case 47:
-        //       // 6th-order 49-node Lagrange quadrangle
-        //       c2nv.push_back(49);
-        //       c2v_tmp.resize(49);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 49; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // Quadratic (9-node Lagrange) quadrangle
+        //         10 => {
+        //             c2nv.append(9) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 48:
-        //       // 7th-order 64-node Lagrange quadrangle
-        //       c2nv.push_back(64);
-        //       c2v_tmp.resize(64);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 64; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 9);
+        //         },
 
-        //     case 49:
-        //       // 8th-order 81-node Lagrange quadrangle
-        //       c2nv.push_back(81);
-        //       c2v_tmp.resize(81);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 81; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // Cubic (16-node Lagrange) quadrangle
+        //         36 => {
+        //             c2nv.append(16) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 50:
-        //       // 9th-order 100-node Lagrange quadrangle
-        //       c2nv.push_back(100);
-        //       c2v_tmp.resize(100);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 100; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 16);
+        //         },
 
-        //     case 51:
-        //       // 10th-order 121-node Lagrange quadrangle
-        //       c2nv.push_back(121);
-        //       c2v_tmp.resize(121);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(QUAD);
-        //       for (int i = 0; i < 121; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // Quartic (25-node Lagrange) quadrangle
+        //         37 => {
+        //             c2nv.append(25) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 5:
-        //       // Linear hexahedron
-        //       c2nv.push_back(8);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       for (int i = 0; i < 8; i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 25);
+        //         },
 
-        //     case 17:
-        //       // Quadratic (20-Node Serendipity) Hexahedron
-        //       c2nv.push_back(20);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       // Corner Nodes
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[3] >> c2v_tmp[4] >>
-        //         c2v_tmp[5] >> c2v_tmp[6] >> c2v_tmp[7];
-        //       // Edge Nodes
-        //       mesh_file >> c2v_tmp[8] >> c2v_tmp[11] >> c2v_tmp[12] >> c2v_tmp[9] >> c2v_tmp[13] >>
-        //         c2v_tmp[10];
-        //       mesh_file >> c2v_tmp[14] >> c2v_tmp[15] >> c2v_tmp[16] >> c2v_tmp[19] >> c2v_tmp[17] >>
-        //         c2v_tmp[18];
-        //       break;
+        //         // Quintic (36-node Lagrange) quadrangle
+        //         38 => {
+        //             c2nv.append(36) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 12:
-        //       // Quadratic (27-Node Lagrange) Hexahedron
-        //       c2nv.push_back(27);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       c2v_tmp.resize(27);
-        //       for (int i = 0; i < c2nv.back(); i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 36);
+        //         },
 
-        //     case 92:
-        //       // Cubic Hexahedron
-        //       c2nv.push_back(64);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       c2v_tmp.resize(64);
-        //       for (int i = 0; i < c2nv.back(); i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // 6th-order 49-node Lagrange quadrangle
+        //         47 => {
+        //             c2nv.append(49) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 93:
-        //       // Quartic Hexahedron
-        //       c2nv.push_back(125);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       c2v_tmp.resize(125);
-        //       for (int i = 0; i < c2nv.back(); i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 49);
+        //         },
 
-        //     case 94:
-        //       // Quintic Hexahedron
-        //       c2nv.push_back(216);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       c2v_tmp.resize(216);
-        //       for (int i = 0; i < c2nv.back(); i++)
-        //         mesh_file >> c2v_tmp[i];
-        //       break;
+        //         // 7th-order 64-node Lagrange quadrangle
+        //         48 => {
+        //             c2nv.append(64) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     case 4:
-        //       // Linear tetrahedron; read as collapsed-face hex
-        //       c2nv.push_back(4);
-        //       c2nf.push_back(4);
-        //       ctype.push_back(HEX);
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[4];
-        //       c2v_tmp[3] = 2;
-        //       c2v_tmp[5] = c2v_tmp[4];
-        //       c2v_tmp[6] = c2v_tmp[4];
-        //       c2v_tmp[6] = c2v_tmp[4];
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 64);
+        //         },
 
-        //     case 6:
-        //       // Linear prism; read as collapsed-face hex
-        //       c2nv.push_back(8);
-        //       c2nf.push_back(6);
-        //       ctype.push_back(HEX);
-        //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[4] >> c2v_tmp[5] >>
-        //         c2v_tmp[6];
-        //       c2v_tmp[3] = c2v_tmp[2];
-        //       c2v_tmp[7] = c2v_tmp[6];
-        //       break;
+        //         // 8th-order 81-node Lagrange quadrangle
+        //         49 => {
+        //             c2nv.append(81) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
 
-        //     default:
-        //       std::cout << "Gmsh element ID " << k << ", Gmsh Element Type = " << e_type << std::endl;
-        //       FatalError("element type not recognized");
-        //       break;
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 81);
+        //         },
+
+        //         // 9th-order 100-node Lagrange quadrangle
+        //         50 => {
+        //             c2nv.append(100) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 100);
+        //         },
+
+        //         // 10th-order 121-node Lagrange quadrangle
+        //         51 => {
+        //             c2nv.append(121) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(1) catch unreachable; // QUAD
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 121);
+        //         },
+
+        //         // Linear hexahedron
+        //         5 => {
+        //             c2nv.append(8) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 8);
+        //         },
+
+        //         // Quadratic (20-Node Serendipity) Hexahedron
+        //         17 => {
+        //             c2nv.append(20) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 8);
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 12);
+        //         },
+
+        //         // Quadratic (27-Node Lagrange) Hexahedron
+        //         12 => {
+        //             c2nv.append(27) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 27);
+        //         },
+
+        //         // Cubic Hexahedron
+        //         92 => {
+        //             c2nv.append(64) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 64);
+        //         },
+
+        //         // Quartic Hexahedron
+        //         93 => {
+        //             c2nv.append(125) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 125);
+        //         },
+
+        //         // Quintic Hexahedron
+        //         94 => {
+        //             c2nv.append(216) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 216);
+        //         },
+
+        //         // Linear tetrahedron; read as collapsed-face hex
+        //         4 => {
+        //             c2nv.append(4) catch unreachable;
+        //             c2nf.append(4) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 3);
+        //             c2v_tmp.append(c2v_tmp.items[2]) catch unreachable;
+        //         },
+
+        //         // Linear prism; read as collapsed-face hex
+        //         6 => {
+        //             c2nv.append(8) catch unreachable;
+        //             c2nf.append(6) catch unreachable;
+        //             ctype.append(2) catch unreachable; // HEX
+
+        //             try readNodesIntoArrayList(&reader, c2v_tmp, 5);
+        //             c2v_tmp.append(c2v_tmp.items[2]) catch unreachable;
+        //             c2v_tmp.append(c2v_tmp.items[5]) catch unreachable;
+        //         },
+
+        //         else => {
+        //             std.log.err("Gmsh element type {} not supported", .{e_type});
+        //             return error.UnsupportedElementType;
+        //         },
         //     }
 
-        //     // Increase the size of c2v (max # of vertices per cell) if needed
-        //     if (c2v.getDim1() < (uint)c2nv[ic]) {
-        //       for (int dim = c2v.getDim1(); dim < c2nv[ic]; dim++) {
-        //         c2v.addCol();
-        //       }
+        //     // Add to c2v matrix, shifting from 1-indexed to 0-indexed
+        //     const n_nodes = c2nv.items[c2nv.items.len - 1];
+        //     if (c2v.data.len < c2v.getDim0() * c2v.getDim1()) {
+        //         try ensureC2vCapacity(geo.gpa, c2v_tmp.items[0..n_nodes].len);
         //     }
 
-        //     // Number of nodes in c2v_tmp may vary, so use pointer rather than vector
-        //     c2v.insertRow(c2v_tmp.data(), -1, c2nv[ic]);
-
-        //     // Shift every value of c2v by -1 (Gmsh is 1-indexed; we need 0-indexed)
-        //     for (int k = 0; k < c2nv[ic]; k++) {
-        //       if (c2v(ic, k) != 0) {
-        //         c2v(ic, k)--;
-        //       }
+        //     for (0..n_nodes) |j| {
+        //         const node_id = c2v_tmp.items[j];
+        //         if (node_id != 0) {
+        //             c2v.data[(c2v.getDim0() - 1) * c2v.getDim1() + j] = node_id - 1;
+        //         }
         //     }
 
-        //     ic++;
-        //     getline(mesh_file, str); // skip end of line
-        //   } else {
-        //     // Boundary cell; put vertices into bndPts
-        //     int n_pts_face = 0;
-        //     switch (e_type) {
-        //     case 1: // Linear edge
-        //       n_pts_face = 2;
-        //       break;
+        //     n_eles += 1;
 
-        //     case 2: // Linear triangle
-        //       n_pts_face = 3;
-        //       break;
-
-        //     case 3:  // Linear quad
-        //     case 10: // Quadratic (Lagrange) quad
-        //     case 16: // Quadratic (Serendipity) quad
-        //     case 36: // Cubic quad
-        //     case 37: // Quartic quad
-        //     case 38: // Quintic quad
-        //       n_pts_face = 4;
-        //       break;
-
-        //     case 8: // Quadratic edge
-        //       n_pts_face = 3;
-        //       break;
-
-        //     case 26: // Cubic Edge
-        //       n_pts_face = 4;
-        //       break;
-
-        //     case 27: // Quartic Edge
-        //       n_pts_face = 5;
-        //       break;
-
-        //     case 28: // Quintic Edge
-        //       n_pts_face = 6;
-        //       break;
-
-        //     case 62: // Order 6
-        //       n_pts_face = 7;
-        //       break;
-
-        //     case 63: // Order 7
-        //       n_pts_face = 8;
-        //       break;
-
-        //     case 64: // Order 8
-        //       n_pts_face = 9;
-        //       break;
-
-        //     case 65: // Order 9
-        //       n_pts_face = 10;
-        //       break;
-
-        //     case 66: // Order 10
-        //       n_pts_face = 11;
-        //       break;
-
-        //     default:
-        //       std::cout << "Gmsh element ID " << k << ", Gmsh Element Type = " << e_type << std::endl;
-        //       FatalError("Boundary Element (Face) Type Not Recognized!");
-        //     }
-
-        //     for (int i = 0; i < n_pts_face; i++) {
-        //       mesh_file >> iv;
-        //       iv--;
-        //       bound_points[bcid].insert(iv);
-        //       // bndPtsGmsh[gmshID].push_back(iv);
-        //     }
-        //     getline(mesh_file, str);
-        //   }
-        // } // End of loop over entities
-
-        // //  for (int i = 0; i < nGmshBnds; i++) {
-        // //    std::sort(bndPtsGmsh[i].begin(),bndPtsGmsh[i].end());
-        // //    bndPtsGmsh[i].erase( std::unique(bndPtsGmsh[i].begin(),bndPtsGmsh[i].end()),
-        // //    bndPtsGmsh[i].end() );
-        // //  }
-
-        // int max_n_bnd_pts = 0;
-        // for (int i = 0; i < n_bounds; i++) {
-        //   n_bnd_pts[i] = bound_points[i].size();
-        //   max_n_bnd_pts = std::max(max_n_bnd_pts, n_bnd_pts[i]);
+        //     // Clear for next element
+        //     c2v_tmp.clearRetainingCapacity();
         // }
 
-        // // Copy temp boundPoints data into bndPts matrix
-        // bnd_pts.setup(n_bounds, max_n_bnd_pts);
-        // for (int i = 0; i < n_bounds; i++) {
-        //   int j = 0;
-        //   for (auto& it : bound_points[i]) {
-        //     bnd_pts(i, j) = it;
-        //     j++;
-        //   }
-        // }
+        // _ = try reader.readUntilDelimiterOrEof('\0'); // consume rest of file
+        // // // Read number of boundaries and fields defined
+        // // mesh_file >> n_gmsh_bnds;
+        // // getline(mesh_file, str); // clear rest of line
 
-        // n_eles = c2v.getDim0();
+        // // n_bounds = 0;
+        // // for (int i = 0; i < n_gmsh_bnds; i++) {
+        // //   std::string bc_str, bc_name;
+        // //   std::stringstream ss;
+        // //   int bcdim, bcid;
 
-        // mesh_file.close();
+        // //   getline(mesh_file, str);
+        // //   ss << str;
+        // //   ss >> bcdim >> bcid >> bc_str;
+
+        // //   // Remove quotation marks from around boundary condition
+        // //   size_t ind = bc_str.find("\"");
+        // //   while (ind != std::string::npos) {
+        // //     bc_str.erase(ind, 1);
+        // //     ind = bc_str.find("\"");
+        // //   }
+        // //   bc_name = bc_str;
+
+        // //   // Convert to lowercase to match Flurry's boundary condition strings
+        // //   std::transform(bc_str.begin(), bc_str.end(), bc_str.begin(), ::tolower);
+
+        // //   // First, map mesh boundary to boundary condition in input file
+        // //   if (!params_->mesh_bounds.count(bc_str)) {
+        // //     std::string err_s = "Unrecognized mesh boundary: \"" + bc_str + "\"\n";
+        // //     err_s += "Boundary names in input file must match those in mesh file.";
+        // //     FatalError(err_s.c_str());
+        // //   }
+
+        // //   // Map the Gmsh PhysicalName to the input-file-specified Flurry boundary condition
+        // //   bc_str = params_->mesh_bounds[bc_str];
+
+        // //   // Next, check that the requested boundary condition exists
+        // //   if (!bc_str2_num.count(bc_str)) {
+        // //     std::string const err_s = "Unrecognized boundary condition: \"" + bc_str + "\"";
+        // //     FatalError(err_s.c_str());
+        // //   }
+
+        // //   if (bc_str.compare("fluid") == 0) {
+        // //     n_dims = bcdim;
+        // //     params_->n_dims = bcdim;
+        // //     bc_id_map_[bcid] = -1;
+        // //   } else {
+        // //     bc_list.push_back(bc_str2_num[bc_str]);
+        // //     bc_names.push_back(bc_name);
+        // //     bc_id_map_[bcid] = n_bounds; // Map Gmsh bcid to Flurry bound index
+        // //     n_bounds++;
+        // //   }
+        // // }
+
+        // // // --- Read Mesh Vertex Locations ---
+
+        // // // Move cursor to $Nodes
+        // // mesh_file.clear();
+        // // mesh_file.seekg(0, std::ios::beg);
+        // // while (1) {
+        // //   getline(mesh_file, str);
+        // //   if (str.find("$Nodes") != std::string::npos)
+        // //     break;
+        // //   if (mesh_file.eof())
+        // //     FatalError("$Nodes tag not found in Gmsh file!");
+        // // }
+
+        // // uint iv;
+        // // mesh_file >> n_verts;
+        // // xv.setup(n_verts, n_dims);
+        // // getline(mesh_file, str); // Clear end of line, just in case
+
+        // // for (0..n_verts) |i| {
+        // //   mesh_file >> iv >> xv(i, 0) >> xv(i, 1);
+        // //   if (n_dims == 3)
+        // //     mesh_file >> xv(i, 2);
+        // //   getline(mesh_file, str);
+        // // }
+
+        // // // --- Read Element Connectivity ---
+
+        // // // Move cursor to $Elements
+        // // mesh_file.clear();
+        // // mesh_file.seekg(0, std::ios::beg);
+        // // while (1) {
+        // //   getline(mesh_file, str);
+        // //   if (str.find("$Elements") != std::string::npos)
+        // //     break;
+        // //   if (mesh_file.eof())
+        // //     FatalError("$Elements tag not found in Gmsh file!");
+        // // }
+
+        // // int n_eles_gmsh;
+        // // std::vector<int> c2v_tmp(27, 0); // Maximum number of nodes/element possible
+        // // std::vector<std::set<int>> bound_points(n_bounds);
+        // // //  bndPtsGmsh.resize(nGmshBnds);
+        // // std::map<int, int> e_type2nv;
+        // // e_type2nv[3] = 4;  // Linear quad
+        // // e_type2nv[16] = 4; // Quadratic serendipity quad
+        // // e_type2nv[10] = 4; // Quadratic Lagrange quad
+        // // e_type2nv[8] = 8;  // Linear hex
+
+        // // n_bnd_pts.resize(n_bounds);
+
+        // // // Read total number of interior + boundary elements
+        // // mesh_file >> n_eles_gmsh;
+        // // getline(mesh_file, str); // Clear end of line, just in case
+
+        // // // For Gmsh node ordering, see: http://geuz.org/gmsh/doc/texinfo/gmsh.html#Node-ordering
+        // // int ic = 0;
+        // // for (int k = 0; k < n_eles_gmsh; k++) {
+        // //   int id, e_type, n_tags, bcid, tmp;
+        // //   mesh_file >> id >> e_type >> n_tags;
+        // //   mesh_file >> bcid;
+        // //   bcid = bc_id_map_[bcid];
+        // //   for (int tag = 0; tag < n_tags - 1; tag++)
+        // //     mesh_file >> tmp;
+
+        // //   if (bcid == -1) {
+        // //     // NOTE: Currently, only quads are supported
+        // //     switch (e_type) {
+        // //     case 2:
+        // //       // linear triangle
+        // //       c2nv.push_back(3);
+        // //       c2nf.push_back(3);
+        // //       ctype.push_back(TRI);
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2];
+        // //       break;
+
+        // //     case 9:
+        // //       // quadratic triangle -> quadratic quad  [corner nodes, then edge-center nodes]
+        // //       c2nv.push_back(8);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[4] >> c2v_tmp[5] >>
+        // //         c2v_tmp[7];
+        // //       c2v_tmp[3] = c2v_tmp[2];
+        // //       c2v_tmp[6] = c2v_tmp[2];
+        // //       break;
+
+        // //     case 3:
+        // //       // linear quadrangle
+        // //       c2nv.push_back(4);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[3];
+        // //       break;
+
+        // //     case 16:
+        // //       // quadratic 8-node (serendipity) quadrangle
+        // //       c2nv.push_back(8);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[3] >> c2v_tmp[4] >>
+        // //         c2v_tmp[5] >> c2v_tmp[6] >> c2v_tmp[7];
+        // //       break;
+
+        // //     case 10:
+        // //       // quadratic (9-node Lagrange) quadrangle (read as 8-node serendipity)
+        // //       c2nv.push_back(9);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 9; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 36:
+        // //       // cubic (16-node Lagrange) quadrangle
+        // //       c2nv.push_back(16);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 16; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 37:
+        // //       // quartic (25-node Lagrange) quadrangle
+        // //       c2nv.push_back(25);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 25; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 38:
+        // //       // quintic (36-node Lagrange) quadrangle
+        // //       c2nv.push_back(36);
+        // //       c2v_tmp.resize(36);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 36; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 47:
+        // //       // 6th-order 49-node Lagrange quadrangle
+        // //       c2nv.push_back(49);
+        // //       c2v_tmp.resize(49);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 49; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 48:
+        // //       // 7th-order 64-node Lagrange quadrangle
+        // //       c2nv.push_back(64);
+        // //       c2v_tmp.resize(64);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 64; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 49:
+        // //       // 8th-order 81-node Lagrange quadrangle
+        // //       c2nv.push_back(81);
+        // //       c2v_tmp.resize(81);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 81; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 50:
+        // //       // 9th-order 100-node Lagrange quadrangle
+        // //       c2nv.push_back(100);
+        // //       c2v_tmp.resize(100);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 100; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 51:
+        // //       // 10th-order 121-node Lagrange quadrangle
+        // //       c2nv.push_back(121);
+        // //       c2v_tmp.resize(121);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(QUAD);
+        // //       for (int i = 0; i < 121; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 5:
+        // //       // Linear hexahedron
+        // //       c2nv.push_back(8);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       for (int i = 0; i < 8; i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 17:
+        // //       // Quadratic (20-Node Serendipity) Hexahedron
+        // //       c2nv.push_back(20);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       // Corner Nodes
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[3] >> c2v_tmp[4] >>
+        // //         c2v_tmp[5] >> c2v_tmp[6] >> c2v_tmp[7];
+        // //       // Edge Nodes
+        // //       mesh_file >> c2v_tmp[8] >> c2v_tmp[11] >> c2v_tmp[12] >> c2v_tmp[9] >> c2v_tmp[13] >>
+        // //         c2v_tmp[10];
+        // //       mesh_file >> c2v_tmp[14] >> c2v_tmp[15] >> c2v_tmp[16] >> c2v_tmp[19] >> c2v_tmp[17] >>
+        // //         c2v_tmp[18];
+        // //       break;
+
+        // //     case 12:
+        // //       // Quadratic (27-Node Lagrange) Hexahedron
+        // //       c2nv.push_back(27);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       c2v_tmp.resize(27);
+        // //       for (int i = 0; i < c2nv.back(); i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 92:
+        // //       // Cubic Hexahedron
+        // //       c2nv.push_back(64);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       c2v_tmp.resize(64);
+        // //       for (int i = 0; i < c2nv.back(); i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 93:
+        // //       // Quartic Hexahedron
+        // //       c2nv.push_back(125);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       c2v_tmp.resize(125);
+        // //       for (int i = 0; i < c2nv.back(); i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 94:
+        // //       // Quintic Hexahedron
+        // //       c2nv.push_back(216);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       c2v_tmp.resize(216);
+        // //       for (int i = 0; i < c2nv.back(); i++)
+        // //         mesh_file >> c2v_tmp[i];
+        // //       break;
+
+        // //     case 4:
+        // //       // Linear tetrahedron; read as collapsed-face hex
+        // //       c2nv.push_back(4);
+        // //       c2nf.push_back(4);
+        // //       ctype.push_back(HEX);
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[4];
+        // //       c2v_tmp[3] = 2;
+        // //       c2v_tmp[5] = c2v_tmp[4];
+        // //       c2v_tmp[6] = c2v_tmp[4];
+        // //       c2v_tmp[6] = c2v_tmp[4];
+        // //       break;
+
+        // //     case 6:
+        // //       // Linear prism; read as collapsed-face hex
+        // //       c2nv.push_back(8);
+        // //       c2nf.push_back(6);
+        // //       ctype.push_back(HEX);
+        // //       mesh_file >> c2v_tmp[0] >> c2v_tmp[1] >> c2v_tmp[2] >> c2v_tmp[4] >> c2v_tmp[5] >>
+        // //         c2v_tmp[6];
+        // //       c2v_tmp[3] = c2v_tmp[2];
+        // //       c2v_tmp[7] = c2v_tmp[6];
+        // //       break;
+
+        // //     default:
+        // //       std::cout << "Gmsh element ID " << k << ", Gmsh Element Type = " << e_type << std::endl;
+        // //       FatalError("element type not recognized");
+        // //       break;
+        // //     }
+
+        // //     // Increase the size of c2v (max # of vertices per cell) if needed
+        // //     if (c2v.getDim1() < (uint)c2nv[ic]) {
+        // //       for (int dim = c2v.getDim1(); dim < c2nv[ic]; dim++) {
+        // //         c2v.addCol();
+        // //       }
+        // //     }
+
+        // //     // Number of nodes in c2v_tmp may vary, so use pointer rather than vector
+        // //     c2v.insertRow(c2v_tmp.data(), -1, c2nv[ic]);
+
+        // //     // Shift every value of c2v by -1 (Gmsh is 1-indexed; we need 0-indexed)
+        // //     for (int k = 0; k < c2nv[ic]; k++) {
+        // //       if (c2v(ic, k) != 0) {
+        // //         c2v(ic, k)--;
+        // //       }
+        // //     }
+
+        // //     ic++;
+        // //     getline(mesh_file, str); // skip end of line
+        // //   } else {
+        // //     // Boundary cell; put vertices into bndPts
+        // //     int n_pts_face = 0;
+        // //     switch (e_type) {
+        // //     case 1: // Linear edge
+        // //       n_pts_face = 2;
+        // //       break;
+
+        // //     case 2: // Linear triangle
+        // //       n_pts_face = 3;
+        // //       break;
+
+        // //     case 3:  // Linear quad
+        // //     case 10: // Quadratic (Lagrange) quad
+        // //     case 16: // Quadratic (Serendipity) quad
+        // //     case 36: // Cubic quad
+        // //     case 37: // Quartic quad
+        // //     case 38: // Quintic quad
+        // //       n_pts_face = 4;
+        // //       break;
+
+        // //     case 8: // Quadratic edge
+        // //       n_pts_face = 3;
+        // //       break;
+
+        // //     case 26: // Cubic Edge
+        // //       n_pts_face = 4;
+        // //       break;
+
+        // //     case 27: // Quartic Edge
+        // //       n_pts_face = 5;
+        // //       break;
+
+        // //     case 28: // Quintic Edge
+        // //       n_pts_face = 6;
+        // //       break;
+
+        // //     case 62: // Order 6
+        // //       n_pts_face = 7;
+        // //       break;
+
+        // //     case 63: // Order 7
+        // //       n_pts_face = 8;
+        // //       break;
+
+        // //     case 64: // Order 8
+        // //       n_pts_face = 9;
+        // //       break;
+
+        // //     case 65: // Order 9
+        // //       n_pts_face = 10;
+        // //       break;
+
+        // //     case 66: // Order 10
+        // //       n_pts_face = 11;
+        // //       break;
+
+        // //     default:
+        // //       std::cout << "Gmsh element ID " << k << ", Gmsh Element Type = " << e_type << std::endl;
+        // //       FatalError("Boundary Element (Face) Type Not Recognized!");
+        // //     }
+
+        // //     for (int i = 0; i < n_pts_face; i++) {
+        // //       mesh_file >> iv;
+        // //       iv--;
+        // //       bound_points[bcid].insert(iv);
+        // //       // bndPtsGmsh[gmshID].push_back(iv);
+        // //     }
+        // //     getline(mesh_file, str);
+        // //   }
+        // // } // End of loop over entities
+
+        // // //  for (int i = 0; i < nGmshBnds; i++) {
+        // // //    std::sort(bndPtsGmsh[i].begin(),bndPtsGmsh[i].end());
+        // // //    bndPtsGmsh[i].erase( std::unique(bndPtsGmsh[i].begin(),bndPtsGmsh[i].end()),
+        // // //    bndPtsGmsh[i].end() );
+        // // //  }
+
+        // // int max_n_bnd_pts = 0;
+        // // for (int i = 0; i < n_bounds; i++) {
+        // //   n_bnd_pts[i] = bound_points[i].size();
+        // //   max_n_bnd_pts = std::max(max_n_bnd_pts, n_bnd_pts[i]);
+        // // }
+
+        // // // Copy temp boundPoints data into bndPts matrix
+        // // bnd_pts.setup(n_bounds, max_n_bnd_pts);
+        // // for (int i = 0; i < n_bounds; i++) {
+        // //   int j = 0;
+        // //   for (auto& it : bound_points[i]) {
+        // //     bnd_pts(i, j) = it;
+        // //     j++;
+        // //   }
+        // // }
+
+        // // n_eles = c2v.getDim0();
+
+        // // mesh_file.close();
     }
 
     pub fn createMesh(geo: *Geo) !void {

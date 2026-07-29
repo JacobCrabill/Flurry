@@ -16,9 +16,21 @@ pub fn build(b: *std.Build) void {
         .@"vk-registry" = vk_registry,
     });
 
-    const ziggy = b.dependency("ziggy", .{
+    // Ziggy: vendored (see vendor/ziggy/README.md). Only the core parser is
+    // kept -- no CLI, no LSP -- so its only import is the equally-trimmed
+    // ansi_term used for colored AST rendering.
+    const ansi_term = b.createModule(.{
+        .root_source_file = b.path("vendor/ziggy/src/ansi_term/root.zig"),
         .target = target,
         .optimize = optimize,
+    });
+    const ziggy_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/ziggy/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ansi_term", .module = ansi_term },
+        },
     });
 
     // ------ Core Library ------
@@ -29,7 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "spock", .module = spock.module("spock") },
-            .{ .name = "ziggy", .module = ziggy.module("ziggy") },
+            .{ .name = "ziggy", .module = ziggy_mod },
         },
     });
 
@@ -60,6 +72,16 @@ pub fn build(b: *std.Build) void {
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    // Config/mesh tests open fixtures by paths relative to the project root.
+    run_mod_tests.setCwd(b.path("."));
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // Upstream ziggy's own test suite, run against our vendored + patched
+    // copy so the fixes in vendor/ziggy stay honest.
+    const ziggy_tests = b.addTest(.{ .root_module = ziggy_mod });
+    const run_ziggy_tests = b.addRunArtifact(ziggy_tests);
+    b.step("test-vendor", "Run the vendored ziggy test suite")
+        .dependOn(&run_ziggy_tests.step);
+    test_step.dependOn(&run_ziggy_tests.step);
 }

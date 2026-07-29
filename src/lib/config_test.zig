@@ -67,8 +67,13 @@ test "parse cylinder.cfg.ziggy from samples/" {
     try expectApprox(1.4, pc.value.freestream.rho_fs, 1e-10);
     try expectApprox(0.2, pc.value.freestream.mach_fs, 1e-10);
 
+    // Fixed-size arrays go down a different path in the deserializer than
+    // slices do; check the elements, not just that parsing succeeded.
+    try testing.expectEqual([3]f64{ 1.0, 0.0, 0.0 }, pc.value.freestream.norm_fs);
+
     // Wall conditions
     try expectApprox(300.0, pc.value.wall_conditions.T_wall, 1e-10);
+    try testing.expectEqual([3]f64{ 1.0, 0.0, 0.0 }, pc.value.wall_conditions.norm_wall);
 
     // Filtering
     try testing.expectEqual(@as(u32, 0), pc.value.filtering.filt_on);

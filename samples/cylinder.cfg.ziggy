@@ -23,15 +23,6 @@
       .CFL = 0.5,
   },
 
-  .multigrid = .{
-      .mg_cycle = .v,
-      .FMG_vcycles = 1,
-      .p_multi = false,
-      .rel_fac = 1.0,
-      .mg_levels = [4, 3, 2],
-      .mg_steps = [8, 6, 4],
-  },
-
   .output = .{
       .output_prefix = "cylinder_rk3",
       .write_paraview = true,
@@ -77,19 +68,12 @@
       .norm_wall = [1.0, 0.0, 0.0],
   },
 
-  .filtering = .{
-      .filt_on = 0,
-      .sen_write = 1,
-      .alpha = 1.0,
-      .filtexp = 2.0,
-  },
-
   .boundary_conditions = .{
       .mesh_bounds = {
           "inlet": .sup_in,
           "outlet": .sup_out,
           "cylinder": .slip_wall,
-          "farfield": .char,
+          "farfield": .characteristic,
       },
   },
 

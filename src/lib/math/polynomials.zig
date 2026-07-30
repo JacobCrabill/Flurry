@@ -23,7 +23,6 @@ pub fn Lagrange(xi_grid: []const f64, xi: f64, mode: usize) f64 {
 /// @param xi  Point of evaluation in domain [-1,1].
 ///
 /// @return Value of first derivative of the Lagrange function at xi.
-///
 pub fn dLagrange(xi_grid: []const f64, xi: f64, mode: usize) f64 {
     var val: f64 = 0.0;
     const npts = xi_grid.len;

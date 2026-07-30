@@ -11,14 +11,14 @@ pub fn main(init: std.process.Init) !void {
     const cfg_file = "samples/cylinder.cfg.ziggy";
 
     // 1. parse (arena-backed — pc.deinit() frees everything at once)
-    var pc = config.loader.parse(io, alloc, cwd, cfg_file) catch |err| {
+    var pc = config.Loader.parse(io, alloc, cwd, cfg_file) catch |err| {
         std.debug.print("Failed to parse {s}: {}\n", .{ cfg_file, err });
         return err;
     };
     defer pc.deinit();
 
     // 2. post-parse init (derive computed values)
-    config.loader.initialize(&pc.value);
+    config.Loader.initialize(&pc.value);
 
     std.debug.print("Loaded: n_dims={}, mesh={s}, order={d}\n", .{
         pc.value.core.n_dims,

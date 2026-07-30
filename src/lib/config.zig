@@ -6,25 +6,18 @@ const ziggy = @import("ziggy");
 
 pub const Equation = enum { adv_diff, euler_ns };
 
-pub const DtScheme = enum {
-    // zig fmt: off
-    euler, rk44, rk54, rkJ, steady, dirk34, esdirk43, esdirk64,
-    // zig fmt: on
-};
+pub const DtScheme = enum { euler, rk44, rk54, rkJ, steady };
 
-pub const FluxConvType = enum { rusanov };
+pub const FluxConvType = enum { rusanov, roe };
 pub const FluxViscType = enum { ldg };
 
 pub const BoundaryCondition = enum {
     // zig fmt: off
-    none, periodic, char, sup_in, sup_out, slip_wall,
-    isothermal_noslip, isothermal_noslip_moving,
-    adiabatic_noslip, adiabatic_noslip_moving,
-    overset, symmetry, wall_closure, overset_closure,
+    none, periodic, characteristic, sup_in, sup_out, slip_wall,
+    isothermal_noslip, adiabatic_noslip, symmetry,
     // zig fmt: on
 };
 
-pub const MotionType = enum { static, test1, test2, test3, circular_trans, rigid_body };
 pub const IterativeMethod = enum { jac, mcgs };
 pub const LinearSolver = enum { lu, inv, svd };
 pub const MgCycle = enum { v, w };
@@ -58,10 +51,7 @@ pub const TimeConfig = struct {
     dt_type: u32 = 0,
     CFL: f64 = 1.0,
     CFL_type: u32 = 0,
-    implicit_method: bool = false,
-    implicit_steady: bool = false,
     adapt_dt: ?AdaptDtConfig = null,
-    implicit: ?ImplicitConfig = null,
 };
 
 pub const AdaptDtConfig = struct {
@@ -75,16 +65,6 @@ pub const AdaptDtConfig = struct {
     max_dt: f64 = 100.0,
 };
 
-pub const ImplicitConfig = struct {
-    FDA_Jacobian: bool = false,
-    linear_solver: LinearSolver = .lu,
-    pseudo_time: ?PseudoTimeConfig = null,
-};
-
-pub const PseudoTimeConfig = struct {
-    CFL_tau: f64 = 1.0,
-};
-
 pub const RestartConfig = struct {
     restart_file: []const u8 = "",
     restart_case: []const u8 = "",
@@ -93,21 +73,11 @@ pub const RestartConfig = struct {
     restart_npart: i32 = -1,
 };
 
-pub const MultigridConfig = struct {
-    mg_cycle: MgCycle = .v,
-    FMG_vcycles: u32 = 1,
-    p_multi: bool = false,
-    rel_fac: f64 = 1.0,
-    mg_levels: []u32,
-    mg_steps: []u32,
-};
-
 pub const OutputConfig = struct {
     output_prefix: []const u8,
     write_paraview: bool = true,
     write_pyfr: bool = false,
     plot_surfaces: bool = false,
-    plot_overset: bool = false,
     write_LHS: bool = false,
     write_RHS: bool = false,
     write_freq: u32,
@@ -160,45 +130,6 @@ pub const WallConditionsConfig = struct {
     norm_wall: [3]f64 = .{ 1.0, 0.0, 0.0 },
 };
 
-pub const FilteringConfig = struct {
-    filt_on: u32 = 0,
-    sen_write: u32 = 1,
-    sen_norm: u32 = 1,
-    sen_Jfac: f64 = 1.0,
-    alpha: f64 = 1.0,
-    filtexp: f64 = 2.0,
-    nonlin_exp: f64 = 2.0,
-};
-
-pub const OversetConfig = struct {
-    overset_grids: [][]const u8,
-    grid_types: []i32,
-};
-
-pub const MotionConfig = struct {
-    motion_type: MotionType = .static,
-    circular_trans: ?CircularTransConfig = null,
-    rigid_body: ?RigidBodyConfig = null,
-};
-
-pub const CircularTransConfig = struct {
-    move_Ax: f64,
-    move_Ay: f64,
-    move_Fx: f64,
-    move_Fy: f64,
-    move_Az: f64 = 0.0,
-    move_Fz: f64 = 0.0,
-};
-
-pub const RigidBodyConfig = struct {
-    g: f64 = 0.0,
-    full_6dof: bool = false,
-    v0: [3]f64 = .{ 0, 0, 0 },
-    w0: [3]f64 = .{ 0, 0, 0 },
-    mass: f64,
-    Imat: [9]f64,
-};
-
 /// Map from mesh boundary name -> BC enum. Ziggy dictionaries (`{"name": val, ...}`)
 /// deserialize directly into this, no hand-rolled entry-list + build step needed.
 pub const BoundaryConditionsConfig = struct {
@@ -247,16 +178,12 @@ pub const Config = struct {
     equation: EquationConfig,
     time: TimeConfig,
     restart: ?RestartConfig = null,
-    multigrid: MultigridConfig,
     output: OutputConfig,
     test_case: TestCaseConfig,
     flux: FluxConfig,
     gas_properties: GasPropertiesConfig,
     freestream: FreestreamConfig,
     wall_conditions: WallConditionsConfig,
-    filtering: FilteringConfig,
-    overset: ?OversetConfig = null,
-    motion: ?MotionConfig = null,
     boundary_conditions: BoundaryConditionsConfig,
     signals: SignalConfig,
     create_mesh: ?CreateMeshConfig = null,
@@ -278,7 +205,7 @@ pub const ParsedConfig = struct {
 
 // ── Loader (parse + initialize) ──────────────────────────────
 
-pub const loader = struct {
+pub const Loader = struct {
     /// Read file using std.Io API (same pattern as zigdown).
     fn readFile(io: Io, alloc: std.mem.Allocator, cwd: Io.Dir, path: []const u8) ![]u8 {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -365,9 +292,7 @@ pub const loader = struct {
     /// Post-parse init from CONFIG_PLAN.md "Init / Validation Logic".
     pub fn initialize(cfg: *Config) void {
         validateDimensions(cfg);
-        applyTimeDerivations(cfg);
-        applyMotionDefaults(cfg);
-        applyFilteringAutoDisable(cfg);
+        applyReportingDefaults(cfg);
     }
 
     fn validateDimensions(cfg: *Config) void {
@@ -377,27 +302,7 @@ pub const loader = struct {
         }
     }
 
-    fn applyTimeDerivations(cfg: *Config) void {
-        const t = &cfg.time;
-        if (t.dt_scheme == .steady) t.dt = null;
-
-        switch (t.dt_scheme) {
-            .steady, .dirk34, .esdirk43, .esdirk64 => t.implicit_method = true,
-            else => {},
-        }
-
-        if (!t.implicit_method) t.implicit_steady = false;
-    }
-
-    fn applyMotionDefaults(cfg: *Config) void {
-        const m = cfg.motion orelse return;
-        // motion disabled when static
-        if (m.motion_type == .static) cfg.motion = null;
-    }
-
-    fn applyFilteringAutoDisable(cfg: *Config) void {
-        const f = &cfg.filtering;
-        if (f.filt_on > 0 and cfg.core.order <= 1) f.filt_on = 0;
+    fn applyReportingDefaults(cfg: *Config) void {
         if (cfg.output.error_freq == 0) cfg.test_case.n_qpts_1d = 0;
     }
 

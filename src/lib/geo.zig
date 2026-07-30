@@ -6,6 +6,32 @@
 /// duplicated vertices, matching the original Flurry-cpp behavior.
 pub const CellType = enum { tri, quad, hex };
 
+/// Classification of each face. The numeric values are Flurry-cpp's, and the
+/// sign is meaningful: `c2b` marks a face as "on a boundary" when the value is
+/// greater than zero.
+pub const FaceType = enum(i8) {
+    internal = 0,
+    boundary = 1,
+    mpi = 2,
+};
+
+/// Stands in for the -1 that Flurry-cpp stored in its signed connectivity
+/// matrices: "no such cell / face / boundary". The connectivity members are
+/// unsigned here, so an out-of-range sentinel takes its place.
+pub const none: usize = std.math.maxInt(usize);
+
+/// Errors specific to deriving mesh connectivity.
+pub const ConnError = error{
+    /// A face is shared by more than two cells
+    NonManifoldFace,
+    /// `ctype` and `c2nf` disagree about how many faces a cell has
+    InconsistentCellType,
+    /// A cell type that does not exist in this many dimensions
+    UnsupportedCellType,
+    /// `core.n_dims` is neither 2 nor 3
+    UnsupportedDimension,
+};
+
 /// Errors specific to reading/parsing a Gmsh `.msh` file.
 pub const GmshError = error{
     /// A required `$Section` tag was not found in the file
@@ -95,8 +121,9 @@ pub const Geo = struct {
     /// lower-cased Gmsh PhysicalNames), parallel to `bc_list`
     bc_names: std.ArrayList([]const u8) = .empty,
 
-    /// Boundary condition for each boundary face
-    bc_type: std.ArrayList(usize) = .empty,
+    /// Boundary condition for each boundary face, indexed by position in
+    /// `bnd_faces`. `.none` marks a boundary face that matched no boundary.
+    bc_type: std.ArrayList(cfg.BoundaryCondition) = .empty,
 
     /// List of node IDs on each boundary
     bnd_pts: Matrix(usize) = .empty,
@@ -104,6 +131,8 @@ pub const Geo = struct {
     /// List of node IDs on each Gmsh boundary ("PhysicalName")
     bnd_pts_gmsh: std.ArrayList(std.ArrayList(usize)) = .empty,
 
+    /// Boundary index (into `bc_list`) for each boundary face, indexed by
+    /// position in `bnd_faces`. `none` where no boundary matched.
     bc_id: std.ArrayList(usize) = .empty,
     n_gmsh_bnds: usize = 0,
 
@@ -134,16 +163,18 @@ pub const Geo = struct {
     periodic_dy: f64 = 0.0,
     periodic_dz: f64 = 0.0,
 
-    // /// Type for each face: hole, internal, boundary, MPI, overset [-1,0,1,2,3]
-    // face_type: std.ArrayList(FACE_TYPE) = .empty,
+    /// Type for each face: internal, boundary, MPI
+    face_type: std.ArrayList(FaceType) = .empty,
 
-    /// Release everything `readGmsh` or `createMesh` allocated from `gpa`.
+    /// Release everything `readGmsh`, `createMesh` or `processConnectivity`
+    /// allocated from `gpa`.
     pub fn deinit(geo: *Geo) void {
         const gpa = geo.gpa;
+
+        // Mesh
         geo.c2v.deinit(gpa);
         geo.xv.deinit(gpa);
         geo.bnd_pts.deinit(gpa);
-
         geo.c2nv.deinit(gpa);
         geo.c2nf.deinit(gpa);
         geo.ctype.deinit(gpa);
@@ -153,6 +184,23 @@ pub const Geo = struct {
 
         for (geo.bc_names.items) |name| gpa.free(name);
         geo.bc_names.deinit(gpa);
+
+        // Connectivity
+        geo.f2v.deinit(gpa);
+        geo.e2v.deinit(gpa);
+        geo.c2f.deinit(gpa);
+        geo.c2b.deinit(gpa);
+        geo.c2c.deinit(gpa);
+        geo.f2c.deinit(gpa);
+        geo.f2nv.deinit(gpa);
+        geo.face_type.deinit(gpa);
+        geo.int_faces.deinit(gpa);
+        geo.bnd_faces.deinit(gpa);
+        geo.bc_type.deinit(gpa);
+        geo.bc_id.deinit(gpa);
+
+        for (geo.bc_faces.items) |*mat| mat.deinit(gpa);
+        geo.bc_faces.deinit(gpa);
     }
 
     /// Read a Gmsh `.msh` file (ASCII format 2.x or 4.x) and populate the
@@ -910,7 +958,367 @@ pub const Geo = struct {
             }
         }
     }
+
+    // ---- Connectivity processing ----
+
+    /// Derive face and neighbour connectivity from `c2v`: `f2v`, `f2nv`,
+    /// `face_type`, `int_faces`, `bnd_faces`, `c2f`, `c2b`, `c2c`, `f2c`, the
+    /// boundary-face matching (`bc_type`, `bc_id`, `bc_faces`), and in 3D the
+    /// edge list (`e2v`, `n_edges`).
+    ///
+    /// Must be called after `readGmsh` or `createMesh`.
+    ///
+    /// TODO: Flurry-cpp's `processConnectivity` continues on to
+    /// `processConnExtra` (v2v/v2e and the bounding box),
+    /// `processPeriodicBoundaries` and `matchMPIFaces`; none of those are
+    /// ported yet.
+    pub fn processConnectivity(geo: *Geo) !void {
+        report("Geo: Processing element connectivity\n", .{});
+
+        var arena_state: std.heap.ArenaAllocator = .init(geo.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        switch (geo.n_dims) {
+            2 => try geo.processConn2D(arena),
+            3 => try geo.processConn3D(arena),
+            else => return error.UnsupportedDimension,
+        }
+    }
+
+    /// 2D: the faces are the cell edges.
+    fn processConn2D(geo: *Geo, arena: std.mem.Allocator) !void {
+        for (geo.ctype.items) |ct| {
+            if (ct == .hex) return error.UnsupportedCellType;
+        }
+
+        var faces: FaceBuilder = .empty;
+        try geo.buildFaces(arena, &faces);
+        try geo.finishConn(arena, &faces);
+    }
+
+    /// 3D: the faces come from each cell type's local face table, and the edge
+    /// list is accumulated alongside them.
+    fn processConn3D(geo: *Geo, arena: std.mem.Allocator) !void {
+        for (geo.ctype.items) |ct| {
+            if (ct != .hex) return error.UnsupportedCellType;
+        }
+
+        var faces: FaceBuilder = .empty;
+        try geo.buildFaces(arena, &faces);
+        try geo.buildEdges(arena);
+        try geo.finishConn(arena, &faces);
+    }
+
+    /// Walk every cell face, registering it in `faces` and recording which
+    /// global face each cell slot maps to in `c2f`.
+    fn buildFaces(geo: *Geo, arena: std.mem.Allocator, faces: *FaceBuilder) !void {
+        const gpa = geo.gpa;
+
+        var max_nf: usize = 0;
+        for (geo.c2nf.items) |nf| max_nf = @max(max_nf, nf);
+
+        geo.c2f = try Matrix(usize).init(gpa, geo.n_eles, max_nf, null);
+        @memset(geo.c2f.data, none);
+
+        var verts: [max_face_verts]usize = undefined;
+
+        // A 2D face (edge) needs two distinct vertices, a 3D face three; with
+        // fewer it has collapsed to a line or a point and is not a face.
+        const min_verts: usize = if (geo.n_dims == 3) 3 else 2;
+
+        for (0..geo.n_eles) |ic| {
+            const local = localFaces(geo.ctype.items[ic]);
+            // A collapsed cell (a tet stored as a hex, say) reports fewer faces
+            // than its type has. Flurry-cpp silently processed only the first
+            // c2nf of them, quietly dropping the rest.
+            if (local.len != geo.c2nf.items[ic]) {
+                report(
+                    "Geo: cell {d} is a {s} with {d} faces, but its type has {d}\n",
+                    .{ ic, @tagName(geo.ctype.items[ic]), geo.c2nf.items[ic], local.len },
+                );
+                return error.InconsistentCellType;
+            }
+
+            for (local, 0..) |lf, j| {
+                for (lf, 0..) |lv, i| verts[i] = geo.c2v.get(ic, lv);
+                const key = FaceKey.init(verts[0..lf.len]);
+                if (key.n_verts < min_verts) continue;
+
+                geo.c2f.at(ic, j).* = try faces.add(arena, key);
+            }
+        }
+    }
+
+    /// Collect the unique mesh edges (3D only; in 2D the faces *are* the edges).
+    ///
+    /// Flurry-cpp derived these by pairing up each face's *sorted* vertex list,
+    /// which does not describe the face's edges at all -- sorting destroys the
+    /// cyclic order, so two of the four pairs came out as diagonals. Edges are
+    /// taken from the local face table's cyclic order here instead.
+    fn buildEdges(geo: *Geo, arena: std.mem.Allocator) !void {
+        var edges: std.AutoArrayHashMapUnmanaged([2]usize, void) = .empty;
+
+        for (0..geo.n_eles) |ic| {
+            for (localFaces(geo.ctype.items[ic])) |lf| {
+                for (lf, 0..) |lv, i| {
+                    const iv1 = geo.c2v.get(ic, lv);
+                    const iv2 = geo.c2v.get(ic, lf[(i + 1) % lf.len]);
+                    if (iv1 == iv2) continue; // collapsed edge
+                    const key: [2]usize = if (iv1 < iv2) .{ iv1, iv2 } else .{ iv2, iv1 };
+                    try edges.put(arena, key, {});
+                }
+            }
+        }
+
+        geo.n_edges = edges.count();
+        geo.e2v = try Matrix(usize).init(geo.gpa, geo.n_edges, 2, null);
+        for (edges.keys(), 0..) |key, ie| {
+            geo.e2v.at(ie, 0).* = key[0];
+            geo.e2v.at(ie, 1).* = key[1];
+        }
+    }
+
+    /// Everything after face enumeration, shared by 2D and 3D: pack `f2v`,
+    /// classify each face, match boundary faces to boundaries, and link cells
+    /// to faces and to each other.
+    fn finishConn(geo: *Geo, arena: std.mem.Allocator, faces: *FaceBuilder) !void {
+        const gpa = geo.gpa;
+
+        // --- f2v / f2nv ---
+        // Rows hold the face's vertices in ascending order, not in an oriented
+        // traversal; matching duplicates is all they are used for.
+        geo.n_faces = faces.keys.count();
+        var max_fnv: usize = 0;
+        for (faces.keys.keys()) |key| max_fnv = @max(max_fnv, key.n_verts);
+
+        geo.f2v = try Matrix(usize).init(gpa, geo.n_faces, max_fnv, null);
+        @memset(geo.f2v.data, none);
+        try geo.f2nv.resize(gpa, geo.n_faces);
+        for (faces.keys.keys(), 0..) |key, ff| {
+            geo.f2nv.items[ff] = key.n_verts;
+            for (0..key.n_verts) |j| geo.f2v.at(ff, j).* = key.verts[j];
+        }
+
+        // --- Internal vs. boundary faces ---
+        // MPI faces still count as boundary faces at this stage.
+        try geo.face_type.appendNTimes(gpa, .internal, geo.n_faces);
+        geo.n_int_faces = 0;
+        geo.n_bnd_faces = 0;
+        geo.n_mpi_faces = 0;
+
+        for (faces.n_cells.items, 0..) |n_cells, ff| {
+            switch (n_cells) {
+                1 => {
+                    geo.face_type.items[ff] = .boundary;
+                    try geo.bnd_faces.append(gpa, ff);
+                    geo.n_bnd_faces += 1;
+                },
+                2 => {
+                    try geo.int_faces.append(gpa, ff);
+                    geo.n_int_faces += 1;
+                },
+                else => {
+                    report("Geo: face {d} is shared by {d} cells\n", .{ ff, n_cells });
+                    return error.NonManifoldFace;
+                },
+            }
+        }
+
+        try geo.matchBoundaryFaces(arena);
+        try geo.linkCellsAndFaces();
+    }
+
+    /// Assign each boundary face to a boundary: every one of its vertices must
+    /// lie on that boundary. Fills `bc_type`, `bc_id` and `bc_faces`.
+    fn matchBoundaryFaces(geo: *Geo, arena: std.mem.Allocator) !void {
+        const gpa = geo.gpa;
+
+        try geo.bc_type.appendNTimes(gpa, .none, geo.n_bnd_faces);
+        try geo.bc_id.appendNTimes(gpa, none, geo.n_bnd_faces);
+
+        // Face IDs per boundary, gathered before packing into bc_faces
+        const per_bnd = try arena.alloc(std.ArrayList(usize), geo.n_bounds);
+        for (per_bnd) |*l| l.* = .empty;
+
+        var n_unmatched: usize = 0;
+        for (geo.bnd_faces.items, 0..) |ff, i| {
+            const matched = for (0..geo.n_bounds) |bnd| {
+                if (geo.faceOnBoundary(ff, bnd)) break bnd;
+            } else null;
+
+            if (matched) |bnd| {
+                geo.bc_type.items[i] = geo.bc_list.items[bnd];
+                geo.bc_id.items[i] = bnd;
+                try per_bnd[bnd].append(arena, ff);
+            } else {
+                n_unmatched += 1;
+            }
+        }
+
+        if (n_unmatched > 0) {
+            // In a parallel run these would be the processor boundaries; with
+            // no MPI support yet, they mean the mesh has boundary faces that
+            // no declared boundary covers.
+            report(
+                "Geo: WARNING: {d} of {d} boundary faces matched no boundary\n",
+                .{ n_unmatched, geo.n_bnd_faces },
+            );
+        }
+
+        // --- Pack bc_faces, and record how many faces each boundary has ---
+        try geo.n_faces_per_bnd.resize(gpa, geo.n_bounds);
+        try geo.bc_faces.resize(gpa, geo.n_bounds);
+        for (per_bnd, 0..) |*list, bnd| {
+            geo.n_faces_per_bnd.items[bnd] = list.items.len;
+            var mat = try Matrix(usize).init(gpa, list.items.len, geo.f2v.cols, null);
+            @memset(mat.data, none);
+            for (list.items, 0..) |ff, row| {
+                for (0..geo.f2nv.items[ff]) |j| mat.at(row, j).* = geo.f2v.get(ff, j);
+            }
+            geo.bc_faces.items[bnd] = mat;
+        }
+    }
+
+    /// Whether every vertex of face `ff` lies on boundary `bnd`.
+    fn faceOnBoundary(geo: *const Geo, ff: usize, bnd: usize) bool {
+        // bnd_pts rows are sorted and n_bnd_pts gives the exact extent, so the
+        // zero padding beyond it is never searched.
+        const row = geo.bnd_pts.data[bnd * geo.bnd_pts.stride ..];
+        const pts = row[0..geo.n_bnd_pts.items[bnd]];
+
+        for (0..geo.f2nv.items[ff]) |j| {
+            const iv = geo.f2v.get(ff, j);
+            if (std.sort.binarySearch(usize, pts, iv, orderUsize) == null) return false;
+        }
+        return true;
+    }
+
+    /// Fill `f2c` (the up-to-two cells on each face), `c2c` (face-neighbour
+    /// cells) and `c2b` (whether each cell face is on a boundary).
+    fn linkCellsAndFaces(geo: *Geo) !void {
+        const gpa = geo.gpa;
+        const max_nf = geo.c2f.cols;
+
+        geo.c2b = try Matrix(usize).init(gpa, geo.n_eles, max_nf, null);
+        geo.c2c = try Matrix(usize).init(gpa, geo.n_eles, max_nf, null);
+        @memset(geo.c2c.data, none);
+        geo.f2c = try Matrix(usize).init(gpa, geo.n_faces, 2, null);
+        @memset(geo.f2c.data, none);
+
+        for (0..geo.n_eles) |ic| {
+            for (0..geo.c2nf.items[ic]) |j| {
+                const ff = geo.c2f.get(ic, j);
+                if (ff == none) continue; // collapsed face
+
+                geo.c2b.at(ic, j).* = @intFromBool(@backingInt(geo.face_type.items[ff]) > 0);
+
+                const left = geo.f2c.get(ff, 0);
+                if (left == none) {
+                    // First cell seen on this face goes on the left
+                    geo.f2c.at(ff, 0).* = ic;
+                    continue;
+                }
+                // A collapsed cell can reach the same face twice; it is not its
+                // own neighbour.
+                if (left == ic) continue;
+
+                geo.f2c.at(ff, 1).* = ic;
+
+                // Both cells are now neighbours across face ff. The left cell
+                // has a lower ID, so its c2f row is already filled in.
+                const fid2 = for (0..geo.c2nf.items[left]) |k| {
+                    if (geo.c2f.get(left, k) == ff) break k;
+                } else unreachable;
+
+                geo.c2c.at(ic, j).* = left;
+                geo.c2c.at(left, fid2).* = ic;
+            }
+        }
+    }
 };
+
+fn orderUsize(key: usize, mid: usize) std.math.Order {
+    return std.math.order(key, mid);
+}
+
+/// Faces are identified by their corner vertices only, so four is the most any
+/// supported cell type needs (a hex face); a 2D "face" is an edge, with two.
+const max_face_verts = 4;
+
+/// A face's identity: its corner vertices, sorted ascending and de-duplicated,
+/// with the unused slots set to `none`.
+///
+/// Sorting makes the same face reachable from either adjoining cell regardless
+/// of the order that cell lists it in, and de-duplicating turns a collapsed
+/// quad face into the triangle it geometrically is. Flurry-cpp instead replaced
+/// repeated vertices with -1 before sorting, which left the sentinel *inside*
+/// the key and made a 3-vertex face compare equal to the first three entries of
+/// an unrelated 4-vertex one.
+const FaceKey = struct {
+    verts: [max_face_verts]usize,
+    n_verts: usize,
+
+    fn init(verts: []const usize) FaceKey {
+        std.debug.assert(verts.len >= 2 and verts.len <= max_face_verts);
+
+        var key: FaceKey = .{ .verts = @splat(none), .n_verts = 0 };
+        @memcpy(key.verts[0..verts.len], verts);
+        std.mem.sortUnstable(usize, key.verts[0..verts.len], {}, std.sort.asc(usize));
+
+        // Collapse runs of equal vertices, then blank the freed slots so the
+        // key stays comparable by value.
+        for (key.verts[0..verts.len]) |v| {
+            if (key.n_verts > 0 and key.verts[key.n_verts - 1] == v) continue;
+            key.verts[key.n_verts] = v;
+            key.n_verts += 1;
+        }
+        @memset(key.verts[key.n_verts..], none);
+        return key;
+    }
+};
+
+/// Builds the unique global face list, counting how many cells touch each.
+///
+/// Flurry-cpp matched cell faces against the global list with a linear scan per
+/// face, making its 3D connectivity O(n_eles * n_faces); a hash lookup keeps it
+/// linear.
+const FaceBuilder = struct {
+    keys: std.AutoArrayHashMapUnmanaged(FaceKey, void),
+    n_cells: std.ArrayList(usize),
+
+    const empty: FaceBuilder = .{ .keys = .empty, .n_cells = .empty };
+
+    /// Global ID of `key`, registering it the first time it is seen. Face IDs
+    /// are assignment order, which the hash map preserves.
+    fn add(fb: *FaceBuilder, arena: std.mem.Allocator, key: FaceKey) !usize {
+        const gop = try fb.keys.getOrPut(arena, key);
+        if (!gop.found_existing) try fb.n_cells.append(arena, 0);
+        fb.n_cells.items[gop.index] += 1;
+        return gop.index;
+    }
+};
+
+/// Corner-vertex indices of each face of a cell, in cyclic order. In 2D a
+/// "face" is an edge.
+///
+/// The hex ordering is Flurry-cpp's `ct2fv[HEX]`, which carries a
+/// "FIX ORDERING FOR FUTURE USE" note upstream -- it is not necessarily the
+/// face ordering the solver's flux points assume.
+fn localFaces(ct: CellType) []const []const u8 {
+    return switch (ct) {
+        .tri => &.{ &.{ 0, 1 }, &.{ 1, 2 }, &.{ 2, 0 } },
+        .quad => &.{ &.{ 0, 1 }, &.{ 1, 2 }, &.{ 2, 3 }, &.{ 3, 0 } },
+        .hex => &.{
+            &.{ 0, 1, 2, 3 }, // Bottom (zmin)
+            &.{ 4, 5, 6, 7 }, // Top    (zmax)
+            &.{ 3, 0, 4, 7 }, // Left   (xmin)
+            &.{ 2, 1, 5, 6 }, // Right  (xmax)
+            &.{ 1, 0, 4, 5 }, // Front  (ymin)
+            &.{ 3, 2, 6, 7 }, // Back   (ymax)
+        },
+    };
+}
 
 /// Uniform Cartesian grid geometry: cell counts, origin and spacing.
 ///
@@ -1479,7 +1887,7 @@ test "createMesh: 3D, one BC per side" {
         .bc_right = .sup_out,
         .bc_top = .symmetry,
         .bc_left = .sup_in,
-        .bc_front = .char,
+        .bc_front = .characteristic,
         .bc_back = .adiabatic_noslip,
     });
     defer geo.deinit();
@@ -1508,7 +1916,7 @@ test "createMesh: 3D, one BC per side" {
     // char < sup_in < sup_out < slip_wall < adiabatic_noslip < symmetry
     try t.expectEqual(@as(usize, 6), geo.n_bounds);
     try t.expectEqualSlices(cfg.BoundaryCondition, &.{
-        .char, .sup_in, .sup_out, .slip_wall, .adiabatic_noslip, .symmetry,
+        .characteristic, .sup_in, .sup_out, .slip_wall, .adiabatic_noslip, .symmetry,
     }, geo.bc_list.items);
 
     // In 3D bottom/top are z, left/right are x, back/front are y
@@ -1571,6 +1979,323 @@ test "createMesh: missing config section is an error" {
     defer geo.deinit();
 
     try std.testing.expectError(error.MissingCreateMeshConfig, geo.createMesh());
+}
+
+// ---- processConnectivity ----
+
+/// Row `ic` of `c2f` / `c2b` / `c2c`, trimmed to the cell's own face count.
+fn cellRow(mat: *const Matrix(usize), ic: usize, n: usize) []const usize {
+    return mat.data[ic * mat.stride ..][0..n];
+}
+
+/// Checks that hold for any valid mesh, whatever its shape.
+fn expectConnInvariants(geo: *const Geo) !void {
+    const t = std.testing;
+
+    try t.expectEqual(geo.n_faces, geo.n_int_faces + geo.n_bnd_faces);
+    try t.expectEqual(geo.n_int_faces, geo.int_faces.items.len);
+    try t.expectEqual(geo.n_bnd_faces, geo.bnd_faces.items.len);
+
+    // Each face is claimed by exactly as many cells as its type implies, and
+    // f2c agrees with c2f in both directions.
+    var n_slots: usize = 0;
+    for (0..geo.n_eles) |ic| {
+        for (0..geo.c2nf.items[ic]) |j| {
+            const ff = geo.c2f.get(ic, j);
+            if (ff == none) continue;
+            n_slots += 1;
+            try t.expect(ff < geo.n_faces);
+            try t.expect(geo.f2c.get(ff, 0) == ic or geo.f2c.get(ff, 1) == ic);
+
+            // c2b mirrors face_type, and c2c is set iff the face is internal
+            const on_bnd = geo.face_type.items[ff] != .internal;
+            try t.expectEqual(@intFromBool(on_bnd), geo.c2b.get(ic, j));
+            try t.expectEqual(!on_bnd, geo.c2c.get(ic, j) != none);
+        }
+    }
+    try t.expectEqual(2 * geo.n_int_faces + geo.n_bnd_faces, n_slots);
+
+    for (geo.int_faces.items) |ff| {
+        try t.expectEqual(FaceType.internal, geo.face_type.items[ff]);
+        try t.expect(geo.f2c.get(ff, 0) != none and geo.f2c.get(ff, 1) != none);
+    }
+    for (geo.bnd_faces.items) |ff| {
+        try t.expectEqual(FaceType.boundary, geo.face_type.items[ff]);
+        try t.expect(geo.f2c.get(ff, 0) != none and geo.f2c.get(ff, 1) == none);
+    }
+
+    // c2c is symmetric: if A sees B across a face, B sees A across one too.
+    for (0..geo.n_eles) |ic| {
+        for (0..geo.c2nf.items[ic]) |j| {
+            const nb = geo.c2c.get(ic, j);
+            if (nb == none) continue;
+            try t.expect(nb != ic);
+            const back = cellRow(&geo.c2c, nb, geo.c2nf.items[nb]);
+            try t.expect(std.mem.indexOfScalar(usize, back, ic) != null);
+        }
+    }
+
+    // f2v rows are sorted ascending; face identity relies on it
+    for (0..geo.n_faces) |ff| {
+        for (1..geo.f2nv.items[ff]) |j| {
+            try t.expect(geo.f2v.get(ff, j - 1) < geo.f2v.get(ff, j));
+        }
+    }
+
+    // bc_faces row counts agree with n_faces_per_bnd and with bc_id
+    for (0..geo.n_bounds) |bnd| {
+        try t.expectEqual(geo.n_faces_per_bnd.items[bnd], geo.bc_faces.items[bnd].rows);
+        var n: usize = 0;
+        for (geo.bc_id.items) |id| {
+            if (id == bnd) n += 1;
+        }
+        try t.expectEqual(n, geo.n_faces_per_bnd.items[bnd]);
+    }
+}
+
+test "processConnectivity: 2D, 2x2 quads" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 2, .{
+        .nx = 2,
+        .ny = 2,
+        .bc_bottom = .slip_wall,
+        .bc_right = .sup_out,
+        .bc_top = .symmetry,
+        .bc_left = .sup_in,
+    });
+    defer geo.deinit();
+
+    try geo.createMesh();
+    try geo.processConnectivity();
+
+    // 12 edges: 3 rows of 2 horizontal + 3 columns of 2 vertical. The four
+    // touching the center vertex are interior; the 8 perimeter ones are not.
+    try t.expectEqual(@as(usize, 12), geo.n_faces);
+    try t.expectEqual(@as(usize, 4), geo.n_int_faces);
+    try t.expectEqual(@as(usize, 8), geo.n_bnd_faces);
+    try t.expectEqual(@as(usize, 0), geo.n_mpi_faces);
+
+    // Face IDs follow first-encounter order over cells and their edge slots
+    try t.expectEqualSlices(usize, &.{ 0, 1, 2, 3 }, cellRow(&geo.c2f, 0, 4));
+    try t.expectEqualSlices(usize, &.{ 2, 4, 5, 6 }, cellRow(&geo.c2f, 1, 4));
+    try t.expectEqualSlices(usize, &.{ 7, 8, 9, 1 }, cellRow(&geo.c2f, 2, 4));
+    try t.expectEqualSlices(usize, &.{ 9, 10, 11, 4 }, cellRow(&geo.c2f, 3, 4));
+
+    try t.expectEqualSlices(usize, &.{ 1, 2, 4, 9 }, geo.int_faces.items);
+    try t.expectEqualSlices(usize, &.{ 0, 3, 5, 6, 7, 8, 10, 11 }, geo.bnd_faces.items);
+
+    // f2v holds sorted vertex pairs
+    try t.expectEqual(@as(usize, 0), geo.f2v.get(0, 0));
+    try t.expectEqual(@as(usize, 1), geo.f2v.get(0, 1));
+    try t.expectEqual(@as(usize, 1), geo.f2v.get(1, 0));
+    try t.expectEqual(@as(usize, 4), geo.f2v.get(1, 1));
+
+    // Cell 0 is the lower-left quad: bottom and left edges are on boundaries,
+    // the other two are shared with cells 2 (+x) and 1 (+y).
+    try t.expectEqualSlices(usize, &.{ 1, 0, 0, 1 }, cellRow(&geo.c2b, 0, 4));
+    try t.expectEqualSlices(usize, &.{ none, 2, 1, none }, cellRow(&geo.c2c, 0, 4));
+    try t.expectEqualSlices(usize, &.{ 9, 10, 11, 4 }, cellRow(&geo.c2f, 3, 4));
+
+    try t.expectEqual(@as(usize, 0), geo.f2c.get(1, 0));
+    try t.expectEqual(@as(usize, 2), geo.f2c.get(1, 1));
+    try t.expectEqual(@as(usize, 0), geo.f2c.get(0, 0));
+    try t.expectEqual(none, geo.f2c.get(0, 1));
+
+    // bc_list is [sup_in, sup_out, slip_wall, symmetry] = [left, right, bottom, top]
+    try t.expectEqualSlices(usize, &.{ 2, 0, 3, 0, 2, 1, 1, 3 }, geo.bc_id.items);
+    try t.expectEqualSlices(cfg.BoundaryCondition, &.{
+        .slip_wall, .sup_in,  .symmetry, .sup_in,
+        .slip_wall, .sup_out, .sup_out,  .symmetry,
+    }, geo.bc_type.items);
+
+    // Two edges per side, matching what createMesh counted
+    try t.expectEqualSlices(usize, &.{ 2, 2, 2, 2 }, geo.n_faces_per_bnd.items);
+
+    try expectConnInvariants(&geo);
+}
+
+test "processConnectivity: 3D, single hex" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 3, .{
+        .nx = 1,
+        .ny = 1,
+        .nz = 1,
+        .bc_bottom = .slip_wall,
+        .bc_right = .sup_out,
+        .bc_top = .symmetry,
+        .bc_left = .sup_in,
+        .bc_front = .characteristic,
+        .bc_back = .adiabatic_noslip,
+    });
+    defer geo.deinit();
+
+    try geo.createMesh();
+    try geo.processConnectivity();
+
+    try t.expectEqual(@as(usize, 6), geo.n_faces);
+    try t.expectEqual(@as(usize, 0), geo.n_int_faces);
+    try t.expectEqual(@as(usize, 6), geo.n_bnd_faces);
+    for (geo.f2nv.items) |fnv| try t.expectEqual(@as(usize, 4), fnv);
+
+    // A cube has 12 edges. Flurry-cpp paired up each face's *sorted* vertex
+    // list, which yields diagonals instead of edges and would not give 12.
+    try t.expectEqual(@as(usize, 12), geo.n_edges);
+    for (0..geo.n_edges) |ie| {
+        try t.expect(geo.e2v.get(ie, 0) < geo.e2v.get(ie, 1));
+    }
+
+    // The hex local face table's sides line up with createMesh's 3D boundary
+    // naming: bottom/top are z, left/right are x, back/front are y.
+    // bc_list = [characteristic, sup_in, sup_out, slip_wall, adiabatic_noslip, symmetry]
+    try t.expectEqualSlices(usize, &.{ 3, 5, 1, 2, 4, 0 }, geo.bc_id.items);
+    try t.expectEqualSlices(usize, &.{ 1, 1, 1, 1, 1, 1 }, geo.n_faces_per_bnd.items);
+
+    // Every face is on a boundary, so the cell has no neighbours
+    try t.expectEqualSlices(usize, &.{ 1, 1, 1, 1, 1, 1 }, cellRow(&geo.c2b, 0, 6));
+    try t.expectEqualSlices(usize, &.{ none, none, none, none, none, none }, cellRow(&geo.c2c, 0, 6));
+
+    try expectConnInvariants(&geo);
+}
+
+test "processConnectivity: 3D, two hexes share one face" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 3, .{ .nx = 2, .ny = 1, .nz = 1 });
+    defer geo.deinit();
+
+    try geo.createMesh();
+    try geo.processConnectivity();
+
+    // 2 * 6 faces with one shared => 11 distinct, 1 of them interior
+    try t.expectEqual(@as(usize, 11), geo.n_faces);
+    try t.expectEqual(@as(usize, 1), geo.n_int_faces);
+    try t.expectEqual(@as(usize, 10), geo.n_bnd_faces);
+
+    // The two cells are each other's only neighbour
+    const shared = geo.int_faces.items[0];
+    try t.expectEqual(@as(usize, 0), geo.f2c.get(shared, 0));
+    try t.expectEqual(@as(usize, 1), geo.f2c.get(shared, 1));
+
+    var n_links: usize = 0;
+    for (0..2) |ic| {
+        for (cellRow(&geo.c2c, ic, 6)) |nb| {
+            if (nb != none) n_links += 1;
+        }
+    }
+    try t.expectEqual(@as(usize, 2), n_links);
+
+    try expectConnInvariants(&geo);
+}
+
+test "processConnectivity: invariants hold on larger meshes" {
+    const gpa = std.testing.allocator;
+
+    {
+        var config: cfg.Config = undefined;
+        var geo = testCreateGeo(gpa, &config, 2, .{
+            .nx = 5,
+            .ny = 4,
+            .bc_bottom = .slip_wall,
+            .bc_top = .symmetry,
+        });
+        defer geo.deinit();
+        try geo.createMesh();
+        try geo.processConnectivity();
+
+        // 6 columns of 4 vertical edges + 5 rows... i.e. (nx+1)*ny + nx*(ny+1)
+        try std.testing.expectEqual(@as(usize, 6 * 4 + 5 * 5), geo.n_faces);
+        try std.testing.expectEqual(@as(usize, 2 * (5 + 4)), geo.n_bnd_faces);
+        try expectConnInvariants(&geo);
+    }
+
+    {
+        var config: cfg.Config = undefined;
+        var geo = testCreateGeo(gpa, &config, 3, .{
+            .nx = 3,
+            .ny = 2,
+            .nz = 2,
+            .bc_left = .sup_in,
+            .bc_right = .sup_out,
+        });
+        defer geo.deinit();
+        try geo.createMesh();
+        try geo.processConnectivity();
+
+        // Faces normal to each axis: (n+1) planes of the other two counts
+        const nx = 3;
+        const ny = 2;
+        const nz = 2;
+        try std.testing.expectEqual(
+            @as(usize, (nx + 1) * ny * nz + nx * (ny + 1) * nz + nx * ny * (nz + 1)),
+            geo.n_faces,
+        );
+        try std.testing.expectEqual(
+            @as(usize, 2 * (nx * ny + nx * nz + ny * nz)),
+            geo.n_bnd_faces,
+        );
+        // A structured box has one edge per grid line segment
+        try std.testing.expectEqual(
+            @as(usize, nx * (ny + 1) * (nz + 1) + (nx + 1) * ny * (nz + 1) + (nx + 1) * (ny + 1) * nz),
+            geo.n_edges,
+        );
+        try expectConnInvariants(&geo);
+    }
+}
+
+test "processConnectivity: boundary faces with no matching boundary" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    var config: cfg.Config = undefined;
+    var geo = try testGeo(gpa, arena.allocator(), &config);
+    defer geo.deinit();
+
+    // mesh_v2 is a single quad, but only two of its four edges belong to a
+    // declared boundary ("Wall" = {0,1} and "Inlet" = {2,3}).
+    try geo.parseGmsh(arena.allocator(), mesh_v2);
+    try geo.processConnectivity();
+
+    try t.expectEqual(@as(usize, 4), geo.n_faces);
+    try t.expectEqual(@as(usize, 0), geo.n_int_faces);
+    try t.expectEqual(@as(usize, 4), geo.n_bnd_faces);
+
+    // Faces are {0,1}, {1,2}, {2,3}, {0,3}; the two diagonal-adjacent ones
+    // span both boundaries and so match neither.
+    try t.expectEqualSlices(usize, &.{ 0, none, 1, none }, geo.bc_id.items);
+    try t.expectEqualSlices(cfg.BoundaryCondition, &.{
+        .slip_wall, .none, .sup_in, .none,
+    }, geo.bc_type.items);
+    try t.expectEqualSlices(usize, &.{ 1, 1 }, geo.n_faces_per_bnd.items);
+
+    try expectConnInvariants(&geo);
+}
+
+test "processConnectivity: rejects a mesh dimension mismatch" {
+    const gpa = std.testing.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 2, .{ .nx = 2, .ny = 2 });
+    defer geo.deinit();
+
+    try geo.createMesh();
+
+    // 2D quads cannot be processed as a 3D mesh, and vice versa
+    geo.n_dims = 3;
+    try std.testing.expectError(error.UnsupportedCellType, geo.processConnectivity());
+
+    geo.n_dims = 4;
+    try std.testing.expectError(error.UnsupportedDimension, geo.processConnectivity());
 }
 
 const std = @import("std");

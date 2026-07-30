@@ -14,11 +14,6 @@
       .n_steps = 100,
   },
 
-  .multigrid = .{
-      .mg_levels = [2],
-      .mg_steps = [4],
-  },
-
   .output = .{
       .output_prefix = "out",
       .write_freq = 100,
@@ -64,16 +59,6 @@
       .mach_wall = 0.0,
       .T_wall = 300.0,
       .norm_wall = [1.0, 0.0, 0.0],
-  },
-
-  .filtering = .{
-      .filt_on = 0,
-      .sen_write = 1,
-      .sen_norm = 1,
-      .sen_Jfac = 1.0,
-      .alpha = 1.0,
-      .filtexp = 2.0,
-      .nonlin_exp = 2.0,
   },
 
   .boundary_conditions = .{

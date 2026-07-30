@@ -13,11 +13,6 @@
         .n_steps = 100,
     },
 
-    .multigrid = .{
-        .mg_levels = [2],
-        .mg_steps = [4],
-    },
-
     .output = .{
         .output_prefix = "out",
         .write_freq = 100,
@@ -33,8 +28,6 @@
     .freestream = .{},
 
     .wall_conditions = .{},
-
-    .filtering = .{},
 
     .boundary_conditions = .{
         .mesh_bounds = {

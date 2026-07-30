@@ -444,7 +444,7 @@ test "uniform flow has exactly zero residual" {
             defer s.deinit();
 
             try s.initializeU();
-            s.extrapolateU();
+            try s.extrapolateU();
             s.computeFluxSpts();
             s.computeDivFSpts(0);
             fillExactFComm(&s, 2);
@@ -488,7 +488,7 @@ test "linear flow reproduces its analytic divergence" {
         }
     }
 
-    s.extrapolateU();
+    try s.extrapolateU();
     s.computeFluxSpts();
     s.computeDivFSpts(0);
     fillExactFComm(&s, 2);
@@ -529,7 +529,7 @@ test "extrapolateU matches applying oppE by hand" {
         }
     }
 
-    s.extrapolateU();
+    try s.extrapolateU();
 
     for (0..ele.n_fpts) |fpt| {
         for (0..s.n_vars) |n| {
@@ -727,7 +727,7 @@ test "free-stream is preserved on cells away from the boundary" {
 
             // computeResidual itself still stops at applyBcs, so drive the
             // chain directly.
-            s.extrapolateU();
+            try s.extrapolateU();
             s.scatterUToFaces();
             s.computeFluxSpts();
             s.computeDivFSpts(0);
@@ -1608,7 +1608,7 @@ test "free-stream is preserved on a non-affine mesh" {
             try testing.expect(worst_asym > 1e-2);
 
             try s.initializeU();
-            s.extrapolateU();
+            try s.extrapolateU();
             s.scatterUToFaces();
             s.computeFluxSpts();
             s.computeDivFSpts(0);

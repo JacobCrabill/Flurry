@@ -2,10 +2,13 @@ const std = @import("std");
 const Io = std.Io;
 const flurry = @import("flurry");
 const config = flurry.config;
+const gpu = flurry.gpu;
 const Run = flurry.driver.Run;
 
 const usage =
-    \\usage: flurry <case.cfg.ziggy>
+    \\usage: flurry [--gpu] <case.cfg.ziggy>
+    \\
+    \\  --gpu   run the ported operators on a Vulkan compute device
     \\
 ;
 
@@ -20,7 +23,13 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.skip();
 
-    const cfg_file = args.next() orelse {
+    var cfg_file: ?[]const u8 = null;
+    var use_gpu = false;
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--gpu")) use_gpu = true else cfg_file = a;
+    }
+
+    const path = cfg_file orelse {
         try stderr.interface.writeAll(usage);
         try stderr.interface.flush();
         return error.MissingArgument;
@@ -28,8 +37,8 @@ pub fn main(init: std.process.Init) !void {
 
     // The arena behind `pc` owns the config's strings, and both the mesh and the
     // solver keep references into them -- so it has to outlive the run.
-    var pc = config.Loader.parse(io, gpa, Io.Dir.cwd(), cfg_file) catch |err| {
-        try stderr.interface.print("failed to read {s}: {t}\n", .{ cfg_file, err });
+    var pc = config.Loader.parse(io, gpa, Io.Dir.cwd(), path) catch |err| {
+        try stderr.interface.print("failed to read {s}: {t}\n", .{ path, err });
         try stderr.interface.flush();
         return err;
     };
@@ -42,6 +51,17 @@ pub fn main(init: std.process.Init) !void {
     // A run that fails partway has usually printed the reports that explain why
     defer stdout.interface.flush() catch {};
 
+    // Declared before the run so it outlives the solver that borrows it.
+    var device: ?gpu.Device = null;
+    defer if (device) |*d| d.deinit();
+    if (use_gpu) {
+        device = gpu.Device.init(gpa, .{}) catch |err| {
+            try stderr.interface.print("--gpu: no compute device ({t})\n", .{err});
+            try stderr.interface.flush();
+            return err;
+        };
+    }
+
     var run: Run = undefined;
     run.init(gpa, io, &pc.value) catch |err| {
         try stderr.interface.print("setup failed: {t}\n", .{err});
@@ -49,6 +69,11 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer run.deinit();
+
+    if (device) |*d| {
+        run.solver.device = d;
+        try stdout.interface.print("\n device    {s}\n", .{d.name()});
+    }
 
     try run.run(&stdout.interface);
 }

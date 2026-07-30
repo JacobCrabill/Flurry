@@ -37,7 +37,7 @@ pub const Error = error{
     /// variable this equation set does not have
     NoExactSolution,
     NotImplemented,
-} || faces_mod.Error || testcase.Error;
+} || faces_mod.Error || testcase.Error || gpu.Error;
 
 /// Explicit Runge-Kutta tableau.
 ///
@@ -118,6 +118,12 @@ pub const Solver = struct {
     current_iter: u32 = 0,
     flow_time: f64 = 0.0,
     dt: f64 = 0.0,
+
+    /// Optional GPU back end. When set, the operators that have been ported run
+    /// there and the rest stay on the CPU; when null everything is on the CPU,
+    /// which is the reference the GPU path is checked against. Must outlive the
+    /// solver.
+    device: ?*gpu.Device = null,
 
     // ---- Solution Variables ----
 
@@ -646,8 +652,24 @@ pub const Solver = struct {
     // ---- Operator applications ----
 
     /// U at the solution points -> U at the flux points.
-    pub fn extrapolateU(s: *Solver) void {
+    ///
+    /// The first operator to have a GPU path: with `device` set it dispatches
+    /// spock's dgemm instead of running `gemm` here. Everything else in the
+    /// step still runs on the CPU, which works only because the device copies
+    /// its operands in and out around the dispatch -- see `gpu.zig`.
+    pub fn extrapolateU(s: *Solver) Error!void {
         const ele = &s.quad.ele;
+        if (s.device) |dev| {
+            return dev.gemmHost(
+                ele.n_fpts,
+                s.n_vars * s.n_eles,
+                ele.n_spts,
+                ele.oppE.data,
+                s.u_spts.data,
+                s.u_fpts.data,
+                .overwrite,
+            );
+        }
         gemm(
             ele.n_fpts,
             s.n_vars * s.n_eles,
@@ -840,7 +862,7 @@ pub const Solver = struct {
 
     /// One residual evaluation: fills `divf_spts[stage]`.
     pub fn computeResidual(s: *Solver, stage: usize) Error!void {
-        s.extrapolateU();
+        try s.extrapolateU();
         s.scatterUToFaces();
 
         // STUB: the right-hand state of every boundary flux point. See faces.zig.
@@ -1213,6 +1235,7 @@ const Element = @import("element.zig").Element;
 const Quad = @import("eles/quads.zig").Quad;
 const faces_mod = @import("faces.zig");
 const testcase = @import("testcase.zig");
+const gpu = @import("gpu.zig");
 const Faces = faces_mod.Faces;
 
 const Matrix = @import("util/matrix.zig").Matrix;

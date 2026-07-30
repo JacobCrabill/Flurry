@@ -10,6 +10,7 @@ pub const solver = @import("solver.zig");
 pub const driver = @import("driver.zig");
 pub const vtu = @import("vtu.zig");
 pub const testcase = @import("testcase.zig");
+pub const gpu = @import("gpu.zig");
 pub const points = @import("points.zig");
 pub const polynomials = @import("math/polynomials.zig");
 
@@ -30,4 +31,5 @@ test {
     _ = @import("driver_test.zig");
     _ = @import("vtu_test.zig");
     _ = @import("testcase_test.zig");
+    _ = @import("gpu_test.zig");
 }

@@ -49,6 +49,23 @@ collocation, but converge more slowly once integrated in time (~2.4 at order 2,
 or the error quadrature, all of which were varied and ruled out; it is still
 open.
 
+## GPU
+
+`--gpu` runs the operators that have been ported to Vulkan compute, via
+[Spock](https://github.com/JacobCrabill/spock); everything else stays on the CPU,
+which remains the reference the GPU path is checked against.
+
+```sh
+./zig-out/bin/flurry --gpu samples/vortex.cfg.ziggy
+```
+
+Ported so far: `extrapolateU`. It is *slower* than the CPU at the moment,
+because each dispatch copies its operands in and out — the solver's arrays are
+still ordinary host allocations. Moving them into device-visible memory is the
+next step and removes the copies rather than optimizing them.
+
+Everything is f64. A device without `shaderFloat64` will not run this.
+
 ## What works so far
 
 2D inviscid flow on quadrilateral meshes: Gmsh 2.2 and 4.1 input, Cartesian mesh

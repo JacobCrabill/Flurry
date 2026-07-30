@@ -45,6 +45,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ------ GPU kernels ------
+    // Every operator application in the solver is one dense `C = A*B` over
+    // row-major matrices, which is exactly what spock's prebuilt dgemm computes
+    // -- so the first operators to move to the GPU need no kernel of our own.
+    // Kernels written here will be added alongside via `spock.addSpirvKernel`.
+    mod.addAnonymousImport("spock/dgemm.spv", .{
+        .root_source_file = spock.namedLazyPath("spock/dgemm.spv"),
+    });
+
     // ------ Executable ------
 
     const exe = b.addExecutable(.{

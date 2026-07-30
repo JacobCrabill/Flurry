@@ -1,4 +1,5 @@
 const std = @import("std");
+const spock_build = @import("spock");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -53,6 +54,17 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("spock/dgemm.spv", .{
         .root_source_file = spock.namedLazyPath("spock/dgemm.spv"),
     });
+
+    // Kernels of our own, compiled to SPIR-V by the same route.
+    inline for (.{"flux_euler"}) |name| {
+        const spv = spock_build.addSpirvKernel(b, .{
+            .name = name,
+            .root_source_file = b.path("src/lib/kernels/" ++ name ++ ".zig"),
+            .optimize = optimize,
+            .spock_dep = spock,
+        });
+        mod.addAnonymousImport(name ++ ".spv", .{ .root_source_file = spv });
+    }
 
     // ------ Executable ------
 

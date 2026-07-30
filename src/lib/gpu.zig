@@ -11,10 +11,15 @@
 //! all, and this will refuse to run on those -- which is the right trade for a
 //! solver whose accuracy claims are the point.
 //!
-//! State of the port: `Solver.extrapolateU`. Its operands are already on the
-//! device -- the solver allocates its arrays through `Heap`, so a dispatch binds
-//! them where they lie rather than copying them in and out. `gemmHost` still
-//! exists for callers holding ordinary host memory.
+//! State of the port: `extrapolateU`, `computeFluxSpts`, `computeDivFSpts` and
+//! `computeDivFFpts` -- three gemms and one kernel of our own. Their operands
+//! are device-resident, so a dispatch binds them where they lie rather than
+//! copying them in and out; `gemmHost` still exists for callers holding ordinary
+//! host memory.
+//!
+//! What is left on the CPU is the face path -- scatter, boundary conditions,
+//! the common flux, gather -- which sits between the ported steps and so keeps
+//! them from being batched into one submission.
 
 const std = @import("std");
 const spock = @import("spock");
@@ -22,9 +27,16 @@ const spock = @import("spock");
 const dgemm = spock.kernels.blas.dgemm;
 const dgemm_spv = @embedFile("spock/dgemm.spv");
 
+const flux_euler = @import("kernels/flux_euler.zig");
+const flux_euler_spv = @embedFile("flux_euler.spv");
+
 pub const Error = error{
     /// No Vulkan loader, or no device on it with compute support
     NoComputeDevice,
+    /// A batch tried to record the same kernel twice. Each kernel owns one
+    /// descriptor set, so the second recording would overwrite the first's
+    /// arguments and both dispatches would run with the second's -- silently.
+    KernelAlreadyRecorded,
     /// The device rejected something, or a dispatch failed. The underlying
     /// Vulkan error is reported to stderr -- it is not in this set because
     /// hoisting the whole of `vk.Error` into every caller's signature buys
@@ -33,8 +45,15 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// The kernels a `Device` owns. A batch may record each at most once.
+const KernelId = enum { dgemm, flux_euler };
+
 /// A device buffer handle, as a dispatch binds it.
 pub const Buffer = spock.vk.Buffer;
+
+/// One storage-buffer argument: a whole buffer, or a byte range of one.
+/// `.whole(buf)` is the common case.
+pub const Binding = spock.Kernel.Binding;
 
 /// Whether a product overwrites its destination or accumulates into it,
 /// matching the CPU `gemm`'s `Mode`.
@@ -64,6 +83,13 @@ pub const Device = struct {
     gpa: std.mem.Allocator,
     ctx: *spock.Context,
     dgemm_kernel: spock.Kernel,
+    flux_euler_kernel: spock.Kernel,
+
+    /// Reused across steps; `beginBatch` resets it rather than allocating a new
+    /// command buffer every residual.
+    batch: spock.Pipeline,
+    /// Null unless a batch is open. Holds which kernels it has already recorded.
+    recorded: ?std.EnumSet(KernelId) = null,
 
     /// Staging for `gemmHost`, grown on demand and reused across calls.
     stage_a: Scratch = .{},
@@ -85,20 +111,42 @@ pub const Device = struct {
         errdefer ctx.deinit();
 
         // spock's dgemm exports its entry point under its own name, not "main"
-        const kernel = spock.Kernel.create(ctx, .{
+        var kernel = spock.Kernel.create(ctx, .{
             .spirv = dgemm_spv,
             .entry = "dgemm",
             .buffers = 3,
             .push_constant_size = @sizeOf(dgemm.PushConstants),
         }) catch |err| return translate(err, "building the dgemm pipeline");
+        errdefer kernel.deinit();
 
-        return .{ .gpa = gpa, .ctx = ctx, .dgemm_kernel = kernel };
+        var flux_kernel = spock.Kernel.create(ctx, .{
+            .spirv = flux_euler_spv,
+            .entry = "flux_euler",
+            .buffers = 3,
+            .push_constant_size = @sizeOf(flux_euler.PushConstants),
+        }) catch |err| return translate(err, "building the flux_euler pipeline");
+
+        errdefer flux_kernel.deinit();
+
+        const batch = spock.Pipeline.create(ctx) catch |err| {
+            return translate(err, "creating the dispatch batch");
+        };
+
+        return .{
+            .gpa = gpa,
+            .ctx = ctx,
+            .dgemm_kernel = kernel,
+            .flux_euler_kernel = flux_kernel,
+            .batch = batch,
+        };
     }
 
     pub fn deinit(d: *Device) void {
         d.stage_a.deinit();
         d.stage_b.deinit();
         d.stage_c.deinit();
+        d.batch.deinit();
+        d.flux_euler_kernel.deinit();
         d.dgemm_kernel.deinit();
         d.ctx.deinit();
         d.gpa.destroy(d.ctx);
@@ -106,6 +154,56 @@ pub const Device = struct {
 
     pub fn name(d: *const Device) []const u8 {
         return d.ctx.deviceName();
+    }
+
+    // ---- Batching ----
+
+    /// Begin a run of dispatches to submit together.
+    ///
+    /// Each dispatch on its own costs a submit and a fence wait, and for
+    /// matrices this small that round trip dwarfs the arithmetic. Recorded into
+    /// one command buffer, a run of consecutive GPU work costs one round trip
+    /// instead of one each, with a storage barrier between them so each sees the
+    /// last one's writes.
+    ///
+    /// Only *consecutive* GPU work can go in one batch: anything the CPU has to
+    /// touch in between ends it.
+    pub fn beginBatch(d: *Device) Error!void {
+        std.debug.assert(d.recorded == null); // a batch is already open
+        d.batch.reset() catch |err| return translate(err, "resetting the batch");
+        d.recorded = .empty;
+    }
+
+    /// Submit everything recorded since `beginBatch` and wait for it.
+    pub fn submitBatch(d: *Device) Error!void {
+        std.debug.assert(d.recorded != null); // no batch is open
+        d.recorded = null;
+        d.batch.submit() catch |err| return translate(err, "submitting the batch");
+        d.ctx.wait() catch |err| return translate(err, "waiting on the batch");
+    }
+
+    /// Record a dispatch into the open batch, or run it on its own if none is.
+    fn run(
+        d: *Device,
+        id: KernelId,
+        kernel: *spock.Kernel,
+        args: spock.Kernel.DispatchArgs,
+        what: []const u8,
+    ) Error!void {
+        if (d.recorded) |*seen| {
+            // A kernel has one descriptor set, so recording it twice into the
+            // same command buffer would leave both dispatches using the second
+            // set of arguments. Catch it rather than return quiet nonsense.
+            if (seen.contains(id)) return error.KernelAlreadyRecorded;
+            seen.insert(id);
+            d.batch.addKernel(kernel, args) catch |err| return translate(err, what);
+            return;
+        }
+
+        kernel.dispatch(args) catch |err| return translate(err, what);
+        // `dispatch` submits without blocking; the results are not there until
+        // the fence clears.
+        d.ctx.wait() catch |err| return translate(err, what);
     }
 
     /// `C = A*B`, or `C += A*B`, over buffers that are already on the device:
@@ -119,9 +217,9 @@ pub const Device = struct {
         m: usize,
         n: usize,
         k: usize,
-        a: spock.vk.Buffer,
-        b: spock.vk.Buffer,
-        c: spock.vk.Buffer,
+        a: Binding,
+        b: Binding,
+        c: Binding,
         mode: Mode,
     ) Error!void {
         if (m == 0 or n == 0 or k == 0) return;
@@ -138,15 +236,43 @@ pub const Device = struct {
         const threads: u32 = @intCast(m * n);
         const groups = std.math.divCeil(u32, threads, dgemm.WgSize.x) catch unreachable;
 
-        d.dgemm_kernel.dispatch(.{
+        try d.run(.dgemm, &d.dgemm_kernel, .{
             .buffers = &.{ a, b, c },
             .push_constant = std.mem.asBytes(&pc),
             .groups = .{ groups, 1, 1 },
-        }) catch |err| return translate(err, "dispatching dgemm");
+        }, "dispatching dgemm");
+    }
 
-        // `dispatch` submits without blocking; the results are not there until
-        // the fence clears.
-        d.ctx.wait() catch |err| return translate(err, "waiting on dgemm");
+    /// Inviscid Euler flux at the solution points, in reference space.
+    ///
+    /// One thread per `(spt, ele)`; see `kernels/flux_euler.zig` for the layouts
+    /// it assumes. 2D and inviscid only, matching the kernel.
+    pub fn fluxEuler(
+        d: *Device,
+        n_spts: usize,
+        n_eles: usize,
+        n_vars: usize,
+        gamma: f64,
+        u_spts: Binding,
+        inv_jaco: Binding,
+        f_spts: Binding,
+    ) Error!void {
+        if (n_spts == 0 or n_eles == 0) return;
+
+        const pc: flux_euler.PushConstants = .{
+            .n_spts = @intCast(n_spts),
+            .n_eles = @intCast(n_eles),
+            .n_vars = @intCast(n_vars),
+            .gamma = gamma,
+        };
+        const threads: u32 = @intCast(n_spts * n_eles);
+        const groups = std.math.divCeil(u32, threads, flux_euler.WgSize.x) catch unreachable;
+
+        try d.run(.flux_euler, &d.flux_euler_kernel, .{
+            .buffers = &.{ u_spts, inv_jaco, f_spts },
+            .push_constant = std.mem.asBytes(&pc),
+            .groups = .{ groups, 1, 1 },
+        }, "dispatching flux_euler");
     }
 
     /// The same product over ordinary host slices, staged in and out around the
@@ -180,7 +306,7 @@ pub const Device = struct {
         // worth uploading.
         if (mode == .accumulate) c_buf.copyFromHost(c[0 .. m * n]);
 
-        try d.gemm(m, n, k, a_buf.raw(), b_buf.raw(), c_buf.raw(), mode);
+        try d.gemm(m, n, k, .whole(a_buf.raw()), .whole(b_buf.raw()), .whole(c_buf.raw()), mode);
 
         c_buf.copyToHost(c[0 .. m * n]);
     }

@@ -59,14 +59,20 @@ which remains the reference the GPU path is checked against.
 ./zig-out/bin/flurry --gpu samples/vortex.cfg.ziggy
 ```
 
-Ported so far: `extrapolateU`. Its operands are device-resident, so a dispatch
-binds them where they lie — nothing is copied. Because that memory is
-host-mapped, every un-ported operation still reads and writes it as an ordinary
-slice, which is what lets the port advance one operator at a time.
+Ported so far: `extrapolateU`, `computeFluxSpts`, `computeDivFSpts` and
+`computeDivFFpts` — three matrix products, plus one kernel of our own for the
+Euler flux. Their operands are device-resident, so a dispatch binds them where
+they lie; nothing is copied. Because that memory is host-mapped, every un-ported
+operation still reads and writes it as an ordinary slice, which is what lets the
+port advance one operator at a time.
 
-It is still slower than the CPU — about 20% on 100 steps of the vortex sample —
-because each dispatch is its own submit and fence wait, four hundred round trips
-over the run. Batching a whole residual into one submission is the next step.
+It is still slower than the CPU — about 15% on 100 steps of the vortex sample —
+and the reason is submission overhead, not arithmetic. Each dispatch costs a
+submit and a fence wait, measured at ~0.4 ms, which for matrices this small
+dwarfs the work. `computeFluxSpts` and `computeDivFSpts` are the only two ported
+steps that sit next to each other, so they are batched into one submission; the
+rest have CPU face work in between, which is what ends a batch. The face path is
+what has to move next for the whole residual to become one round trip.
 
 Getting there needed a fix in Spock. It asked for `host_visible | host_coherent`
 and took the first matching memory type, which on the test hardware is an

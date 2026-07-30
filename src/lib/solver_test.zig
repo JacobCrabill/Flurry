@@ -445,10 +445,10 @@ test "uniform flow has exactly zero residual" {
 
             try s.initializeU();
             try s.extrapolateU();
-            s.computeFluxSpts();
-            s.computeDivFSpts(0);
+            try s.computeFluxSpts();
+            try s.computeDivFSpts(0);
             fillExactFComm(&s, 2);
-            s.computeDivFFpts(0);
+            try s.computeDivFFpts(0);
 
             // Uniform state, uniform flux, zero divergence. The interior term
             // alone is *not* zero -- it takes the DFR correction to cancel it.
@@ -489,10 +489,10 @@ test "linear flow reproduces its analytic divergence" {
     }
 
     try s.extrapolateU();
-    s.computeFluxSpts();
-    s.computeDivFSpts(0);
+    try s.computeFluxSpts();
+    try s.computeDivFSpts(0);
     fillExactFComm(&s, 2);
-    s.computeDivFFpts(0);
+    try s.computeDivFFpts(0);
 
     // divF is the *reference*-space divergence, so it carries a factor of |J|
     const a = s.params.adv_vel;
@@ -729,11 +729,11 @@ test "free-stream is preserved on cells away from the boundary" {
             // chain directly.
             try s.extrapolateU();
             s.scatterUToFaces();
-            s.computeFluxSpts();
-            s.computeDivFSpts(0);
+            try s.computeFluxSpts();
+            try s.computeDivFSpts(0);
             s.faces.computeCommonF();
             s.gatherCommonFFromFaces();
-            s.computeDivFFpts(0);
+            try s.computeDivFFpts(0);
 
             const ele = &s.quad.ele;
             var n_interior: usize = 0;
@@ -1610,11 +1610,11 @@ test "free-stream is preserved on a non-affine mesh" {
             try s.initializeU();
             try s.extrapolateU();
             s.scatterUToFaces();
-            s.computeFluxSpts();
-            s.computeDivFSpts(0);
+            try s.computeFluxSpts();
+            try s.computeDivFSpts(0);
             s.faces.computeCommonF();
             s.gatherCommonFFromFaces();
-            s.computeDivFFpts(0);
+            try s.computeDivFFpts(0);
 
             const ele = &s.quad.ele;
             for (0..s.n_eles) |e| {

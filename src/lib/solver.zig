@@ -108,25 +108,39 @@ const GpuState = struct {
     dev: *gpu.Device,
     heap: gpu.Heap,
 
-    /// `oppE`. Operators are constant for the whole run and tiny -- an order-3
-    /// quad's is 16x16 -- so a copy uploaded once beats routing `Element`'s
-    /// allocations through the heap.
+    /// The reference-element operators a dispatch multiplies by. They are
+    /// constant for the whole run and tiny -- an order-3 quad's `oppE` is 16x16
+    /// -- so a copy uploaded once beats routing `Element`'s allocations through
+    /// the heap.
     opp_e: gpu.Array,
+    opp_div: gpu.Array,
+    opp_div_fpts: gpu.Array,
 
     fn create(gpa: std.mem.Allocator, dev: *gpu.Device, ele: *const Element) Error!*GpuState {
         const g = try gpa.create(GpuState);
         errdefer gpa.destroy(g);
 
-        g.* = .{ .gpa = gpa, .dev = dev, .heap = .init(dev, gpa), .opp_e = undefined };
+        g.* = .{
+            .gpa = gpa,
+            .dev = dev,
+            .heap = .init(dev, gpa),
+            .opp_e = undefined,
+            .opp_div = undefined,
+            .opp_div_fpts = undefined,
+        };
         errdefer g.heap.deinit();
 
         g.opp_e = try gpu.Array.upload(dev, ele.oppE.data);
+        g.opp_div = try gpu.Array.upload(dev, ele.oppDiv.data);
+        g.opp_div_fpts = try gpu.Array.upload(dev, ele.oppDiv_fpts.data);
         return g;
     }
 
     fn destroy(g: *GpuState) void {
         const gpa = g.gpa;
         g.opp_e.deinit();
+        g.opp_div.deinit();
+        g.opp_div_fpts.deinit();
         g.heap.deinit();
         gpa.destroy(g);
     }
@@ -136,11 +150,22 @@ const GpuState = struct {
     /// Every array a dispatch binds is allocated from `heap`; one that is not is
     /// a bug in `allocate` rather than a runtime condition, so this says so
     /// instead of quietly falling back to a copy.
-    fn bufferFor(g: *const GpuState, data: []const f64) Error!gpu.Buffer {
-        return g.heap.bufferFor(data.ptr) orelse {
+    fn bufferFor(g: *const GpuState, data: []const f64) Error!gpu.Binding {
+        const buf = g.heap.bufferFor(data.ptr) orelse {
             std.debug.print("gpu: solver array at {*} is not device memory\n", .{data.ptr});
             return error.DeviceFailure;
         };
+        return .whole(buf);
+    }
+
+    /// A byte range of the buffer a solver array lives in, for an operator
+    /// writing one block of a larger array -- `divf_spts` holds one residual per
+    /// RK stage.
+    fn sliceOf(g: *const GpuState, data: []const f64, start: usize, len: usize) Error!gpu.Binding {
+        var b = try g.bufferFor(data);
+        b.offset = start * @sizeOf(f64);
+        b.size = len * @sizeOf(f64);
+        return b;
     }
 };
 
@@ -318,14 +343,14 @@ pub const Solver = struct {
         s.u_ini.deinit(gpa);
         s.du_spts.deinit(gpa);
         s.du_fpts.deinit(gpa);
-        s.f_spts.deinit(gpa);
-        s.f_comm.deinit(gpa);
+        s.f_spts.deinit(arr);
+        s.f_comm.deinit(arr);
+        s.divf_spts.deinit(arr);
         s.u_comm.deinit(gpa);
-        s.divf_spts.deinit(gpa);
 
         s.nodes.deinit(gpa);
         s.jaco_spts.deinit(gpa);
-        s.inv_jaco_spts.deinit(gpa);
+        s.inv_jaco_spts.deinit(arr);
         s.jaco_det_spts.deinit(gpa);
         s.inv_jaco_fpts.deinit(gpa);
         s.norm_fpts.deinit(gpa);
@@ -373,9 +398,9 @@ pub const Solver = struct {
 
         s.u_spts = try Array3(f64).init(dev, ele.n_spts, nv, ne);
         s.u_fpts = try Array3(f64).init(dev, ele.n_fpts, nv, ne);
-        s.f_spts = try Array4(f64).init(gpa, nd, ele.n_spts, nv, ne);
-        s.f_comm = try Array3(f64).init(gpa, ele.n_fpts, nv, ne);
-        s.divf_spts = try Array4(f64).init(gpa, s.rk.n_stages, ele.n_spts, nv, ne);
+        s.f_spts = try Array4(f64).init(dev, nd, ele.n_spts, nv, ne);
+        s.f_comm = try Array3(f64).init(dev, ele.n_fpts, nv, ne);
+        s.divf_spts = try Array4(f64).init(dev, s.rk.n_stages, ele.n_spts, nv, ne);
 
         // u_ini is only needed when a later stage has to restart from the
         // beginning of the step.
@@ -391,7 +416,7 @@ pub const Solver = struct {
 
         s.nodes = try Array3(f64).init(gpa, ele.n_nodes, nd, ne);
         s.jaco_spts = try Array4(f64).init(gpa, nd, ele.n_spts, nd, ne);
-        s.inv_jaco_spts = try Array4(f64).init(gpa, nd, ele.n_spts, nd, ne);
+        s.inv_jaco_spts = try Array4(f64).init(dev, nd, ele.n_spts, nd, ne);
         s.jaco_det_spts = try Matrix(f64).init(gpa, ele.n_spts, ne, null);
         s.inv_jaco_fpts = try Array4(f64).init(gpa, nd, ele.n_fpts, nd, ne);
         s.norm_fpts = try Array3(f64).init(gpa, ele.n_fpts, nd, ne);
@@ -749,7 +774,7 @@ pub const Solver = struct {
                 ele.n_fpts,
                 s.n_vars * s.n_eles,
                 ele.n_spts,
-                g.opp_e.raw(),
+                .whole(g.opp_e.raw()),
                 try g.bufferFor(s.u_spts.data),
                 try g.bufferFor(s.u_fpts.data),
                 .overwrite,
@@ -838,9 +863,22 @@ pub const Solver = struct {
     }
 
     /// Divergence contribution from the flux at the solution points.
-    pub fn computeDivFSpts(s: *Solver, stage: usize) void {
+    pub fn computeDivFSpts(s: *Solver, stage: usize) Error!void {
         const ele = &s.quad.ele;
         const per_stage = ele.n_spts * s.n_vars * s.n_eles;
+        if (s.gpu_state) |g| {
+            return g.dev.gemm(
+                ele.n_spts,
+                s.n_vars * s.n_eles,
+                ele.n_spts * s.n_dims,
+                .whole(g.opp_div.raw()),
+                try g.bufferFor(s.f_spts.data),
+                // `divf_spts` holds every stage in one array, so this binds the
+                // block for `stage` rather than the whole thing.
+                try g.sliceOf(s.divf_spts.data, stage * per_stage, per_stage),
+                .overwrite,
+            );
+        }
         gemm(
             ele.n_spts,
             s.n_vars * s.n_eles,
@@ -853,9 +891,20 @@ pub const Solver = struct {
     }
 
     /// Divergence correction from the common normal flux at the flux points.
-    pub fn computeDivFFpts(s: *Solver, stage: usize) void {
+    pub fn computeDivFFpts(s: *Solver, stage: usize) Error!void {
         const ele = &s.quad.ele;
         const per_stage = ele.n_spts * s.n_vars * s.n_eles;
+        if (s.gpu_state) |g| {
+            return g.dev.gemm(
+                ele.n_spts,
+                s.n_vars * s.n_eles,
+                ele.n_fpts,
+                .whole(g.opp_div_fpts.raw()),
+                try g.bufferFor(s.f_comm.data),
+                try g.sliceOf(s.divf_spts.data, stage * per_stage, per_stage),
+                .accumulate,
+            );
+        }
         gemm(
             ele.n_spts,
             s.n_vars * s.n_eles,
@@ -872,7 +921,26 @@ pub const Solver = struct {
     /// Evaluate the physical flux at every solution point and transform it into
     /// reference space. For viscous runs the reference-space gradient in
     /// `du_spts` is converted to a physical gradient in place first.
-    pub fn computeFluxSpts(s: *Solver) void {
+    pub fn computeFluxSpts(s: *Solver) Error!void {
+        const ele = &s.quad.ele;
+
+        // The kernel covers the inviscid Euler case only. Advection-diffusion
+        // and the viscous terms stay on the CPU until they have kernels of
+        // their own; there is no correctness cliff either way, only speed.
+        if (s.gpu_state) |g| {
+            if (s.config.equation.equation == .euler_ns and !s.config.equation.viscous) {
+                return g.dev.fluxEuler(
+                    ele.n_spts,
+                    s.n_eles,
+                    s.n_vars,
+                    s.params.gamma,
+                    try g.bufferFor(s.u_spts.data),
+                    try g.bufferFor(s.inv_jaco_spts.data),
+                    try g.bufferFor(s.f_spts.data),
+                );
+            }
+        }
+
         switch (s.config.equation.equation) {
             .adv_diff => s.fluxSpts(2, .adv_diff),
             .euler_ns => s.fluxSpts(2, .euler_ns),
@@ -960,7 +1028,16 @@ pub const Solver = struct {
             s.computeGradFpts();
         }
 
-        s.computeFluxSpts();
+        // `computeFluxSpts` and `computeDivFSpts` are the only two steps with a
+        // GPU path that sit next to each other, so they are the only pair a
+        // batch can currently help: one submit and one fence wait between them
+        // rather than two. Everything else in the chain has CPU work in
+        // between, which is what ends a batch. The rest joins as its operators
+        // move across.
+        const batched = s.gpu_state != null and !s.config.equation.viscous;
+        if (batched) try s.gpu_state.?.dev.beginBatch();
+
+        try s.computeFluxSpts();
 
         if (s.config.equation.viscous) {
             s.extrapolateGrad();
@@ -968,10 +1045,11 @@ pub const Solver = struct {
             try s.faces.applyBcsGrad();
         }
 
-        s.computeDivFSpts(stage);
+        try s.computeDivFSpts(stage);
+        if (batched) try s.gpu_state.?.dev.submitBatch();
         s.faces.computeCommonF();
         s.gatherCommonFFromFaces();
-        s.computeDivFFpts(stage);
+        try s.computeDivFFpts(stage);
     }
 
     /// Physical solution gradient at the solution points -> flux points.

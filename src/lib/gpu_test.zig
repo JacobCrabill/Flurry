@@ -274,9 +274,10 @@ test "only the arrays a dispatch binds are device-resident" {
     const gpa = testing.allocator;
     const d = try device();
 
-    // This is the split the port advances one operator at a time. `u_spts` and
-    // `u_fpts` are bound by `extrapolateU`, so they live in device memory;
-    // nothing dispatches over the geometry yet, so it does not.
+    // This is the split the port advances one operator at a time, and it moves
+    // every time one crosses over -- which is the point of pinning it here.
+    // Resident: everything the three ported gemms bind. Not resident: the
+    // geometry and the face arrays, which no dispatch touches yet.
     const config = testConfig(3, 4);
 
     var run: driver.Run = undefined;
@@ -284,12 +285,16 @@ test "only the arrays a dispatch binds are device-resident" {
     defer run.deinit();
 
     const s = &run.solver;
-    try testing.expect(s.deviceBufferFor(s.u_spts.data) != null);
+    try testing.expect(s.deviceBufferFor(s.u_spts.data) != null); // extrapolateU
     try testing.expect(s.deviceBufferFor(s.u_fpts.data) != null);
+    try testing.expect(s.deviceBufferFor(s.f_spts.data) != null); // computeDivFSpts
+    try testing.expect(s.deviceBufferFor(s.f_comm.data) != null); // computeDivFFpts
+    try testing.expect(s.deviceBufferFor(s.divf_spts.data) != null);
+    try testing.expect(s.deviceBufferFor(s.inv_jaco_spts.data) != null); // computeFluxSpts
 
     try testing.expect(s.deviceBufferFor(s.nodes.data) == null);
     try testing.expect(s.deviceBufferFor(s.coord_spts.data) == null);
-    try testing.expect(s.deviceBufferFor(s.divf_spts.data) == null);
+    try testing.expect(s.deviceBufferFor(s.jaco_spts.data) == null);
 
     // ...and with no device nothing is
     var cpu_run: driver.Run = undefined;
@@ -324,4 +329,88 @@ test "device memory is still an ordinary slice to the CPU" {
         if (v != 0.0) nonzero += 1;
     }
     try testing.expect(nonzero > 0);
+}
+
+// ---------------------------------------------------------------------------
+// The hand-written flux kernel
+// ---------------------------------------------------------------------------
+
+test "the Euler flux kernel matches the CPU one" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The first kernel written here rather than taken from spock, so it gets a
+    // check of its own: a failure inside a whole residual would only say that
+    // *something* disagreed.
+    const config = testConfig(3, 5);
+
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+
+    // Both start from the vortex, so `u_spts` already varies across the mesh
+    try cpu_run.solver.computeFluxSpts();
+    try gpu_run.solver.computeFluxSpts();
+
+    try expectClose(cpu_run.solver.f_spts.data, gpu_run.solver.f_spts.data, 1e-13);
+}
+
+// ---------------------------------------------------------------------------
+// Batching
+// ---------------------------------------------------------------------------
+
+test "a batched dispatch pair gives the same answer as two separate ones" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // `computeResidual` batches `computeFluxSpts` with `computeDivFSpts`. The
+    // barrier between them is what makes the second see the first's writes; if
+    // it were missing this would read stale `f_spts`.
+    const config = testConfig(3, 5);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    const s = &run.solver;
+
+    // Unbatched: each dispatch submitted and waited for on its own
+    try s.computeFluxSpts();
+    try s.computeDivFSpts(0);
+    const separate = try gpa.dupe(f64, s.divf_spts.data);
+    defer gpa.free(separate);
+
+    @memset(s.f_spts.data, 0.0);
+    @memset(s.divf_spts.data, 0.0);
+
+    try d.beginBatch();
+    try s.computeFluxSpts();
+    try s.computeDivFSpts(0);
+    try d.submitBatch();
+
+    try expectClose(separate, s.divf_spts.data, 1e-15);
+}
+
+test "recording one kernel twice in a batch is rejected" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // A kernel owns a single descriptor set, so a second recording would
+    // overwrite the first's arguments and *both* dispatches would run with the
+    // second's -- with no error and a plausible-looking wrong answer.
+    const config = testConfig(2, 4);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    const s = &run.solver;
+    try d.beginBatch();
+    try s.computeDivFSpts(0);
+    try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFFpts(0));
+    try d.submitBatch();
 }

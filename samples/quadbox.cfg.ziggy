@@ -1,0 +1,82 @@
+// A doubly-periodic Cartesian box on a generated mesh, so it runs with no
+// external mesh file.
+//
+// The only initial condition implemented so far is a uniform freestream, which
+// on a periodic domain is an exact steady solution -- so this case is really an
+// end-to-end free-stream preservation check: every reported residual should sit
+// at roundoff for the whole run. Anything that grows means the operators, the
+// metric terms or the periodic pairing are wrong.
+.{
+  .core = .{
+      .n_dims = 2,
+      .mesh_file = "",
+      .order = 3,
+  },
+
+  .equation = .{
+      .equation = .euler_ns,
+      .viscous = false,
+  },
+
+  .time = .{
+      .dt_scheme = .rk44,
+      .n_steps = 500,
+      .dt = 1e-3,
+  },
+
+  .output = .{
+      .output_prefix = "quadbox",
+      .write_freq = 0,
+      .report_freq = 50,
+  },
+
+  .test_case = .{
+      .test_case = 0,
+      .err_field = 0,
+      .n_qpts_1d = 5,
+  },
+
+  .flux = .{
+      .fconv_type = .rusanov,
+      .rus_k = 0.0,
+  },
+
+  .gas_properties = .{
+      .gamma = 1.4,
+  },
+
+  .freestream = .{
+      .rho_fs = 1.4,
+      .P_fs = 1.0,
+      .mach_fs = 0.2,
+      .norm_fs = [1.0, 0.0, 0.0],
+      .fix_vis = true,
+  },
+
+  .wall_conditions = .{
+      .T_wall = 300.0,
+  },
+
+  // Generated meshes name their boundaries through `create_mesh`, so there is
+  // nothing to map here.
+  .boundary_conditions = .{
+      .mesh_bounds = {},
+  },
+
+  .signals = .{
+      .catch_signals = false,
+  },
+
+  .create_mesh = .{
+      .nx = 20,
+      .ny = 20,
+      .xmin = -5.0,
+      .xmax = 5.0,
+      .ymin = -5.0,
+      .ymax = 5.0,
+      .bc_bottom = .periodic,
+      .bc_top = .periodic,
+      .bc_left = .periodic,
+      .bc_right = .periodic,
+  },
+}

@@ -46,6 +46,10 @@ pub const Faces = struct {
     n_vars: usize = 0,
 
     /// Global flux points: interior interfaces plus boundary faces
+    /// Where the arrays a GPU dispatch binds come from; `gpa` when there is no
+    /// device. Either way they are plain slices to the CPU code.
+    arr: std.mem.Allocator = undefined,
+
     n_gfpts: usize = 0,
     /// Interior gfpts, which come first
     n_gfpts_int: usize = 0,
@@ -97,8 +101,11 @@ pub const Faces = struct {
     /// Condition applied on each boundary, indexed by boundary
     bc_list: []const cfg.BoundaryCondition = &.{},
 
+    /// `arr` is where the arrays a GPU dispatch binds come from -- the device
+    /// heap when there is one, and `gpa` otherwise. Everything else uses `gpa`.
     pub fn init(
         gpa: std.mem.Allocator,
+        arr: std.mem.Allocator,
         config: *const Config,
         params: flux.FlowParams,
         n_gfpts: usize,
@@ -109,6 +116,7 @@ pub const Faces = struct {
 
         var f: Faces = .{
             .gpa = gpa,
+            .arr = arr,
             .config = config,
             .params = params,
             .n_dims = n_dims,
@@ -119,12 +127,14 @@ pub const Faces = struct {
         };
         errdefer f.deinit();
 
-        f.u = try Array3(f64).init(gpa, 2, n_vars, n_gfpts);
-        f.f_comm = try Array3(f64).init(gpa, 2, n_vars, n_gfpts);
-        f.norm = try Matrix(f64).init(gpa, n_dims, n_gfpts, null);
-        f.d_a = try Matrix(f64).init(gpa, 2, n_gfpts, null);
+        // Everything the face kernels bind
+        f.u = try Array3(f64).init(arr, 2, n_vars, n_gfpts);
+        f.f_comm = try Array3(f64).init(arr, 2, n_vars, n_gfpts);
+        f.norm = try Matrix(f64).init(arr, n_dims, n_gfpts, null);
+        f.d_a = try Matrix(f64).init(arr, 2, n_gfpts, null);
+        f.wave_sp = try arr.alloc(f64, n_gfpts);
+
         f.coord = try Matrix(f64).init(gpa, n_dims, n_gfpts, null);
-        f.wave_sp = try gpa.alloc(f64, n_gfpts);
         @memset(f.wave_sp, 0.0);
 
         if (config.equation.viscous) {
@@ -138,15 +148,17 @@ pub const Faces = struct {
 
     pub fn deinit(f: *Faces) void {
         const gpa = f.gpa;
-        f.u.deinit(gpa);
+        const arr = f.arr;
+        f.u.deinit(arr);
+        f.f_comm.deinit(arr);
+        f.norm.deinit(arr);
+        f.d_a.deinit(arr);
+        arr.free(f.wave_sp);
+
         f.u_comm.deinit(gpa);
         f.u_ldg.deinit(gpa);
-        f.f_comm.deinit(gpa);
         f.du.deinit(gpa);
-        f.norm.deinit(gpa);
-        f.d_a.deinit(gpa);
         f.coord.deinit(gpa);
-        gpa.free(f.wave_sp);
     }
 
     /// Fill the right-hand state of every boundary flux point from its

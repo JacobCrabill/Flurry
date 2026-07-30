@@ -59,20 +59,30 @@ which remains the reference the GPU path is checked against.
 ./zig-out/bin/flurry --gpu samples/vortex.cfg.ziggy
 ```
 
-Ported so far: `extrapolateU`, `computeFluxSpts`, `computeDivFSpts` and
-`computeDivFFpts` — three matrix products, plus one kernel of our own for the
-Euler flux. Their operands are device-resident, so a dispatch binds them where
-they lie; nothing is copied. Because that memory is host-mapped, every un-ported
-operation still reads and writes it as an ordinary slice, which is what lets the
-port advance one operator at a time.
+The whole residual runs on the device for 2D inviscid Euler: eight dispatches
+recorded into one command buffer and submitted once. Operands are
+device-resident, so a dispatch binds them where they lie and nothing is copied.
+Because that memory is host-mapped, everything still on the CPU — the
+Runge-Kutta update, the residual norms — reads and writes it as an ordinary
+slice.
 
-It is still slower than the CPU — about 15% on 100 steps of the vortex sample —
-and the reason is submission overhead, not arithmetic. Each dispatch costs a
-submit and a fence wait, measured at ~0.4 ms, which for matrices this small
-dwarfs the work. `computeFluxSpts` and `computeDivFSpts` are the only two ported
-steps that sit next to each other, so they are batched into one submission; the
-rest have CPU face work in between, which is what ends a batch. The face path is
-what has to move next for the whole residual to become one round trip.
+Anything the kernels do not cover falls back rather than failing:
+advection-diffusion, the viscous terms, and the viscous wall conditions.
+
+Performance, 50 steps of the vortex sample:
+
+| mesh | CPU | GPU |
+|---|---|---|
+| 32×32 | 0.70 s | 0.73 s |
+| 64×64 | 3.24 s | 4.33 s |
+| 128×128 | 13.18 s | 17.15 s |
+
+So it is at parity when small and ~1.3× *slower* when large, by a constant
+factor rather than a widening one. Spock's buffers are host-visible by design —
+its own docs say so — which means the GPU streams every array over PCIe instead
+of reading VRAM. Going faster from here means device-local memory with staging,
+and that only pays once nothing on the CPU needs to read these arrays: the
+Runge-Kutta update is the remaining obstacle.
 
 Getting there needed a fix in Spock. It asked for `host_visible | host_coherent`
 and took the first matching memory type, which on the test hardware is an

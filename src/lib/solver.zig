@@ -116,6 +116,16 @@ const GpuState = struct {
     opp_div: gpu.Array,
     opp_div_fpts: gpu.Array,
 
+    /// The element-to-face connectivity the face kernels walk, narrowed from the
+    /// mesh's `usize` to `u32`. Constant for the run, like the operators.
+    fpt2gfpt: gpu.IndexArray,
+    fpt2slot: gpu.IndexArray,
+
+    /// The boundary condition at each boundary flux point, resolved once from
+    /// `gfpt2bnd` and `bc_list` so the kernel needs neither indirection.
+    /// Null when some condition has no kernel, which sends `applyBcs` to the CPU.
+    bc_code: ?gpu.IndexArray,
+
     fn create(gpa: std.mem.Allocator, dev: *gpu.Device, ele: *const Element) Error!*GpuState {
         const g = try gpa.create(GpuState);
         errdefer gpa.destroy(g);
@@ -127,6 +137,9 @@ const GpuState = struct {
             .opp_e = undefined,
             .opp_div = undefined,
             .opp_div_fpts = undefined,
+            .fpt2gfpt = undefined,
+            .fpt2slot = undefined,
+            .bc_code = null,
         };
         errdefer g.heap.deinit();
 
@@ -136,11 +149,50 @@ const GpuState = struct {
         return g;
     }
 
+    /// Upload the connectivity, once the mesh's global flux points are laid out.
+    fn uploadConnectivity(g: *GpuState, gpa: std.mem.Allocator, mesh: *const Geo) Error!void {
+        const map = mesh.fpt2gfpt.data;
+        const slot = mesh.fpt2gfpt_slot.data;
+
+        const narrowed = try gpa.alloc(u32, map.len);
+        defer gpa.free(narrowed);
+
+        for (map, narrowed) |v, *out| {
+            out.* = if (v == geo_mod.none) gpu.none_u32 else @intCast(v);
+        }
+        g.fpt2gfpt = try gpu.IndexArray.upload(g.dev, narrowed);
+
+        for (slot, narrowed[0..slot.len]) |v, *out| out.* = @intCast(v);
+        g.fpt2slot = try gpu.IndexArray.upload(g.dev, narrowed[0..slot.len]);
+    }
+
+    /// Resolve each boundary flux point's condition to a kernel code, or leave
+    /// `bc_code` null if any of them has no kernel.
+    fn uploadBcCodes(g: *GpuState, gpa: std.mem.Allocator, f: *const Faces) Error!void {
+        if (f.n_gfpts_bnd == 0) {
+            g.bc_code = try gpu.IndexArray.upload(g.dev, &.{});
+            return;
+        }
+
+        const codes = try gpa.alloc(u32, f.n_gfpts_bnd);
+        defer gpa.free(codes);
+
+        for (codes, 0..) |*c, i| {
+            const bnd = f.gfpt2bnd[i];
+            if (bnd == geo_mod.none) return error.UnmatchedBoundaryFace;
+            c.* = @backingInt(bcCode(f.bc_list[bnd]) orelse return);
+        }
+        g.bc_code = try gpu.IndexArray.upload(g.dev, codes);
+    }
+
     fn destroy(g: *GpuState) void {
         const gpa = g.gpa;
         g.opp_e.deinit();
         g.opp_div.deinit();
         g.opp_div_fpts.deinit();
+        g.fpt2gfpt.deinit();
+        g.fpt2slot.deinit();
+        if (g.bc_code) |*b| b.deinit();
         g.heap.deinit();
         gpa.destroy(g);
     }
@@ -168,6 +220,19 @@ const GpuState = struct {
         return b;
     }
 };
+
+/// The kernel's code for a boundary condition, or null if it has none -- the
+/// viscous walls, which keep `applyBcs` on the CPU.
+fn bcCode(bc: cfg.BoundaryCondition) ?gpu.face_bcs.Code {
+    return switch (bc) {
+        .sup_in => .sup_in,
+        .sup_out => .sup_out,
+        .characteristic => .characteristic,
+        // Symmetry and a slip wall are the same condition for an inviscid flow
+        .slip_wall, .symmetry => .slip_wall,
+        .none, .periodic, .isothermal_noslip, .adiabatic_noslip => null,
+    };
+}
 
 pub const Solver = struct {
     gpa: std.mem.Allocator,
@@ -300,7 +365,7 @@ pub const Solver = struct {
             .rk = try RkScheme.fromConfig(config.time.dt_scheme),
             .quad = Quad.init(gpa, config, order, n_nodes),
             // Replaced below, once the element's flux point count is known.
-            .faces = try Faces.init(gpa, config, params, 0, 0),
+            .faces = try Faces.init(gpa, gpa, config, params, 0, 0),
             .n_dims = n_dims,
             .n_vars = n_vars,
             .n_eles = n_eles,
@@ -316,14 +381,19 @@ pub const Solver = struct {
             return error.ConnectivityNotProcessed;
         }
 
+        // Before the arrays, all of which ask it where they should live
+        if (opts.device) |dev| {
+            s.gpu_state = try GpuState.create(gpa, dev, &s.quad.ele);
+            try s.gpu_state.?.uploadConnectivity(gpa, mesh);
+        }
+
         s.faces.deinit();
-        s.faces = try Faces.init(gpa, config, params, mesh.n_gfpts, mesh.n_gfpts_bnd);
+        s.faces = try Faces.init(gpa, s.arrayAllocator(), config, params, mesh.n_gfpts, mesh.n_gfpts_bnd);
         // Borrowed from the mesh, which outlives the solver
         s.faces.gfpt2bnd = mesh.gfpt2bnd.items;
         s.faces.bc_list = mesh.bc_list.items;
 
-        // Before `allocate`, which asks it where the solution arrays go
-        if (opts.device) |dev| s.gpu_state = try GpuState.create(gpa, dev, &s.quad.ele);
+        if (s.gpu_state) |g| try g.uploadBcCodes(gpa, &s.faces);
 
         try s.allocate();
         try s.computeTransforms();
@@ -1011,15 +1081,66 @@ pub const Solver = struct {
         }
     }
 
+    /// Ghost states at the boundary flux points.
+    ///
+    /// The kernel covers the inviscid conditions; a viscous wall has no code and
+    /// leaves `bc_code` null, which sends this to the CPU.
+    fn applyFaceBcs(s: *Solver) Error!void {
+        if (s.gpu_state) |g| {
+            if (g.bc_code) |codes| {
+                const f = &s.faces;
+                const u_fs = s.params.freestreamState(2, .euler_ns);
+                return g.dev.faceBcs(.{
+                    .n_gfpts = @intCast(f.n_gfpts),
+                    .n_gfpts_int = @intCast(f.n_gfpts_int),
+                    .n_gfpts_bnd = @intCast(f.n_gfpts_bnd),
+                    .n_vars = @intCast(s.n_vars),
+                    .gamma = s.params.gamma,
+                    .rho_fs = s.params.rho_fs,
+                    .p_fs = s.params.p_fs,
+                    .vel_fs = .{ s.params.vel_fs[0], s.params.vel_fs[1] },
+                    .u_fs = u_fs,
+                }, try g.bufferFor(f.u.data), try g.bufferFor(f.norm.data), codes.binding());
+            }
+        }
+        return s.faces.applyBcs();
+    }
+
+    /// Rusanov common normal flux at every global flux point.
+    fn computeCommonF(s: *Solver) Error!void {
+        if (s.gpu_state) |g| {
+            if (!s.config.equation.viscous) {
+                const f = &s.faces;
+                return g.dev.faceCommonF(
+                    f.n_gfpts,
+                    s.n_vars,
+                    s.params.gamma,
+                    s.config.flux.rus_k,
+                    try g.bufferFor(f.u.data),
+                    try g.bufferFor(f.norm.data),
+                    try g.bufferFor(f.d_a.data),
+                    try g.bufferFor(f.f_comm.data),
+                    try g.bufferFor(f.wave_sp),
+                );
+            }
+        }
+        s.faces.computeCommonF();
+    }
+
     // ---- Residual ----
 
     /// One residual evaluation: fills `divf_spts[stage]`.
     pub fn computeResidual(s: *Solver, stage: usize) Error!void {
-        try s.extrapolateU();
-        s.scatterUToFaces();
+        // With the face path on the device too, the whole residual is one
+        // uninterrupted run of GPU work: one submit and one fence wait for the
+        // lot, instead of one per dispatch. `gpuResidual` is that arrangement;
+        // this is the mixed one, where each ported step still stands alone
+        // because a CPU step follows it.
+        if (s.canBatchResidual()) return s.gpuResidual(stage);
 
-        // STUB: the right-hand state of every boundary flux point. See faces.zig.
-        try s.faces.applyBcs();
+        try s.extrapolateU();
+        try s.scatterUToFaces();
+        try s.applyFaceBcs();
 
         if (s.config.equation.viscous) {
             s.computeGradSpts();
@@ -1027,15 +1148,6 @@ pub const Solver = struct {
             s.gatherCommonUFromFaces();
             s.computeGradFpts();
         }
-
-        // `computeFluxSpts` and `computeDivFSpts` are the only two steps with a
-        // GPU path that sit next to each other, so they are the only pair a
-        // batch can currently help: one submit and one fence wait between them
-        // rather than two. Everything else in the chain has CPU work in
-        // between, which is what ends a batch. The rest joins as its operators
-        // move across.
-        const batched = s.gpu_state != null and !s.config.equation.viscous;
-        if (batched) try s.gpu_state.?.dev.beginBatch();
 
         try s.computeFluxSpts();
 
@@ -1046,10 +1158,45 @@ pub const Solver = struct {
         }
 
         try s.computeDivFSpts(stage);
-        if (batched) try s.gpu_state.?.dev.submitBatch();
-        s.faces.computeCommonF();
-        s.gatherCommonFFromFaces();
+        try s.computeCommonF();
+        try s.gatherCommonFFromFaces();
         try s.computeDivFFpts(stage);
+    }
+
+    /// Whether the residual runs entirely on the device. For tests: the fallback
+    /// is silent by design, so it needs a way to be seen.
+    pub fn canBatchResidualForTest(s: *const Solver) bool {
+        return s.canBatchResidual();
+    }
+
+    /// Whether every step of the residual has a GPU path, so the whole thing can
+    /// go in one submission.
+    fn canBatchResidual(s: *const Solver) bool {
+        const g = s.gpu_state orelse return false;
+        if (s.config.equation.viscous) return false;
+        if (s.config.equation.equation != .euler_ns) return false;
+        // Null when some boundary condition has no kernel
+        return g.bc_code != null;
+    }
+
+    /// The residual as one batch. Same order as `computeResidual`, with a
+    /// storage barrier between consecutive dispatches so each sees the last
+    /// one's writes.
+    ///
+    /// Seven dispatches, one submission, one fence wait.
+    fn gpuResidual(s: *Solver, stage: usize) Error!void {
+        const dev = s.gpu_state.?.dev;
+
+        try dev.beginBatch();
+        try s.extrapolateU();
+        try s.scatterUToFaces();
+        try s.applyFaceBcs();
+        try s.computeFluxSpts();
+        try s.computeDivFSpts(stage);
+        try s.computeCommonF();
+        try s.gatherCommonFFromFaces();
+        try s.computeDivFFpts(stage);
+        try dev.submitBatch();
     }
 
     /// Physical solution gradient at the solution points -> flux points.
@@ -1076,9 +1223,24 @@ pub const Solver = struct {
     // global flux point and side, so these are pure gather/scatter loops.
 
     /// Element flux-point solution -> the faces' two-sided state.
-    pub fn scatterUToFaces(s: *Solver) void {
+    pub fn scatterUToFaces(s: *Solver) Error!void {
         const ele = &s.quad.ele;
         const mesh = s.mesh;
+
+        if (s.gpu_state) |g| {
+            if (!s.config.equation.viscous) {
+                return g.dev.faceScatter(
+                    ele.n_fpts,
+                    s.n_eles,
+                    s.n_vars,
+                    s.faces.n_gfpts,
+                    try g.bufferFor(s.u_fpts.data),
+                    g.fpt2gfpt.binding(),
+                    g.fpt2slot.binding(),
+                    try g.bufferFor(s.faces.u.data),
+                );
+            }
+        }
 
         for (0..s.n_eles) |e| {
             for (0..ele.n_fpts) |fpt| {
@@ -1100,9 +1262,22 @@ pub const Solver = struct {
     }
 
     /// Common normal flux -> each element's own flux-point array.
-    pub fn gatherCommonFFromFaces(s: *Solver) void {
+    pub fn gatherCommonFFromFaces(s: *Solver) Error!void {
         const ele = &s.quad.ele;
         const mesh = s.mesh;
+
+        if (s.gpu_state) |g| {
+            return g.dev.faceGather(
+                ele.n_fpts,
+                s.n_eles,
+                s.n_vars,
+                s.faces.n_gfpts,
+                try g.bufferFor(s.faces.f_comm.data),
+                g.fpt2gfpt.binding(),
+                g.fpt2slot.binding(),
+                try g.bufferFor(s.f_comm.data),
+            );
+        }
 
         for (0..s.n_eles) |e| {
             for (0..ele.n_fpts) |fpt| {

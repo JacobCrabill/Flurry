@@ -728,11 +728,11 @@ test "free-stream is preserved on cells away from the boundary" {
             // computeResidual itself still stops at applyBcs, so drive the
             // chain directly.
             try s.extrapolateU();
-            s.scatterUToFaces();
+            try s.scatterUToFaces();
             try s.computeFluxSpts();
             try s.computeDivFSpts(0);
             s.faces.computeCommonF();
-            s.gatherCommonFFromFaces();
+            try s.gatherCommonFFromFaces();
             try s.computeDivFFpts(0);
 
             const ele = &s.quad.ele;
@@ -1181,7 +1181,7 @@ test "residualNorm is zero for a zero residual and scales linearly" {
 /// unit face scaling on both sides.
 fn testFaces(gpa: std.mem.Allocator, config: *const cfg.Config, n: usize) !Faces {
     const params = flux.FlowParams.fromConfig(config);
-    var f = try Faces.init(gpa, config, params, n, 0);
+    var f = try Faces.init(gpa, gpa, config, params, n, 0);
     for (0..n) |gf| {
         f.norm.at(0, gf).* = 1.0;
         f.norm.at(1, gf).* = 0.0;
@@ -1306,7 +1306,7 @@ fn testBndFaces(
     gfpt2bnd: []const usize,
 ) !Faces {
     const params = flux.FlowParams.fromConfig(config);
-    var f = try Faces.init(gpa, config, params, gfpt2bnd.len, gfpt2bnd.len);
+    var f = try Faces.init(gpa, gpa, config, params, gfpt2bnd.len, gfpt2bnd.len);
     f.gfpt2bnd = gfpt2bnd;
     f.bc_list = bc;
     for (0..f.n_gfpts) |gf| {
@@ -1609,11 +1609,11 @@ test "free-stream is preserved on a non-affine mesh" {
 
             try s.initializeU();
             try s.extrapolateU();
-            s.scatterUToFaces();
+            try s.scatterUToFaces();
             try s.computeFluxSpts();
             try s.computeDivFSpts(0);
             s.faces.computeCommonF();
-            s.gatherCommonFFromFaces();
+            try s.gatherCommonFFromFaces();
             try s.computeDivFFpts(0);
 
             const ele = &s.quad.ele;

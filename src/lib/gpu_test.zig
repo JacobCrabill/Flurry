@@ -14,6 +14,7 @@ const testing = std.testing;
 const cfg = @import("config.zig");
 const driver = @import("driver.zig");
 const gpu = @import("gpu.zig");
+const mathf64 = @import("kernels/mathf64.zig");
 
 // ---------------------------------------------------------------------------
 // Shared device
@@ -168,6 +169,15 @@ test "the device's staging survives a shrinking call" {
 // The solver operator
 // ---------------------------------------------------------------------------
 
+fn testConfigBc(order: u8, n: u32, bc: cfg.BoundaryCondition) cfg.Config {
+    var config = testConfig(order, n);
+    config.create_mesh.?.bc_bottom = bc;
+    config.create_mesh.?.bc_top = bc;
+    config.create_mesh.?.bc_left = bc;
+    config.create_mesh.?.bc_right = bc;
+    return config;
+}
+
 fn testConfig(order: u8, n: u32) cfg.Config {
     var config: cfg.Config = undefined;
     config.core = .{ .n_dims = 2, .mesh_file = "", .order = order };
@@ -292,9 +302,17 @@ test "only the arrays a dispatch binds are device-resident" {
     try testing.expect(s.deviceBufferFor(s.divf_spts.data) != null);
     try testing.expect(s.deviceBufferFor(s.inv_jaco_spts.data) != null); // computeFluxSpts
 
+    // ...and the face arrays, now that the whole face path dispatches
+    try testing.expect(s.deviceBufferFor(s.faces.u.data) != null);
+    try testing.expect(s.deviceBufferFor(s.faces.f_comm.data) != null);
+    try testing.expect(s.deviceBufferFor(s.faces.norm.data) != null);
+    try testing.expect(s.deviceBufferFor(s.faces.d_a.data) != null);
+    try testing.expect(s.deviceBufferFor(s.faces.wave_sp) != null);
+
     try testing.expect(s.deviceBufferFor(s.nodes.data) == null);
     try testing.expect(s.deviceBufferFor(s.coord_spts.data) == null);
     try testing.expect(s.deviceBufferFor(s.jaco_spts.data) == null);
+    try testing.expect(s.deviceBufferFor(s.faces.coord.data) == null);
 
     // ...and with no device nothing is
     var cpu_run: driver.Run = undefined;
@@ -395,13 +413,15 @@ test "a batched dispatch pair gives the same answer as two separate ones" {
     try expectClose(separate, s.divf_spts.data, 1e-15);
 }
 
-test "recording one kernel twice in a batch is rejected" {
+test "recording a single-instance kernel twice in a batch is rejected" {
     const gpa = testing.allocator;
     const d = try device();
 
     // A kernel owns a single descriptor set, so a second recording would
     // overwrite the first's arguments and *both* dispatches would run with the
-    // second's -- with no error and a plausible-looking wrong answer.
+    // second's -- no error, a plausible wrong answer. dgemm really is dispatched
+    // several times per residual and has an instance per recording; everything
+    // else has one, and says so.
     const config = testConfig(2, 4);
 
     var run: driver.Run = undefined;
@@ -410,7 +430,129 @@ test "recording one kernel twice in a batch is rejected" {
 
     const s = &run.solver;
     try d.beginBatch();
+    try s.computeFluxSpts();
+    try testing.expectError(error.KernelAlreadyRecorded, s.computeFluxSpts());
+    try d.submitBatch();
+}
+
+test "a batch runs out of dgemm instances rather than reusing one" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The pool is sized for a residual's three products. Asking for more is the
+    // same silent-overwrite hazard, so it is the same error.
+    const config = testConfig(2, 4);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    const s = &run.solver;
+    try d.beginBatch();
+    // Three fit; the residual uses exactly this many
+    try s.extrapolateU();
     try s.computeDivFSpts(0);
+    try s.computeDivFFpts(0);
+    try s.computeDivFSpts(0); // the fourth is the last of the pool
     try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFFpts(0));
     try d.submitBatch();
+}
+
+test "the kernels' f64 pow matches std.math" {
+    // Vulkan has no f64 transcendentals, so these are hand-rolled -- and a
+    // characteristic far field is built out of them, which makes them worth
+    // checking against the real thing rather than assuming.
+    const xs = [_]f64{ 1e-6, 0.1, 0.5, 0.9999, 1.0, 1.4, 2.0, 7.0, 1000.0, 1.0e6 };
+    const ys = [_]f64{ -2.5, -1.4, -0.4, 0.0, 0.4, 1.0, 1.4, 2.5, 3.0 };
+
+    for (xs) |x| {
+        try std.testing.expectApproxEqRel(std.math.log2(x), mathf64.log2(x), 1e-15);
+        for (ys) |y| {
+            try std.testing.expectApproxEqRel(std.math.pow(f64, x, y), mathf64.pow(x, y), 1e-14);
+            try std.testing.expectApproxEqRel(std.math.exp2(y), mathf64.exp2(y), 1e-15);
+        }
+    }
+
+    // The exponents the characteristic boundary actually raises things to
+    const gam = 1.4;
+    for ([_]f64{ 0.3, 1.0, 1.7, 4.2 }) |rho| {
+        try std.testing.expectApproxEqRel(std.math.pow(f64, rho, gam), mathf64.pow(rho, gam), 1e-14);
+        try std.testing.expectApproxEqRel(
+            std.math.pow(f64, rho, 1.0 / (gam - 1.0)),
+            mathf64.pow(rho, 1.0 / (gam - 1.0)),
+            1e-14,
+        );
+    }
+}
+
+test "boundary conditions on the device match the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // Every other GPU test here runs a periodic mesh, where there are no
+    // boundary flux points at all and `face_bcs` never dispatches. These are the
+    // conditions that do have a kernel; the characteristic one is the
+    // interesting case, being where the hand-rolled f64 `pow` gets used.
+    for ([_]cfg.BoundaryCondition{ .characteristic, .sup_in, .sup_out, .slip_wall, .symmetry }) |bc| {
+        const config = testConfigBc(3, 5, bc);
+
+        var cpu_run: driver.Run = undefined;
+        try cpu_run.init(gpa, testing.io, &config, .{});
+        defer cpu_run.deinit();
+
+        var gpu_run: driver.Run = undefined;
+        try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+        defer gpu_run.deinit();
+
+        try testing.expect(gpu_run.solver.faces.n_gfpts_bnd > 0); // or this proves nothing
+
+        try cpu_run.solver.computeResidual(0);
+        try gpu_run.solver.computeResidual(0);
+
+        expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-10) catch |err| {
+            std.debug.print("boundary condition: {t}\n", .{bc});
+            return err;
+        };
+    }
+}
+
+test "a viscous wall keeps the boundary conditions on the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // No kernel covers it, so the whole step falls back rather than running a
+    // condition the kernel would silently treat as a slip wall.
+    var config = testConfigBc(2, 4, .adiabatic_noslip);
+    config.equation.viscous = true;
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    try testing.expect(run.solver.deviceBufferFor(run.solver.u_spts.data) != null);
+    try testing.expect(!run.solver.canBatchResidualForTest());
+}
+
+test "several steps with boundaries stay together" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The same drift check as the periodic one, on a mesh where the boundary
+    // kernel actually runs every stage.
+    const config = testConfigBc(2, 5, .characteristic);
+
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+
+    for (0..10) |_| {
+        try cpu_run.solver.update();
+        try gpu_run.solver.update();
+    }
+
+    try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-10);
 }

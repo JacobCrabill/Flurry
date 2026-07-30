@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Kernels of our own, compiled to SPIR-V by the same route.
-    inline for (.{"flux_euler"}) |name| {
+    inline for (.{ "flux_euler", "face_scatter", "face_gather", "face_common_f", "face_bcs" }) |name| {
         const spv = spock_build.addSpirvKernel(b, .{
             .name = name,
             .root_source_file = b.path("src/lib/kernels/" ++ name ++ ".zig"),

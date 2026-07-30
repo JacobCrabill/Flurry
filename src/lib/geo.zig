@@ -1,3 +1,5 @@
+//! Geometry loading and connectivity processing
+
 /// Cell (element) topology types supported by the solver.
 ///
 /// Note that "collapsed" elements (tets, prisms) are stored as `hex` with
@@ -22,6 +24,14 @@ pub const GmshError = error{
     UnrecognizedElementType,
     /// An element referenced a node tag that was never defined in `$Nodes`
     UnknownNodeTag,
+};
+
+/// Errors specific to generating a Cartesian mesh.
+pub const CreateMeshError = error{
+    /// `createMesh` was called without a `create_mesh` config section
+    MissingCreateMeshConfig,
+    /// `core.n_dims` is neither 2 nor 3
+    UnsupportedDimension,
 };
 
 /// Geometry loading and processing
@@ -118,10 +128,16 @@ pub const Geo = struct {
     /// Flag for whether an MPI face is also a periodic face
     mpi_periodic: std.ArrayList(usize) = .empty,
 
+    // ---- Periodic box extents ----
+    // Set by `createMesh`; used to match up periodic boundary faces.
+    periodic_dx: f64 = 0.0,
+    periodic_dy: f64 = 0.0,
+    periodic_dz: f64 = 0.0,
+
     // /// Type for each face: hole, internal, boundary, MPI, overset [-1,0,1,2,3]
     // face_type: std.ArrayList(FACE_TYPE) = .empty,
 
-    /// Release everything `readGmsh` allocated from `gpa`.
+    /// Release everything `readGmsh` or `createMesh` allocated from `gpa`.
     pub fn deinit(geo: *Geo) void {
         const gpa = geo.gpa;
         geo.c2v.deinit(gpa);
@@ -132,6 +148,7 @@ pub const Geo = struct {
         geo.c2nf.deinit(gpa);
         geo.ctype.deinit(gpa);
         geo.n_bnd_pts.deinit(gpa);
+        geo.n_faces_per_bnd.deinit(gpa);
         geo.bc_list.deinit(gpa);
 
         for (geo.bc_names.items) |name| gpa.free(name);
@@ -565,7 +582,23 @@ pub const Geo = struct {
             for (verts, 0..) |v, j| geo.c2v.at(ic, j).* = v;
         }
 
-        // --- Pack the boundary node sets into bnd_pts ---
+        try geo.packBoundaryPoints(bound_points);
+
+        report(
+            "Geo: read {d} vertices, {d} cells, {d} boundaries\n",
+            .{ geo.n_verts, geo.n_eles, geo.n_bounds },
+        );
+    }
+
+    /// Pack one node set per boundary into `bnd_pts` / `n_bnd_pts`.
+    ///
+    /// `bnd_pts` is rectangular, so rows for boundaries with fewer points are
+    /// zero-padded; `n_bnd_pts[i]` is the only reliable way to know where row
+    /// `i` ends. The sets are consumed (their key arrays get sorted in place).
+    fn packBoundaryPoints(geo: *Geo, bound_points: []NodeSet) !void {
+        const gpa = geo.gpa;
+        std.debug.assert(bound_points.len == geo.n_bounds);
+
         try geo.n_bnd_pts.resize(gpa, geo.n_bounds);
         var max_n_bnd_pts: usize = 0;
         for (bound_points, 0..) |*set, i| {
@@ -576,19 +609,357 @@ pub const Geo = struct {
         geo.bnd_pts = try Matrix(usize).init(gpa, geo.n_bounds, max_n_bnd_pts, null);
         for (bound_points, 0..) |*set, i| {
             const pts = set.keys();
-            // Sorted, so the node ordering is independent of file ordering
+            // Sorted, so the node ordering is independent of insertion order
             std.mem.sortUnstable(usize, pts, {}, std.sort.asc(usize));
             for (pts, 0..) |v, j| geo.bnd_pts.at(i, j).* = v;
         }
+    }
+
+    // ---- Cartesian mesh generation ----
+
+    /// Generate a uniform Cartesian mesh from `config.create_mesh`, filling the
+    /// same members `readGmsh` does: `xv`, `c2v`, `c2nv`, `c2nf`, `ctype`,
+    /// `bc_list`, `bc_names`, `bnd_pts`, `n_bnd_pts`, plus `n_faces_per_bnd`
+    /// and the `periodic_d*` box extents.
+    pub fn createMesh(geo: *Geo) !void {
+        const cm = geo.config.create_mesh orelse {
+            report("Geo: createMesh called but no [create_mesh] config section is present\n", .{});
+            return error.MissingCreateMeshConfig;
+        };
+
+        geo.n_dims = geo.config.core.n_dims;
+        if (geo.n_dims != 2 and geo.n_dims != 3) return error.UnsupportedDimension;
+
+        const grid: CartGrid = .init(cm, geo.n_dims);
 
         report(
-            "Geo: read {d} vertices, {d} cells, {d} boundaries\n",
+            "Geo: Creating {d}x{d}x{d} cartesian mesh\n",
+            .{ grid.nx, grid.ny, grid.nz },
+        );
+
+        // Box extents, needed later to match up periodic boundaries
+        geo.periodic_dx = cm.xmax - cm.xmin;
+        geo.periodic_dy = cm.ymax - cm.ymin;
+        geo.periodic_dz = cm.zmax - cm.zmin;
+
+        var arena_state: std.heap.ArenaAllocator = .init(geo.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        switch (geo.n_dims) {
+            2 => try geo.createMesh2D(grid),
+            3 => try geo.createMesh3D(grid),
+            else => unreachable,
+        }
+
+        // --- Boundaries ---
+        // The six (four in 2D) sides may share boundary conditions, so the
+        // distinct BCs become the boundary list and each side is routed to its
+        // entry in it.
+        const bound_points = try geo.setupBoundaries(arena, cm);
+        switch (geo.n_dims) {
+            2 => try geo.boundaryFaces2D(arena, grid, cm, bound_points),
+            3 => try geo.boundaryFaces3D(arena, grid, cm, bound_points),
+            else => unreachable,
+        }
+        try geo.packBoundaryPoints(bound_points);
+
+        report(
+            "Geo: created {d} vertices, {d} cells, {d} boundaries\n",
             .{ geo.n_verts, geo.n_eles, geo.n_bounds },
         );
     }
 
-    pub fn createMesh(geo: *Geo) !void {
-        _ = geo; // autofix
+    /// Vertices and cells of a 2D (quad) Cartesian mesh.
+    fn createMesh2D(geo: *Geo, grid: CartGrid) !void {
+        const gpa = geo.gpa;
+        const nx = grid.nx;
+        const ny = grid.ny;
+
+        geo.n_verts = (nx + 1) * (ny + 1);
+        geo.n_eles = nx * ny;
+        geo.n_nodes_per_cell = 4;
+
+        geo.xv = try Matrix(f64).init(gpa, geo.n_verts, 2, null);
+        for (0..ny + 1) |j| {
+            for (0..nx + 1) |i| {
+                const iv = grid.vert(i, j, 0);
+                geo.xv.at(iv, 0).* = grid.x(i);
+                geo.xv.at(iv, 1).* = grid.y(j);
+            }
+        }
+
+        try geo.c2nv.appendNTimes(gpa, 4, geo.n_eles);
+        try geo.c2nf.appendNTimes(gpa, 4, geo.n_eles);
+        try geo.ctype.appendNTimes(gpa, .quad, geo.n_eles);
+
+        geo.c2v = try Matrix(usize).init(gpa, geo.n_eles, 4, null);
+        var ic: usize = 0;
+        // x-outer / y-inner, matching Flurry-cpp's cell numbering
+        for (0..nx) |i| {
+            for (0..ny) |j| {
+                geo.c2v.at(ic, 0).* = grid.vert(i, j, 0);
+                geo.c2v.at(ic, 1).* = grid.vert(i + 1, j, 0);
+                geo.c2v.at(ic, 2).* = grid.vert(i + 1, j + 1, 0);
+                geo.c2v.at(ic, 3).* = grid.vert(i, j + 1, 0);
+                ic += 1;
+            }
+        }
+        std.debug.assert(ic == geo.n_eles);
+    }
+
+    /// Vertices and cells of a 3D (hex) Cartesian mesh.
+    fn createMesh3D(geo: *Geo, grid: CartGrid) !void {
+        const gpa = geo.gpa;
+        const nx = grid.nx;
+        const ny = grid.ny;
+        const nz = grid.nz;
+
+        geo.n_verts = (nx + 1) * (ny + 1) * (nz + 1);
+        geo.n_eles = nx * ny * nz;
+        geo.n_nodes_per_cell = 8;
+
+        geo.xv = try Matrix(f64).init(gpa, geo.n_verts, 3, null);
+        for (0..nz + 1) |k| {
+            for (0..ny + 1) |j| {
+                for (0..nx + 1) |i| {
+                    const iv = grid.vert(i, j, k);
+                    geo.xv.at(iv, 0).* = grid.x(i);
+                    geo.xv.at(iv, 1).* = grid.y(j);
+                    geo.xv.at(iv, 2).* = grid.z(k);
+                }
+            }
+        }
+
+        try geo.c2nv.appendNTimes(gpa, 8, geo.n_eles);
+        try geo.c2nf.appendNTimes(gpa, 6, geo.n_eles);
+        try geo.ctype.appendNTimes(gpa, .hex, geo.n_eles);
+
+        geo.c2v = try Matrix(usize).init(gpa, geo.n_eles, 8, null);
+        var ic: usize = 0;
+        // z-outer, then x, then y -- matching Flurry-cpp's cell numbering
+        for (0..nz) |k| {
+            for (0..nx) |i| {
+                for (0..ny) |j| {
+                    // Bottom face (z = k), then the same four at z = k+1
+                    geo.c2v.at(ic, 0).* = grid.vert(i, j, k);
+                    geo.c2v.at(ic, 1).* = grid.vert(i + 1, j, k);
+                    geo.c2v.at(ic, 2).* = grid.vert(i + 1, j + 1, k);
+                    geo.c2v.at(ic, 3).* = grid.vert(i, j + 1, k);
+
+                    geo.c2v.at(ic, 4).* = grid.vert(i, j, k + 1);
+                    geo.c2v.at(ic, 5).* = grid.vert(i + 1, j, k + 1);
+                    geo.c2v.at(ic, 6).* = grid.vert(i + 1, j + 1, k + 1);
+                    geo.c2v.at(ic, 7).* = grid.vert(i, j + 1, k + 1);
+                    ic += 1;
+                }
+            }
+        }
+        std.debug.assert(ic == geo.n_eles);
+    }
+
+    /// Collapse the per-side boundary conditions into the distinct-BC list
+    /// (`bc_list`, `bc_names`, `n_bounds`) and return one empty node set per
+    /// boundary, arena-owned, for the face loops to fill.
+    fn setupBoundaries(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        cm: cfg.CreateMeshConfig,
+    ) ![]NodeSet {
+        const gpa = geo.gpa;
+
+        // Order follows Flurry-cpp; it only affects the pre-sort arrangement.
+        // front/back exist in 3D only, so they come last and get sliced off.
+        var sides: [6]cfg.BoundaryCondition = .{
+            cm.bc_bottom, cm.bc_right, cm.bc_top,
+            cm.bc_left,   cm.bc_front, cm.bc_back,
+        };
+
+        // Sort and drop duplicates: sides sharing a BC share a boundary.
+        const list = sides[0..if (geo.n_dims == 3) @as(usize, 6) else 4];
+        std.mem.sortUnstable(cfg.BoundaryCondition, list, {}, struct {
+            fn lessThan(_: void, a: cfg.BoundaryCondition, b: cfg.BoundaryCondition) bool {
+                return @backingInt(a) < @backingInt(b);
+            }
+        }.lessThan);
+
+        var n_bounds: usize = 0;
+        for (list) |bc| {
+            if (n_bounds > 0 and list[n_bounds - 1] == bc) continue;
+            list[n_bounds] = bc;
+            n_bounds += 1;
+        }
+        geo.n_bounds = n_bounds;
+
+        try geo.bc_list.appendSlice(gpa, list[0..n_bounds]);
+        for (list[0..n_bounds]) |bc| {
+            // No mesh file to take names from, so the BC tag is the name.
+            try geo.bc_names.append(gpa, try gpa.dupe(u8, @tagName(bc)));
+        }
+
+        try geo.n_faces_per_bnd.appendNTimes(gpa, 0, n_bounds);
+
+        const bound_points = try arena.alloc(NodeSet, n_bounds);
+        for (bound_points) |*s| s.* = .empty;
+        return bound_points;
+    }
+
+    /// Index into `bc_list` for a side's boundary condition.
+    fn boundIndex(geo: *const Geo, bc: cfg.BoundaryCondition) usize {
+        return std.mem.indexOfScalar(cfg.BoundaryCondition, geo.bc_list.items, bc).?;
+    }
+
+    /// Record the nodes of one boundary face against its boundary.
+    fn addBoundaryFace(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        bound_points: []NodeSet,
+        bc: cfg.BoundaryCondition,
+        nodes: []const usize,
+    ) !void {
+        const ib = geo.boundIndex(bc);
+        for (nodes) |v| try bound_points[ib].put(arena, v, {});
+        geo.n_faces_per_bnd.items[ib] += 1;
+    }
+
+    /// Boundary edges of a 2D mesh. `bottom`/`top` are y = ymin/ymax and
+    /// `left`/`right` are x = xmin/xmax; each edge is wound so the interior
+    /// lies to its left.
+    fn boundaryFaces2D(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        grid: CartGrid,
+        cm: cfg.CreateMeshConfig,
+        bound_points: []NodeSet,
+    ) !void {
+        const nx = grid.nx;
+        const ny = grid.ny;
+
+        for (0..nx) |ix| {
+            try geo.addBoundaryFace(arena, bound_points, cm.bc_bottom, &.{
+                grid.vert(ix, 0, 0), grid.vert(ix + 1, 0, 0),
+            });
+            try geo.addBoundaryFace(arena, bound_points, cm.bc_top, &.{
+                grid.vert(ix + 1, ny, 0), grid.vert(ix, ny, 0),
+            });
+        }
+
+        for (0..ny) |iy| {
+            try geo.addBoundaryFace(arena, bound_points, cm.bc_left, &.{
+                grid.vert(0, iy + 1, 0), grid.vert(0, iy, 0),
+            });
+            try geo.addBoundaryFace(arena, bound_points, cm.bc_right, &.{
+                grid.vert(nx, iy, 0), grid.vert(nx, iy + 1, 0),
+            });
+        }
+    }
+
+    /// Boundary faces of a 3D mesh. Note the axes differ from the 2D case:
+    /// `bottom`/`top` are z = zmin/zmax, `left`/`right` are x = xmin/xmax and
+    /// `back`/`front` are y = ymin/ymax.
+    fn boundaryFaces3D(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        grid: CartGrid,
+        cm: cfg.CreateMeshConfig,
+        bound_points: []NodeSet,
+    ) !void {
+        const nx = grid.nx;
+        const ny = grid.ny;
+        const nz = grid.nz;
+
+        // z = zmin / z = zmax
+        for (0..nx) |ix| {
+            for (0..ny) |iy| {
+                try geo.addBoundaryFace(arena, bound_points, cm.bc_bottom, &.{
+                    grid.vert(ix, iy, 0),         grid.vert(ix + 1, iy, 0),
+                    grid.vert(ix + 1, iy + 1, 0), grid.vert(ix, iy + 1, 0),
+                });
+                try geo.addBoundaryFace(arena, bound_points, cm.bc_top, &.{
+                    grid.vert(ix, iy, nz),         grid.vert(ix + 1, iy, nz),
+                    grid.vert(ix + 1, iy + 1, nz), grid.vert(ix, iy + 1, nz),
+                });
+            }
+        }
+
+        // x = xmin / x = xmax
+        for (0..nz) |iz| {
+            for (0..ny) |iy| {
+                try geo.addBoundaryFace(arena, bound_points, cm.bc_left, &.{
+                    grid.vert(0, iy, iz),         grid.vert(0, iy, iz + 1),
+                    grid.vert(0, iy + 1, iz + 1), grid.vert(0, iy + 1, iz),
+                });
+                try geo.addBoundaryFace(arena, bound_points, cm.bc_right, &.{
+                    grid.vert(nx, iy, iz),         grid.vert(nx, iy, iz + 1),
+                    grid.vert(nx, iy + 1, iz + 1), grid.vert(nx, iy + 1, iz),
+                });
+            }
+        }
+
+        // y = ymin / y = ymax
+        for (0..nz) |iz| {
+            for (0..nx) |ix| {
+                try geo.addBoundaryFace(arena, bound_points, cm.bc_back, &.{
+                    grid.vert(ix, 0, iz),         grid.vert(ix, 0, iz + 1),
+                    grid.vert(ix + 1, 0, iz + 1), grid.vert(ix + 1, 0, iz),
+                });
+                try geo.addBoundaryFace(arena, bound_points, cm.bc_front, &.{
+                    grid.vert(ix, ny, iz),         grid.vert(ix, ny, iz + 1),
+                    grid.vert(ix + 1, ny, iz + 1), grid.vert(ix + 1, ny, iz),
+                });
+            }
+        }
+    }
+};
+
+/// Uniform Cartesian grid geometry: cell counts, origin and spacing.
+///
+/// Vertices are numbered x-fastest then y then z, so `vert(i, j, k)` is the
+/// single source of truth for the layout that both the cell connectivity and
+/// the boundary face loops index against.
+const CartGrid = struct {
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    xmin: f64,
+    ymin: f64,
+    zmin: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+
+    fn init(cm: cfg.CreateMeshConfig, n_dims: usize) CartGrid {
+        // A 2D mesh is one cell thick, which also keeps n_eles = nx*ny*nz.
+        const nz: usize = if (n_dims == 2) 1 else cm.nz;
+        return .{
+            .nx = cm.nx,
+            .ny = cm.ny,
+            .nz = nz,
+            .xmin = cm.xmin,
+            .ymin = cm.ymin,
+            .zmin = cm.zmin,
+            .dx = (cm.xmax - cm.xmin) / @as(f64, @floatFromInt(cm.nx)),
+            .dy = (cm.ymax - cm.ymin) / @as(f64, @floatFromInt(cm.ny)),
+            .dz = (cm.zmax - cm.zmin) / @as(f64, @floatFromInt(nz)),
+        };
+    }
+
+    /// 0-based vertex index at grid position (i, j, k)
+    fn vert(g: CartGrid, i: usize, j: usize, k: usize) usize {
+        std.debug.assert(i <= g.nx and j <= g.ny and k <= g.nz);
+        return i + (g.nx + 1) * (j + (g.ny + 1) * k);
+    }
+
+    fn x(g: CartGrid, i: usize) f64 {
+        return g.xmin + @as(f64, @floatFromInt(i)) * g.dx;
+    }
+
+    fn y(g: CartGrid, j: usize) f64 {
+        return g.ymin + @as(f64, @floatFromInt(j)) * g.dy;
+    }
+
+    fn z(g: CartGrid, k: usize) f64 {
+        return g.zmin + @as(f64, @floatFromInt(k)) * g.dz;
     }
 };
 
@@ -939,7 +1310,7 @@ test "readGmsh: missing section is an error" {
     var geo = try testGeo(gpa, arena.allocator(), &config);
     defer geo.deinit();
 
-    const truncated = mesh_v2[0 .. std.mem.indexOf(u8, mesh_v2, "$Elements").?];
+    const truncated = mesh_v2[0..std.mem.indexOf(u8, mesh_v2, "$Elements").?];
     try std.testing.expectError(error.MissingSection, geo.parseGmsh(arena.allocator(), truncated));
 }
 
@@ -971,6 +1342,235 @@ test cellFromGmsh {
     // A truncated node list must be rejected rather than read past the end
     try t.expectError(error.MalformedMeshFile, cellFromGmsh(3, &.{ 0, 1 }, &out));
     try t.expectError(error.UnrecognizedElementType, cellFromGmsh(999, &.{ 0, 1 }, &out));
+}
+
+// ---- createMesh ----
+
+/// A `Geo` set up for Cartesian mesh generation. `gpa` owns everything
+/// `createMesh` produces, so leak checking exercises `deinit`.
+fn testCreateGeo(gpa: std.mem.Allocator, config: *cfg.Config, n_dims: u8, cm: cfg.CreateMeshConfig) Geo {
+    config.core = .{ .n_dims = n_dims, .mesh_file = "", .order = 1 };
+    config.boundary_conditions = .{};
+    config.create_mesh = cm;
+    return .{ .gpa = gpa, .io = undefined, .config = config.* };
+}
+
+/// Row `ib` of `bnd_pts`, trimmed to the entries that are actually populated.
+fn bndPts(geo: *const Geo, ib: usize) []const usize {
+    const row = geo.bnd_pts.data[ib * geo.bnd_pts.stride ..];
+    return row[0..geo.n_bnd_pts.items[ib]];
+}
+
+test "createMesh: 2D, one BC per side" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 2, .{
+        .nx = 2,
+        .ny = 2,
+        .xmin = 0.0,
+        .xmax = 2.0,
+        .ymin = 0.0,
+        .ymax = 4.0,
+        .bc_bottom = .slip_wall,
+        .bc_right = .sup_out,
+        .bc_top = .symmetry,
+        .bc_left = .sup_in,
+    });
+    defer geo.deinit();
+
+    try geo.createMesh();
+
+    try t.expectEqual(@as(usize, 2), geo.n_dims);
+    try t.expectEqual(@as(usize, 9), geo.n_verts);
+    try t.expectEqual(@as(usize, 4), geo.n_eles);
+    try t.expectEqual(@as(usize, 4), geo.n_nodes_per_cell);
+
+    // Box extents, for periodic face matching
+    try t.expectEqual(@as(f64, 2.0), geo.periodic_dx);
+    try t.expectEqual(@as(f64, 4.0), geo.periodic_dy);
+
+    // Vertices: x fastest, so dx = 1 and dy = 2
+    const xv_expect = [9][2]f64{
+        .{ 0, 0 }, .{ 1, 0 }, .{ 2, 0 },
+        .{ 0, 2 }, .{ 1, 2 }, .{ 2, 2 },
+        .{ 0, 4 }, .{ 1, 4 }, .{ 2, 4 },
+    };
+    for (xv_expect, 0..) |xy, iv| {
+        try t.expectEqual(xy[0], geo.xv.get(iv, 0));
+        try t.expectEqual(xy[1], geo.xv.get(iv, 1));
+    }
+
+    // Cells are numbered x-outer / y-inner, counter-clockwise within each
+    const c2v_expect = [4][4]usize{
+        .{ 0, 1, 4, 3 }, .{ 3, 4, 7, 6 },
+        .{ 1, 2, 5, 4 }, .{ 4, 5, 8, 7 },
+    };
+    for (c2v_expect, 0..) |verts, ic| {
+        try t.expectEqual(CellType.quad, geo.ctype.items[ic]);
+        try t.expectEqual(@as(usize, 4), geo.c2nv.items[ic]);
+        try t.expectEqual(@as(usize, 4), geo.c2nf.items[ic]);
+        for (verts, 0..) |v, j| try t.expectEqual(v, geo.c2v.get(ic, j));
+    }
+
+    // Distinct BCs, sorted by enum value: sup_in < sup_out < slip_wall < symmetry
+    try t.expectEqual(@as(usize, 4), geo.n_bounds);
+    try t.expectEqualSlices(cfg.BoundaryCondition, &.{
+        .sup_in, .sup_out, .slip_wall, .symmetry,
+    }, geo.bc_list.items);
+    try t.expectEqualStrings("sup_in", geo.bc_names.items[0]);
+    try t.expectEqualStrings("symmetry", geo.bc_names.items[3]);
+
+    try t.expectEqualSlices(usize, &.{ 0, 3, 6 }, bndPts(&geo, 0)); // left,   x = 0
+    try t.expectEqualSlices(usize, &.{ 2, 5, 8 }, bndPts(&geo, 1)); // right,  x = 2
+    try t.expectEqualSlices(usize, &.{ 0, 1, 2 }, bndPts(&geo, 2)); // bottom, y = 0
+    // Vertex 0 is absent here. Flurry-cpp sorted the zero-padded `bnd_pts`
+    // row and de-duplicated it, which folded the padding into a spurious
+    // vertex 0 on every boundary that did not already contain it.
+    try t.expectEqualSlices(usize, &.{ 6, 7, 8 }, bndPts(&geo, 3)); // top,    y = 4
+
+    try t.expectEqualSlices(usize, &.{ 2, 2, 2, 2 }, geo.n_faces_per_bnd.items);
+}
+
+test "createMesh: 2D, all sides share one BC" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 2, .{
+        .nx = 2,
+        .ny = 2,
+        .xmin = 0.0,
+        .xmax = 2.0,
+        .ymin = 0.0,
+        .ymax = 2.0,
+        // all four sides default to .periodic
+    });
+    defer geo.deinit();
+
+    try geo.createMesh();
+
+    // Sides sharing a BC collapse into a single boundary
+    try t.expectEqual(@as(usize, 1), geo.n_bounds);
+    try t.expectEqualSlices(cfg.BoundaryCondition, &.{.periodic}, geo.bc_list.items);
+
+    // Every vertex except the center one (4) lies on the perimeter
+    try t.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 5, 6, 7, 8 }, bndPts(&geo, 0));
+    try t.expectEqualSlices(usize, &.{8}, geo.n_faces_per_bnd.items);
+}
+
+test "createMesh: 3D, one BC per side" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    var config: cfg.Config = undefined;
+    var geo = testCreateGeo(gpa, &config, 3, .{
+        .nx = 1,
+        .ny = 1,
+        .nz = 1,
+        .xmin = 0.0,
+        .xmax = 1.0,
+        .ymin = 0.0,
+        .ymax = 1.0,
+        .zmin = 0.0,
+        .zmax = 1.0,
+        .bc_bottom = .slip_wall,
+        .bc_right = .sup_out,
+        .bc_top = .symmetry,
+        .bc_left = .sup_in,
+        .bc_front = .char,
+        .bc_back = .adiabatic_noslip,
+    });
+    defer geo.deinit();
+
+    try geo.createMesh();
+
+    try t.expectEqual(@as(usize, 3), geo.n_dims);
+    try t.expectEqual(@as(usize, 8), geo.n_verts);
+    try t.expectEqual(@as(usize, 1), geo.n_eles);
+    try t.expectEqual(@as(usize, 8), geo.n_nodes_per_cell);
+    try t.expectEqual(@as(f64, 1.0), geo.periodic_dz);
+
+    // The single hex, in Gmsh linear-hex vertex order
+    try t.expectEqual(CellType.hex, geo.ctype.items[0]);
+    try t.expectEqual(@as(usize, 6), geo.c2nf.items[0]);
+    for ([8]usize{ 0, 1, 3, 2, 4, 5, 7, 6 }, 0..) |v, j| {
+        try t.expectEqual(v, geo.c2v.get(0, j));
+    }
+
+    // Unit cube corners, x fastest then y then z
+    try t.expectEqual(@as(f64, 0.0), geo.xv.get(0, 2));
+    try t.expectEqual(@as(f64, 1.0), geo.xv.get(7, 0));
+    try t.expectEqual(@as(f64, 1.0), geo.xv.get(7, 1));
+    try t.expectEqual(@as(f64, 1.0), geo.xv.get(7, 2));
+
+    // char < sup_in < sup_out < slip_wall < adiabatic_noslip < symmetry
+    try t.expectEqual(@as(usize, 6), geo.n_bounds);
+    try t.expectEqualSlices(cfg.BoundaryCondition, &.{
+        .char, .sup_in, .sup_out, .slip_wall, .adiabatic_noslip, .symmetry,
+    }, geo.bc_list.items);
+
+    // In 3D bottom/top are z, left/right are x, back/front are y
+    try t.expectEqualSlices(usize, &.{ 2, 3, 6, 7 }, bndPts(&geo, 0)); // front,  y = 1
+    try t.expectEqualSlices(usize, &.{ 0, 2, 4, 6 }, bndPts(&geo, 1)); // left,   x = 0
+    try t.expectEqualSlices(usize, &.{ 1, 3, 5, 7 }, bndPts(&geo, 2)); // right,  x = 1
+    try t.expectEqualSlices(usize, &.{ 0, 1, 2, 3 }, bndPts(&geo, 3)); // bottom, z = 0
+    try t.expectEqualSlices(usize, &.{ 0, 1, 4, 5 }, bndPts(&geo, 4)); // back,   y = 0
+    try t.expectEqualSlices(usize, &.{ 4, 5, 6, 7 }, bndPts(&geo, 5)); // top,    z = 1
+
+    try t.expectEqualSlices(usize, &.{ 1, 1, 1, 1, 1, 1 }, geo.n_faces_per_bnd.items);
+}
+
+test "createMesh: cell and vertex counts" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    // 2D ignores nz entirely: the mesh is one cell thick
+    {
+        var config: cfg.Config = undefined;
+        var geo = testCreateGeo(gpa, &config, 2, .{ .nx = 3, .ny = 4, .nz = 99 });
+        defer geo.deinit();
+        try geo.createMesh();
+        try t.expectEqual(@as(usize, 4 * 5), geo.n_verts);
+        try t.expectEqual(@as(usize, 3 * 4), geo.n_eles);
+    }
+
+    {
+        var config: cfg.Config = undefined;
+        var geo = testCreateGeo(gpa, &config, 3, .{ .nx = 3, .ny = 4, .nz = 5 });
+        defer geo.deinit();
+        try geo.createMesh();
+        try t.expectEqual(@as(usize, 4 * 5 * 6), geo.n_verts);
+        try t.expectEqual(@as(usize, 3 * 4 * 5), geo.n_eles);
+
+        // Every vertex must be referenced by some cell, and no index may run
+        // past the end of xv -- catches any slip in the vertex numbering.
+        var seen = try gpa.alloc(bool, geo.n_verts);
+        defer gpa.free(seen);
+        @memset(seen, false);
+        for (0..geo.n_eles) |ic| {
+            for (0..8) |j| {
+                const v = geo.c2v.get(ic, j);
+                try t.expect(v < geo.n_verts);
+                seen[v] = true;
+            }
+        }
+        for (seen) |s| try t.expect(s);
+    }
+}
+
+test "createMesh: missing config section is an error" {
+    const gpa = std.testing.allocator;
+
+    var config: cfg.Config = undefined;
+    config.core = .{ .n_dims = 2, .mesh_file = "", .order = 1 };
+    config.create_mesh = null;
+
+    var geo: Geo = .{ .gpa = gpa, .io = undefined, .config = config };
+    defer geo.deinit();
+
+    try std.testing.expectError(error.MissingCreateMeshConfig, geo.createMesh());
 }
 
 const std = @import("std");

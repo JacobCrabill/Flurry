@@ -185,6 +185,30 @@ test "invalid enum tag produces ParseError" {
     return error.ExpectedParseError;
 }
 
+test "create_mesh section is optional and round-trips" {
+    // Absent in the standard fixtures: mesh creation is off unless asked for.
+    var rk = try parseTest(std.testing.io, @embedFile("testdata/config/rk44.cfg.ziggy"));
+    defer rk.deinit();
+    try testing.expectEqual(@as(?config.CreateMeshConfig, null), rk.value.create_mesh);
+
+    var pc = try parseTest(std.testing.io, @embedFile("testdata/config/create_mesh.cfg.ziggy"));
+    defer pc.deinit();
+
+    const cm = pc.value.create_mesh orelse return error.ExpectedCreateMeshSection;
+    try testing.expectEqual(@as(u32, 4), cm.nx);
+    try testing.expectEqual(@as(u32, 8), cm.ny);
+    try testing.expectEqual(@as(u32, 2), cm.nz);
+    try expectApprox(-1.0, cm.xmin, 1e-12);
+    try expectApprox(4.0, cm.ymax, 1e-12);
+    try expectApprox(-0.5, cm.zmin, 1e-12);
+    try testing.expectEqual(config.BoundaryCondition.slip_wall, cm.bc_bottom);
+    try testing.expectEqual(config.BoundaryCondition.symmetry, cm.bc_top);
+    try testing.expectEqual(config.BoundaryCondition.sup_in, cm.bc_left);
+    try testing.expectEqual(config.BoundaryCondition.sup_out, cm.bc_right);
+    try testing.expectEqual(config.BoundaryCondition.char, cm.bc_front);
+    try testing.expectEqual(config.BoundaryCondition.periodic, cm.bc_back);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Boundary condition dictionary iteration
 // ---------------------------------------------------------------------------

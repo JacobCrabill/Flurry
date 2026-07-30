@@ -7,17 +7,21 @@ const ziggy = @import("ziggy");
 pub const Equation = enum { adv_diff, euler_ns };
 
 pub const DtScheme = enum {
+    // zig fmt: off
     euler, rk44, rk54, rkJ, steady, dirk34, esdirk43, esdirk64,
+    // zig fmt: on
 };
 
 pub const FluxConvType = enum { rusanov };
 pub const FluxViscType = enum { ldg };
 
 pub const BoundaryCondition = enum {
+    // zig fmt: off
     none, periodic, char, sup_in, sup_out, slip_wall,
     isothermal_noslip, isothermal_noslip_moving,
     adiabatic_noslip, adiabatic_noslip_moving,
     overset, symmetry, wall_closure, overset_closure,
+    // zig fmt: on
 };
 
 pub const MotionType = enum { static, test1, test2, test3, circular_trans, rigid_body };
@@ -201,6 +205,38 @@ pub const BoundaryConditionsConfig = struct {
     mesh_bounds: ziggy.Dictionary(BoundaryCondition) = .empty,
 };
 
+/// Generate a uniform Cartesian mesh instead of reading one from a file
+/// (`meshType = CREATE_MESH` in Flurry-cpp). Presence of this section is what
+/// selects mesh creation, so `core.mesh_file` is ignored when it is set.
+///
+/// Note the axis each boundary names, which follows Flurry-cpp and is *not*
+/// consistent between 2D and 3D:
+///   - 2D: `bottom`/`top` are y = ymin/ymax, `left`/`right` are x = xmin/xmax
+///   - 3D: `bottom`/`top` are z = zmin/zmax, `left`/`right` are x = xmin/xmax,
+///         and `back`/`front` are y = ymin/ymax
+pub const CreateMeshConfig = struct {
+    nx: u32 = 10,
+    ny: u32 = 10,
+    /// Ignored when `core.n_dims` is 2
+    nz: u32 = 10,
+
+    xmin: f64 = -10.0,
+    xmax: f64 = 10.0,
+    ymin: f64 = -10.0,
+    ymax: f64 = 10.0,
+    zmin: f64 = -10.0,
+    zmax: f64 = 10.0,
+
+    bc_bottom: BoundaryCondition = .periodic,
+    bc_right: BoundaryCondition = .periodic,
+    bc_top: BoundaryCondition = .periodic,
+    bc_left: BoundaryCondition = .periodic,
+    /// 3D only
+    bc_front: BoundaryCondition = .periodic,
+    /// 3D only
+    bc_back: BoundaryCondition = .periodic,
+};
+
 pub const SignalConfig = struct {
     catch_signals: bool = false,
 };
@@ -223,6 +259,7 @@ pub const Config = struct {
     motion: ?MotionConfig = null,
     boundary_conditions: BoundaryConditionsConfig,
     signals: SignalConfig,
+    create_mesh: ?CreateMeshConfig = null,
 };
 
 /// Arena-backed parse result. Ziggy has no recursive `free`, and (by default)

@@ -30,6 +30,8 @@ pub const ConnError = error{
     UnsupportedCellType,
     /// `core.n_dims` is neither 2 nor 3
     UnsupportedDimension,
+    /// `setupGlobalFpts` was called before `processConnectivity`
+    ConnectivityNotProcessed,
 };
 
 /// Errors specific to reading/parsing a Gmsh `.msh` file.
@@ -166,6 +168,36 @@ pub const Geo = struct {
     /// Type for each face: internal, boundary, MPI
     face_type: std.ArrayList(FaceType) = .empty,
 
+    // ---- Global flux points ----
+    // Built by `setupGlobalFpts`. Every face carries `n_fpts_per_face` *global*
+    // flux points (gfpts), the points at which the two sides of an interface
+    // exchange data. Interior gfpts come first; boundary ones occupy the tail,
+    // so a boundary gfpt is `gfpt - n_gfpts_int` into `gfpt2bnd`.
+
+    /// Flux points along a single face
+    n_fpts_per_face: usize = 0,
+    /// Flux points on a whole element, `n_faces * n_fpts_per_face`
+    n_fpts_per_ele: usize = 0,
+
+    n_gfpts: usize = 0,
+    n_gfpts_int: usize = 0,
+    n_gfpts_bnd: usize = 0,
+
+    /// Global flux point of each element-local flux point, (fpt, ele).
+    /// `none` where a cell face is collapsed.
+    fpt2gfpt: Matrix(usize) = .empty,
+
+    /// Which side of its interface an element-local flux point is on:
+    /// 0 = left, 1 = right. (fpt, ele)
+    fpt2gfpt_slot: Matrix(u8) = .empty,
+
+    /// Boundary index (into `bc_list`) of each boundary gfpt, indexed by
+    /// `gfpt - n_gfpts_int`. `none` if the face matched no boundary.
+    gfpt2bnd: std.ArrayList(usize) = .empty,
+
+    /// Face ID owning each global flux point
+    gfpt2face: std.ArrayList(usize) = .empty,
+
     /// Release everything `readGmsh`, `createMesh` or `processConnectivity`
     /// allocated from `gpa`.
     pub fn deinit(geo: *Geo) void {
@@ -201,6 +233,11 @@ pub const Geo = struct {
 
         for (geo.bc_faces.items) |*mat| mat.deinit(gpa);
         geo.bc_faces.deinit(gpa);
+
+        geo.fpt2gfpt.deinit(gpa);
+        geo.fpt2gfpt_slot.deinit(gpa);
+        geo.gfpt2bnd.deinit(gpa);
+        geo.gfpt2face.deinit(gpa);
     }
 
     /// Read a Gmsh `.msh` file (ASCII format 2.x or 4.x) and populate the
@@ -984,6 +1021,99 @@ pub const Geo = struct {
             3 => try geo.processConn3D(arena),
             else => return error.UnsupportedDimension,
         }
+    }
+
+    /// Build the global flux point map, given how many flux points an element
+    /// puts on each face (`order + 1` for a tensor-product element).
+    ///
+    /// Call after `processConnectivity`. The element's local flux points must be
+    /// stored face by face, in the same face order as `localFaces`, each face
+    /// traversed counter-clockwise -- which is what `eles/quads.zig` does.
+    ///
+    /// Two cells sharing a face both traverse it counter-clockwise *from their
+    /// own side*, so they walk it in opposite directions: the left cell's flux
+    /// point `j` sits on top of the right cell's `n_fpts_per_face - 1 - j`. That
+    /// holds exactly because the 1D flux point distribution is symmetric about
+    /// the face midpoint. `Solver` checks it geometrically once it knows the
+    /// physical flux point locations.
+    ///
+    /// ZEFR relies on the same reversal, then runs `orient_fpts` to re-sort by
+    /// physical coordinate for the cases where it does not hold (3D face
+    /// rotations). A 2D conforming mesh needs no such fixup.
+    pub fn setupGlobalFpts(geo: *Geo, n_fpts_per_face: usize) !void {
+        const gpa = geo.gpa;
+
+        if (geo.n_faces == 0) return error.ConnectivityNotProcessed;
+
+        var max_nf: usize = 0;
+        for (geo.c2nf.items) |nf| max_nf = @max(max_nf, nf);
+
+        geo.n_fpts_per_face = n_fpts_per_face;
+        geo.n_fpts_per_ele = max_nf * n_fpts_per_face;
+        geo.n_gfpts_int = geo.n_int_faces * n_fpts_per_face;
+        geo.n_gfpts_bnd = geo.n_bnd_faces * n_fpts_per_face;
+        geo.n_gfpts = geo.n_gfpts_int + geo.n_gfpts_bnd;
+
+        geo.fpt2gfpt = try Matrix(usize).init(gpa, geo.n_fpts_per_ele, geo.n_eles, null);
+        @memset(geo.fpt2gfpt.data, none);
+        geo.fpt2gfpt_slot = try Matrix(u8).init(gpa, geo.n_fpts_per_ele, geo.n_eles, null);
+        try geo.gfpt2bnd.resize(gpa, geo.n_gfpts_bnd);
+        try geo.gfpt2face.resize(gpa, geo.n_gfpts);
+
+        var gfpt: usize = 0;
+
+        // --- Interior faces: both sides, second one reversed ---
+        for (geo.int_faces.items) |ff| {
+            const ic_l = geo.f2c.get(ff, 0);
+            const ic_r = geo.f2c.get(ff, 1);
+            const lf_l = geo.localFaceOf(ic_l, ff).?;
+            const lf_r = geo.localFaceOf(ic_r, ff).?;
+
+            const fpt0_l = lf_l * n_fpts_per_face;
+            const fpt0_r = lf_r * n_fpts_per_face;
+
+            for (0..n_fpts_per_face) |j| {
+                const jr = n_fpts_per_face - 1 - j;
+                geo.fpt2gfpt.at(fpt0_l + j, ic_l).* = gfpt;
+                geo.fpt2gfpt_slot.at(fpt0_l + j, ic_l).* = 0;
+                geo.fpt2gfpt.at(fpt0_r + jr, ic_r).* = gfpt;
+                geo.fpt2gfpt_slot.at(fpt0_r + jr, ic_r).* = 1;
+
+                geo.gfpt2face.items[gfpt] = ff;
+                gfpt += 1;
+            }
+        }
+
+        // --- Boundary faces: left side only; the right state comes from the BC ---
+        for (geo.bnd_faces.items, 0..) |ff, i| {
+            const ic = geo.f2c.get(ff, 0);
+            const lf = geo.localFaceOf(ic, ff).?;
+            const fpt0 = lf * n_fpts_per_face;
+
+            for (0..n_fpts_per_face) |j| {
+                geo.fpt2gfpt.at(fpt0 + j, ic).* = gfpt;
+                geo.fpt2gfpt_slot.at(fpt0 + j, ic).* = 0;
+
+                geo.gfpt2bnd.items[gfpt - geo.n_gfpts_int] = geo.bc_id.items[i];
+                geo.gfpt2face.items[gfpt] = ff;
+                gfpt += 1;
+            }
+        }
+
+        std.debug.assert(gfpt == geo.n_gfpts);
+
+        report(
+            "Geo: {d} global flux points ({d} interior, {d} boundary)\n",
+            .{ geo.n_gfpts, geo.n_gfpts_int, geo.n_gfpts_bnd },
+        );
+    }
+
+    /// Which of cell `ic`'s faces is global face `ff`.
+    pub fn localFaceOf(geo: *const Geo, ic: usize, ff: usize) ?usize {
+        for (0..geo.c2nf.items[ic]) |j| {
+            if (geo.c2f.get(ic, j) == ff) return j;
+        }
+        return null;
     }
 
     /// 2D: the faces are the cell edges.

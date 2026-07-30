@@ -10,8 +10,10 @@ pub const Array4z = Array4(usize);
 pub fn Array4(T: type) type {
     return struct {
         const Self = @This();
-        dims: [4]usize,
-        data: []T,
+        dims: [4]usize = .{ 0, 0, 0, 0 },
+        data: []T = &.{},
+
+        pub const empty: Self = .{};
 
         /// Initialize a new Array4(T) with the given size.
         /// Initializes the full array to 0.

@@ -410,7 +410,7 @@ pub const Solver = struct {
 
         s.u_spts.deinit(arr);
         s.u_fpts.deinit(arr);
-        s.u_ini.deinit(gpa);
+        s.u_ini.deinit(arr);
         s.du_spts.deinit(gpa);
         s.du_fpts.deinit(gpa);
         s.f_spts.deinit(arr);
@@ -421,7 +421,7 @@ pub const Solver = struct {
         s.nodes.deinit(gpa);
         s.jaco_spts.deinit(gpa);
         s.inv_jaco_spts.deinit(arr);
-        s.jaco_det_spts.deinit(gpa);
+        s.jaco_det_spts.deinit(arr);
         s.inv_jaco_fpts.deinit(gpa);
         s.norm_fpts.deinit(gpa);
         s.d_a_fpts.deinit(gpa);
@@ -475,7 +475,7 @@ pub const Solver = struct {
         // u_ini is only needed when a later stage has to restart from the
         // beginning of the step.
         if (s.rk.n_stages > 1) {
-            s.u_ini = try Array3(f64).init(gpa, ele.n_spts, nv, ne);
+            s.u_ini = try Array3(f64).init(dev, ele.n_spts, nv, ne);
         }
 
         if (s.config.equation.viscous) {
@@ -487,7 +487,7 @@ pub const Solver = struct {
         s.nodes = try Array3(f64).init(gpa, ele.n_nodes, nd, ne);
         s.jaco_spts = try Array4(f64).init(gpa, nd, ele.n_spts, nd, ne);
         s.inv_jaco_spts = try Array4(f64).init(dev, nd, ele.n_spts, nd, ne);
-        s.jaco_det_spts = try Matrix(f64).init(gpa, ele.n_spts, ne, null);
+        s.jaco_det_spts = try Matrix(f64).init(dev, ele.n_spts, ne, null);
         s.inv_jaco_fpts = try Array4(f64).init(gpa, nd, ele.n_fpts, nd, ne);
         s.norm_fpts = try Array3(f64).init(gpa, ele.n_fpts, nd, ne);
         s.d_a_fpts = try Matrix(f64).init(gpa, ele.n_fpts, ne, null);
@@ -1133,10 +1133,19 @@ pub const Solver = struct {
     pub fn computeResidual(s: *Solver, stage: usize) Error!void {
         // With the face path on the device too, the whole residual is one
         // uninterrupted run of GPU work: one submit and one fence wait for the
-        // lot, instead of one per dispatch. `gpuResidual` is that arrangement;
-        // this is the mixed one, where each ported step still stands alone
-        // because a CPU step follows it.
-        if (s.canBatchResidual()) return s.gpuResidual(stage);
+        // lot, instead of one per dispatch. Below is the mixed arrangement,
+        // where each ported step still stands alone because a CPU step follows.
+        if (s.canBatchResidual()) {
+            const dev = s.gpu_state.?.dev;
+            // `update` batches the residual together with the stage update that
+            // follows it, so only open one here if it has not already.
+            if (dev.isBatching()) return s.gpuResidual(stage);
+
+            try dev.beginBatch();
+            errdefer dev.abortBatch();
+            try s.gpuResidual(stage);
+            return dev.submitBatch();
+        }
 
         try s.extrapolateU();
         try s.scatterUToFaces();
@@ -1183,11 +1192,10 @@ pub const Solver = struct {
     /// storage barrier between consecutive dispatches so each sees the last
     /// one's writes.
     ///
-    /// Seven dispatches, one submission, one fence wait.
+    /// The residual as eight dispatches recorded into whatever batch is open.
+    /// Opening and submitting it is the caller's, so a stage update can ride
+    /// along in the same submission.
     fn gpuResidual(s: *Solver, stage: usize) Error!void {
-        const dev = s.gpu_state.?.dev;
-
-        try dev.beginBatch();
         try s.extrapolateU();
         try s.scatterUToFaces();
         try s.applyFaceBcs();
@@ -1196,7 +1204,6 @@ pub const Solver = struct {
         try s.computeCommonF();
         try s.gatherCommonFFromFaces();
         try s.computeDivFFpts(stage);
-        try dev.submitBatch();
     }
 
     /// Physical solution gradient at the solution points -> flux points.
@@ -1438,26 +1445,55 @@ pub const Solver = struct {
     /// Advance one full time step with the configured RK scheme.
     pub fn update(s: *Solver) Error!void {
         const prev_time = s.flow_time;
+        const batched = s.canBatchResidual();
 
-        if (s.rk.n_stages > 1) @memcpy(s.u_ini.data, s.u_spts.data);
+        if (s.rk.n_stages > 1) try s.saveInitialU();
 
         // Intermediate stages: each advances from u_ini by alpha * dt
         const n_steps = if (s.rk.combines_stages) s.rk.n_stages - 1 else s.rk.n_stages;
         for (0..n_steps) |stage| {
             s.flow_time = prev_time + s.rk.c[stage] * s.dt;
+            // The stage's update depends on the residual it just recorded, and a
+            // barrier between dispatches is what makes that safe -- so the whole
+            // stage is one submission rather than two.
+            if (batched) try s.gpu_state.?.dev.beginBatch();
+            errdefer if (batched) s.gpu_state.?.dev.abortBatch();
             try s.computeResidual(stage);
-            s.rkStage(stage);
+            try s.rkStage(stage);
+            if (batched) try s.gpu_state.?.dev.submitBatch();
         }
 
         if (s.rk.combines_stages) {
             const last = s.rk.n_stages - 1;
             s.flow_time = prev_time + s.rk.c[last] * s.dt;
+            if (batched) try s.gpu_state.?.dev.beginBatch();
+            errdefer if (batched) s.gpu_state.?.dev.abortBatch();
             try s.computeResidual(last);
-            s.rkCombine();
+            try s.rkCombine();
+            if (batched) try s.gpu_state.?.dev.submitBatch();
         }
 
         s.flow_time = prev_time + s.dt;
         s.current_iter += 1;
+    }
+
+    /// Keep the solution at the start of the step, for the RK combination.
+    fn saveInitialU(s: *Solver) Error!void {
+        const ele = &s.quad.ele;
+        if (s.gpu_state) |g| {
+            // No terms, so the kernel's sum is empty and this is a copy -- done
+            // on the device so nothing has to travel to the host and back.
+            return g.dev.rkUpdate(.{
+                .n_spts = @intCast(ele.n_spts),
+                .n_vars = @intCast(s.n_vars),
+                .n_eles = @intCast(s.n_eles),
+                .n_terms = 0,
+                .first_stage = 0,
+                .dt = s.dt,
+                .coeff = @splat(0.0),
+            }, try g.bufferFor(s.u_spts.data), try g.bufferFor(s.divf_spts.data), try g.bufferFor(s.jaco_det_spts.data), try g.bufferFor(s.u_ini.data));
+        }
+        @memcpy(s.u_ini.data, s.u_spts.data);
     }
 
     /// Intermediate RK stage: `u = u_ini - alpha dt / |J| divF`.
@@ -1465,10 +1501,24 @@ pub const Solver = struct {
     /// The Jacobian determinant appears because `divF_spts` is a
     /// reference-space divergence; dividing by `|J|` returns it to physical
     /// space.
-    pub fn rkStage(s: *Solver, stage: usize) void {
+    pub fn rkStage(s: *Solver, stage: usize) Error!void {
         const ele = &s.quad.ele;
         const src = if (s.rk.n_stages > 1) &s.u_ini else &s.u_spts;
         const a = s.rk.alpha[stage];
+
+        if (s.gpu_state) |g| {
+            var coeff: [gpu.rk_update.max_stages]f64 = @splat(0.0);
+            coeff[0] = a;
+            return g.dev.rkUpdate(.{
+                .n_spts = @intCast(ele.n_spts),
+                .n_vars = @intCast(s.n_vars),
+                .n_eles = @intCast(s.n_eles),
+                .n_terms = 1,
+                .first_stage = @intCast(stage),
+                .dt = s.dt,
+                .coeff = coeff,
+            }, try g.bufferFor(src.data), try g.bufferFor(s.divf_spts.data), try g.bufferFor(s.jaco_det_spts.data), try g.bufferFor(s.u_spts.data));
+        }
 
         for (0..ele.n_spts) |spt| {
             for (0..s.n_vars) |n| {
@@ -1482,8 +1532,23 @@ pub const Solver = struct {
     }
 
     /// Final RK combination: `u = u_ini - sum_stage beta dt / |J| divF_stage`.
-    pub fn rkCombine(s: *Solver) void {
+    pub fn rkCombine(s: *Solver) Error!void {
         const ele = &s.quad.ele;
+
+        if (s.gpu_state) |g| {
+            var coeff: [gpu.rk_update.max_stages]f64 = @splat(0.0);
+            for (s.rk.beta, 0..) |b, i| coeff[i] = b;
+            const src = if (s.rk.n_stages > 1) &s.u_ini else &s.u_spts;
+            return g.dev.rkUpdate(.{
+                .n_spts = @intCast(ele.n_spts),
+                .n_vars = @intCast(s.n_vars),
+                .n_eles = @intCast(s.n_eles),
+                .n_terms = @intCast(s.rk.n_stages),
+                .first_stage = 0,
+                .dt = s.dt,
+                .coeff = coeff,
+            }, try g.bufferFor(src.data), try g.bufferFor(s.divf_spts.data), try g.bufferFor(s.jaco_det_spts.data), try g.bufferFor(s.u_spts.data));
+        }
 
         if (s.rk.n_stages > 1) @memcpy(s.u_spts.data, s.u_ini.data);
 

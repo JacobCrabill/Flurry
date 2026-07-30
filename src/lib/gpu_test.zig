@@ -308,6 +308,8 @@ test "only the arrays a dispatch binds are device-resident" {
     try testing.expect(s.deviceBufferFor(s.faces.norm.data) != null);
     try testing.expect(s.deviceBufferFor(s.faces.d_a.data) != null);
     try testing.expect(s.deviceBufferFor(s.faces.wave_sp) != null);
+    try testing.expect(s.deviceBufferFor(s.u_ini.data) != null); // the RK update
+    try testing.expect(s.deviceBufferFor(s.jaco_det_spts.data) != null);
 
     try testing.expect(s.deviceBufferFor(s.nodes.data) == null);
     try testing.expect(s.deviceBufferFor(s.coord_spts.data) == null);
@@ -449,13 +451,40 @@ test "a batch runs out of dgemm instances rather than reusing one" {
 
     const s = &run.solver;
     try d.beginBatch();
-    // Three fit; the residual uses exactly this many
+    defer d.abortBatch();
+
+    // A residual dispatches dgemm exactly three times, and the pool is sized for
+    // that; the fourth has nothing left to hand out.
     try s.extrapolateU();
     try s.computeDivFSpts(0);
     try s.computeDivFFpts(0);
-    try s.computeDivFSpts(0); // the fourth is the last of the pool
-    try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFFpts(0));
-    try d.submitBatch();
+    try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFSpts(0));
+}
+
+test "a failed batch does not poison the device" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // Recording can fail part-way. If that left the batch open, every later
+    // `beginBatch` would trip the assert and every dispatch would draw from an
+    // exhausted pool -- so an error has to leave the device usable.
+    const config = testConfig(2, 4);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    const s = &run.solver;
+    try d.beginBatch();
+    try s.extrapolateU();
+    try s.computeDivFSpts(0);
+    try s.computeDivFFpts(0);
+    try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFSpts(0));
+    d.abortBatch();
+
+    try testing.expect(!d.isBatching());
+    // ...and a whole step still runs
+    try s.update();
 }
 
 test "the kernels' f64 pow matches std.math" {

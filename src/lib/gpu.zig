@@ -11,16 +11,17 @@
 //! all, and this will refuse to run on those -- which is the right trade for a
 //! solver whose accuracy claims are the point.
 //!
-//! State of the port: the whole residual, for the inviscid Euler equations in
-//! 2D -- eight dispatches recorded into one command buffer and submitted once.
-//! Their operands are device-resident, so a dispatch binds them where they lie
-//! rather than copying them in and out; `gemmHost` still exists for callers
-//! holding ordinary host memory.
+//! State of the port: a whole time step, for the inviscid Euler equations in 2D
+//! -- the eight residual dispatches plus the Runge-Kutta update, recorded into
+//! one command buffer and submitted once per stage. Operands are
+//! device-resident, so a dispatch binds them where they lie rather than copying
+//! them in and out; `gemmHost` still exists for callers holding ordinary host
+//! memory.
 //!
-//! What is left on the CPU: the Runge-Kutta update, the residual norms, and
-//! anything the kernels do not cover -- advection-diffusion, the viscous terms,
-//! and the viscous wall conditions -- each of which falls back rather than
-//! failing.
+//! What is left on the CPU: the residual norms and the error measure, both of
+//! which run at report intervals rather than every step, and anything the
+//! kernels do not cover -- advection-diffusion, the viscous terms, and the
+//! viscous wall conditions -- each of which falls back rather than failing.
 
 const std = @import("std");
 const spock = @import("spock");
@@ -35,11 +36,13 @@ pub const face_scatter = @import("kernels/face_scatter.zig");
 pub const face_gather = @import("kernels/face_gather.zig");
 pub const face_common_f = @import("kernels/face_common_f.zig");
 pub const face_bcs = @import("kernels/face_bcs.zig");
+pub const rk_update = @import("kernels/rk_update.zig");
 
 const face_scatter_spv = @embedFile("face_scatter.spv");
 const face_gather_spv = @embedFile("face_gather.spv");
 const face_common_f_spv = @embedFile("face_common_f.spv");
 const face_bcs_spv = @embedFile("face_bcs.spv");
+const rk_update_spv = @embedFile("rk_update.spv");
 
 /// What the index arrays use for "no global flux point here". The host's
 /// `geo.none` is `maxInt(usize)`; it narrows to this on upload.
@@ -61,14 +64,46 @@ pub const Error = error{
 };
 
 /// The kernels a `Device` owns. A batch may record each at most once.
-const KernelId = enum { flux_euler, face_scatter, face_gather, face_common_f, face_bcs };
+/// The kernels a `Device` owns.
+const Kind = enum {
+    dgemm,
+    flux_euler,
+    face_scatter,
+    face_gather,
+    face_common_f,
+    face_bcs,
+    rk_update,
+};
 
-/// How many separate dgemm dispatches one batch may hold.
+/// How many times one batch may dispatch each kernel.
 ///
-/// A kernel owns a single descriptor set, so each recording needs its own
-/// instance. A residual has three: `extrapolateU` and the two divergence
-/// products.
-const max_gemms_per_batch = 4;
+/// A kernel owns a single descriptor set, so a second recording would leave both
+/// dispatches using the second set of arguments -- no error, a plausible wrong
+/// answer. Each repeat therefore needs its own instance, and these are the
+/// counts a whole step actually uses: three products (`extrapolateU` and the two
+/// divergences) and two RK updates (saving the solution, then advancing it).
+const pool_sizes = std.enums.EnumArray(Kind, u8).init(.{
+    .dgemm = 3,
+    .flux_euler = 1,
+    .face_scatter = 1,
+    .face_gather = 1,
+    .face_common_f = 1,
+    .face_bcs = 1,
+    .rk_update = 2,
+});
+
+/// Instances of one kernel, handed out one per recording in a batch.
+const Pool = struct {
+    instances: []spock.Kernel,
+    used: usize = 0,
+
+    fn next(p: *Pool, batching: bool) Error!*spock.Kernel {
+        if (!batching) return &p.instances[0];
+        if (p.used >= p.instances.len) return error.KernelAlreadyRecorded;
+        defer p.used += 1;
+        return &p.instances[p.used];
+    }
+};
 
 /// A device buffer handle, as a dispatch binds it.
 pub const Buffer = spock.vk.Buffer;
@@ -104,21 +139,17 @@ pub const Options = struct {
 pub const Device = struct {
     gpa: std.mem.Allocator,
     ctx: *spock.Context,
-    /// One instance per dgemm recording in a batch; see `max_gemms_per_batch`.
-    dgemm_kernels: [max_gemms_per_batch]spock.Kernel,
-    /// How many of them the open batch has used.
-    gemms_used: usize = 0,
-    flux_euler_kernel: spock.Kernel,
-    face_scatter_kernel: spock.Kernel,
-    face_gather_kernel: spock.Kernel,
-    face_common_f_kernel: spock.Kernel,
-    face_bcs_kernel: spock.Kernel,
+
+    /// Every kernel, with its instances; see `pool_sizes`.
+    pools: std.enums.EnumArray(Kind, Pool),
+    /// One slab behind every pool's `instances`.
+    all_kernels: []spock.Kernel,
 
     /// Reused across steps; `beginBatch` resets it rather than allocating a new
     /// command buffer every residual.
     batch: spock.Pipeline,
-    /// Null unless a batch is open. Holds which kernels it has already recorded.
-    recorded: ?std.EnumSet(KernelId) = null,
+    /// Whether a batch is open, so dispatches are recorded rather than run.
+    batching: bool = false,
 
     /// Staging for `gemmHost`, grown on demand and reused across calls.
     stage_a: Scratch = .{},
@@ -139,31 +170,38 @@ pub const Device = struct {
         }) catch |err| return translate(err, "creating the compute context");
         errdefer ctx.deinit();
 
-        // spock's dgemm exports its entry point under its own name, not "main"
-        var gemms: [max_gemms_per_batch]spock.Kernel = undefined;
+        // Every kernel, with its instances, out of one slab.
+        const specs = std.enums.EnumArray(Kind, Spec).init(.{
+            // spock's dgemm names its entry point after itself, not "main"
+            .dgemm = .{ dgemm_spv, "dgemm", 3, @sizeOf(dgemm.PushConstants) },
+            .flux_euler = .{ flux_euler_spv, "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
+            .face_scatter = .{ face_scatter_spv, "face_scatter", 4, @sizeOf(face_scatter.PushConstants) },
+            .face_gather = .{ face_gather_spv, "face_gather", 4, @sizeOf(face_gather.PushConstants) },
+            .face_common_f = .{ face_common_f_spv, "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
+            .face_bcs = .{ face_bcs_spv, "face_bcs", 3, @sizeOf(face_bcs.PushConstants) },
+            .rk_update = .{ rk_update_spv, "rk_update", 4, @sizeOf(rk_update.PushConstants) },
+        });
+
+        var total: usize = 0;
+        for (pool_sizes.values) |n| total += n;
+
+        const slab = try gpa.alloc(spock.Kernel, total);
+        errdefer gpa.free(slab);
+
         var built: usize = 0;
-        errdefer for (gemms[0..built]) |*k| k.deinit();
-        while (built < gemms.len) : (built += 1) {
-            gemms[built] = try makeKernel(ctx, dgemm_spv, "dgemm", 3, @sizeOf(dgemm.PushConstants));
+        errdefer for (slab[0..built]) |*k| k.deinit();
+
+        var pools: std.enums.EnumArray(Kind, Pool) = undefined;
+        for (std.enums.values(Kind)) |kind| {
+            const spec = specs.get(kind);
+            const n = pool_sizes.get(kind);
+            const start = built;
+            for (0..n) |_| {
+                slab[built] = try makeKernel(ctx, spec[0], spec[1], spec[2], spec[3]);
+                built += 1;
+            }
+            pools.set(kind, .{ .instances = slab[start..built] });
         }
-
-        var flux_kernel = spock.Kernel.create(ctx, .{
-            .spirv = flux_euler_spv,
-            .entry = "flux_euler",
-            .buffers = 3,
-            .push_constant_size = @sizeOf(flux_euler.PushConstants),
-        }) catch |err| return translate(err, "building the flux_euler pipeline");
-
-        errdefer flux_kernel.deinit();
-
-        var scatter = try makeKernel(ctx, face_scatter_spv, "face_scatter", 4, @sizeOf(face_scatter.PushConstants));
-        errdefer scatter.deinit();
-        var gather = try makeKernel(ctx, face_gather_spv, "face_gather", 4, @sizeOf(face_gather.PushConstants));
-        errdefer gather.deinit();
-        var common_f = try makeKernel(ctx, face_common_f_spv, "face_common_f", 5, @sizeOf(face_common_f.PushConstants));
-        errdefer common_f.deinit();
-        var bcs = try makeKernel(ctx, face_bcs_spv, "face_bcs", 3, @sizeOf(face_bcs.PushConstants));
-        errdefer bcs.deinit();
 
         const batch = spock.Pipeline.create(ctx) catch |err| {
             return translate(err, "creating the dispatch batch");
@@ -172,12 +210,8 @@ pub const Device = struct {
         return .{
             .gpa = gpa,
             .ctx = ctx,
-            .dgemm_kernels = gemms,
-            .flux_euler_kernel = flux_kernel,
-            .face_scatter_kernel = scatter,
-            .face_gather_kernel = gather,
-            .face_common_f_kernel = common_f,
-            .face_bcs_kernel = bcs,
+            .pools = pools,
+            .all_kernels = slab,
             .batch = batch,
         };
     }
@@ -187,12 +221,8 @@ pub const Device = struct {
         d.stage_b.deinit();
         d.stage_c.deinit();
         d.batch.deinit();
-        d.face_bcs_kernel.deinit();
-        d.face_common_f_kernel.deinit();
-        d.face_gather_kernel.deinit();
-        d.face_scatter_kernel.deinit();
-        d.flux_euler_kernel.deinit();
-        for (&d.dgemm_kernels) |*k| k.deinit();
+        for (d.all_kernels) |*k| k.deinit();
+        d.gpa.free(d.all_kernels);
         d.ctx.deinit();
         d.gpa.destroy(d.ctx);
     }
@@ -214,48 +244,49 @@ pub const Device = struct {
     /// Only *consecutive* GPU work can go in one batch: anything the CPU has to
     /// touch in between ends it.
     pub fn beginBatch(d: *Device) Error!void {
-        std.debug.assert(d.recorded == null); // a batch is already open
+        std.debug.assert(!d.batching); // a batch is already open
         d.batch.reset() catch |err| return translate(err, "resetting the batch");
-        d.recorded = .empty;
-        d.gemms_used = 0;
+        for (&d.pools.values) |*p| p.used = 0;
+        d.batching = true;
+    }
+
+    /// Abandon the open batch without submitting it.
+    ///
+    /// For the error path: a dispatch that fails part-way through recording
+    /// would otherwise leave the batch open, and every later `beginBatch` would
+    /// trip over it. The command buffer is reset by the next `beginBatch`, so
+    /// there is nothing to undo here beyond the flag.
+    pub fn abortBatch(d: *Device) void {
+        d.batching = false;
+    }
+
+    /// Whether a batch is open, for a caller deciding whether to open its own.
+    pub fn isBatching(d: *const Device) bool {
+        return d.batching;
     }
 
     /// Submit everything recorded since `beginBatch` and wait for it.
     pub fn submitBatch(d: *Device) Error!void {
-        std.debug.assert(d.recorded != null); // no batch is open
-        d.recorded = null;
+        std.debug.assert(d.batching); // no batch is open
+        d.batching = false;
         d.batch.submit() catch |err| return translate(err, "submitting the batch");
         d.ctx.wait() catch |err| return translate(err, "waiting on the batch");
     }
 
     /// Record a dispatch into the open batch, or run it on its own if none is.
     ///
-    /// A kernel has one descriptor set, so recording the same instance twice
-    /// into one command buffer would leave both dispatches using the second set
-    /// of arguments -- no error, a plausible wrong answer. This catches it;
-    /// dgemm, which really is dispatched several times per residual, has an
-    /// instance per recording instead.
+    /// Takes a fresh instance of the kernel each time within a batch, and fails
+    /// with `KernelAlreadyRecorded` when the pool runs out -- reusing one would
+    /// leave both dispatches running with the second set of arguments.
     fn run(
         d: *Device,
-        id: KernelId,
-        kernel: *spock.Kernel,
+        kind: Kind,
         args: spock.Kernel.DispatchArgs,
         what: []const u8,
     ) Error!void {
-        if (d.recorded) |*seen| {
-            if (seen.contains(id)) return error.KernelAlreadyRecorded;
-            seen.insert(id);
-        }
-        return d.runOn(kernel, args, what);
-    }
+        const kernel = try d.pools.getPtr(kind).next(d.batching);
 
-    fn runOn(
-        d: *Device,
-        kernel: *spock.Kernel,
-        args: spock.Kernel.DispatchArgs,
-        what: []const u8,
-    ) Error!void {
-        if (d.recorded != null) {
+        if (d.batching) {
             d.batch.addKernel(kernel, args) catch |err| return translate(err, what);
             return;
         }
@@ -296,20 +327,11 @@ pub const Device = struct {
         const threads: u32 = @intCast(m * n);
         const groups = std.math.divCeil(u32, threads, dgemm.WgSize.x) catch unreachable;
 
-        try d.runOn(try d.nextGemm(), .{
+        try d.run(.dgemm, .{
             .buffers = &.{ a, b, c },
             .push_constant = std.mem.asBytes(&pc),
             .groups = .{ groups, 1, 1 },
         }, "dispatching dgemm");
-    }
-
-    /// The next unused dgemm instance in the open batch, or the first one when
-    /// there is no batch.
-    fn nextGemm(d: *Device) Error!*spock.Kernel {
-        if (d.recorded == null) return &d.dgemm_kernels[0];
-        if (d.gemms_used >= d.dgemm_kernels.len) return error.KernelAlreadyRecorded;
-        defer d.gemms_used += 1;
-        return &d.dgemm_kernels[d.gemms_used];
     }
 
     /// Inviscid Euler flux at the solution points, in reference space.
@@ -337,7 +359,7 @@ pub const Device = struct {
         const threads: u32 = @intCast(n_spts * n_eles);
         const groups = std.math.divCeil(u32, threads, flux_euler.WgSize.x) catch unreachable;
 
-        try d.run(.flux_euler, &d.flux_euler_kernel, .{
+        try d.run(.flux_euler, .{
             .buffers = &.{ u_spts, inv_jaco, f_spts },
             .push_constant = std.mem.asBytes(&pc),
             .groups = .{ groups, 1, 1 },
@@ -365,7 +387,7 @@ pub const Device = struct {
             .n_vars = @intCast(n_vars),
             .n_gfpts = @intCast(n_gfpts),
         };
-        try d.run(.face_scatter, &d.face_scatter_kernel, .{
+        try d.run(.face_scatter, .{
             .buffers = &.{ u_fpts, fpt2gfpt, fpt2slot, faces_u },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(n_fpts * n_eles, face_scatter.WgSize.x), 1, 1 },
@@ -391,7 +413,7 @@ pub const Device = struct {
             .n_vars = @intCast(n_vars),
             .n_gfpts = @intCast(n_gfpts),
         };
-        try d.run(.face_gather, &d.face_gather_kernel, .{
+        try d.run(.face_gather, .{
             .buffers = &.{ faces_f, fpt2gfpt, fpt2slot, f_comm },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(n_fpts * n_eles, face_gather.WgSize.x), 1, 1 },
@@ -418,7 +440,7 @@ pub const Device = struct {
             .gamma = gamma,
             .rus_k = rus_k,
         };
-        try d.run(.face_common_f, &d.face_common_f_kernel, .{
+        try d.run(.face_common_f, .{
             .buffers = &.{ u, norm, d_a, f_comm, wave_sp },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(n_gfpts, face_common_f.WgSize.x), 1, 1 },
@@ -434,11 +456,32 @@ pub const Device = struct {
         bc_code: Binding,
     ) Error!void {
         if (p.n_gfpts_bnd == 0) return;
-        try d.run(.face_bcs, &d.face_bcs_kernel, .{
+        try d.run(.face_bcs, .{
             .buffers = &.{ u, norm, bc_code },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(p.n_gfpts_bnd, face_bcs.WgSize.x), 1, 1 },
         }, "dispatching face_bcs");
+    }
+
+    /// `dst = src - dt/|J| * sum_t coeff[t] * divf[first_stage + t]`.
+    ///
+    /// With no terms it is a copy, which is how the time loop saves the solution
+    /// at the start of a step.
+    pub fn rkUpdate(
+        d: *Device,
+        p: rk_update.PushConstants,
+        src: Binding,
+        divf: Binding,
+        jaco_det: Binding,
+        dst: Binding,
+    ) Error!void {
+        const total = p.n_spts * p.n_vars * p.n_eles;
+        if (total == 0) return;
+        try d.run(.rk_update, .{
+            .buffers = &.{ src, divf, jaco_det, dst },
+            .push_constant = std.mem.asBytes(&p),
+            .groups = .{ groupsFor(total, rk_update.WgSize.x), 1, 1 },
+        }, "dispatching rk_update");
     }
 
     /// The same product over ordinary host slices, staged in and out around the
@@ -496,6 +539,9 @@ fn makeKernel(
 fn groupsFor(threads: usize, wg: u32) u32 {
     return std.math.divCeil(u32, @intCast(threads), wg) catch unreachable;
 }
+
+/// What one kernel is built from: module, entry point, buffer count, push size.
+const Spec = struct { []const u8, [*:0]const u8, u32, u32 };
 
 /// A device buffer that grows to fit whatever it is asked to hold.
 const Scratch = struct {

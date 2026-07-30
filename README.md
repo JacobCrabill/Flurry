@@ -59,12 +59,11 @@ which remains the reference the GPU path is checked against.
 ./zig-out/bin/flurry --gpu samples/vortex.cfg.ziggy
 ```
 
-The whole residual runs on the device for 2D inviscid Euler: eight dispatches
-recorded into one command buffer and submitted once. Operands are
-device-resident, so a dispatch binds them where they lie and nothing is copied.
-Because that memory is host-mapped, everything still on the CPU — the
-Runge-Kutta update, the residual norms — reads and writes it as an ordinary
-slice.
+A whole time step runs on the device for 2D inviscid Euler: the eight residual
+dispatches plus the Runge-Kutta update, recorded into one command buffer and
+submitted once per stage. Between reports the CPU touches none of the solution
+arrays. Operands are device-resident, so a dispatch binds them where they lie
+and nothing is copied.
 
 Anything the kernels do not cover falls back rather than failing:
 advection-diffusion, the viscous terms, and the viscous wall conditions.
@@ -73,16 +72,20 @@ Performance, 50 steps of the vortex sample:
 
 | mesh | CPU | GPU |
 |---|---|---|
-| 32×32 | 0.70 s | 0.73 s |
-| 64×64 | 3.24 s | 4.33 s |
-| 128×128 | 13.18 s | 17.15 s |
+| 32×32 | 0.69 s | 0.67 s |
+| 64×64 | 3.25 s | 4.06 s |
+| 128×128 | 13.22 s | 16.10 s |
 
-So it is at parity when small and ~1.3× *slower* when large, by a constant
-factor rather than a widening one. Spock's buffers are host-visible by design —
-its own docs say so — which means the GPU streams every array over PCIe instead
-of reading VRAM. Going faster from here means device-local memory with staging,
-and that only pays once nothing on the CPU needs to read these arrays: the
-Runge-Kutta update is the remaining obstacle.
+Ahead when small, ~1.2× behind when large. That is not submission overhead —
+200 submissions over the 128² run, at ~0.4 ms each, is under a tenth of a
+second. It works out to about 80 ms per residual for ~60 MFLOP over ~80 MB of
+traffic: roughly 1 GB/s and 0.75 GFLOP/s, both an order of magnitude below what
+the hardware will do. Spock's buffers are host-visible by design — its own docs
+say so — so every array the kernels touch lives in system memory rather than
+VRAM.
+
+Device-local memory with staging is the next structural step, and it is only
+viable now that nothing on the CPU reads these arrays between reports.
 
 Getting there needed a fix in Spock. It asked for `host_visible | host_coherent`
 and took the first matching memory type, which on the test hardware is an

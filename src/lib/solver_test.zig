@@ -587,11 +587,11 @@ test "RK stages integrate du/dt = -c exactly" {
         const n_steps = if (s.rk.combines_stages) s.rk.n_stages - 1 else s.rk.n_stages;
         for (0..n_steps) |stage| {
             setConstantResidual(&s, stage, c);
-            s.rkStage(stage);
+            try s.rkStage(stage);
         }
         if (s.rk.combines_stages) {
             setConstantResidual(&s, s.rk.n_stages - 1, c);
-            s.rkCombine();
+            try s.rkCombine();
         }
         s.flow_time = prev + s.dt;
 

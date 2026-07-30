@@ -367,8 +367,8 @@ pub const Solver = struct {
         const nd = s.n_dims;
 
         // An array moves into device memory when the operator that binds it
-        // does, and not before: on a discrete GPU this memory is across PCIe,
-        // so anything still read on the CPU is better left where it is.
+        // does, and not before -- there is nothing to gain from a Vulkan
+        // allocation for something no dispatch touches.
         const dev = s.arrayAllocator();
 
         s.u_spts = try Array3(f64).init(dev, ele.n_spts, nv, ne);

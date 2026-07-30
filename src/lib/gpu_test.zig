@@ -275,9 +275,8 @@ test "only the arrays a dispatch binds are device-resident" {
     const d = try device();
 
     // This is the split the port advances one operator at a time. `u_spts` and
-    // `u_fpts` are bound by `extrapolateU`, so they live in device memory; the
-    // geometry is still read on the CPU every step, and on a discrete GPU that
-    // memory is across PCIe, so it stays where the CPU can get at it quickly.
+    // `u_fpts` are bound by `extrapolateU`, so they live in device memory;
+    // nothing dispatches over the geometry yet, so it does not.
     const config = testConfig(3, 4);
 
     var run: driver.Run = undefined;

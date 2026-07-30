@@ -64,12 +64,16 @@ binds them where they lie — nothing is copied. Because that memory is
 host-mapped, every un-ported operation still reads and writes it as an ordinary
 slice, which is what lets the port advance one operator at a time.
 
-It is still *slower* than the CPU, and for a reason worth knowing: Spock asks
-for `host_visible | host_coherent` and takes the first matching memory type,
-which on the test hardware is an uncached (write-combined) one. CPU reads from it
-measured **25× slower** than from an ordinary allocation, even though a
-`host_cached` type was available one index later. So an array is only moved into
-device memory when the operator that binds it moves too.
+It is still slower than the CPU — about 20% on 100 steps of the vortex sample —
+because each dispatch is its own submit and fence wait, four hundred round trips
+over the run. Batching a whole residual into one submission is the next step.
+
+Getting there needed a fix in Spock. It asked for `host_visible | host_coherent`
+and took the first matching memory type, which on the test hardware is an
+uncached (write-combined) one; CPU reads from it measured **25× slower** than
+from an ordinary allocation, and making one operator's operands resident cost the
+whole step **8×**. Spock now prefers a cached type where the device has one, which
+brings host reads back to parity.
 
 Everything is f64. A device without `shaderFloat64` will not run this.
 

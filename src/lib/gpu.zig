@@ -233,13 +233,13 @@ fn translate(err: anyerror, doing: []const u8) Error {
 /// one. That makes this the wrong tool for many small allocations and the right
 /// one for the handful of large solver arrays it holds.
 ///
-/// Beware what this costs the CPU. spock asks for `host_visible | host_coherent`
-/// and takes the first memory type that matches, which on this hardware is an
-/// *uncached* (write-combined) one -- CPU reads from it measured 25x slower than
-/// from an ordinary allocation, even though a `host_cached` type was available
-/// one index later. Until spock prefers the cached type, every un-ported
-/// operation that reads a resident array pays that, so an array should move
-/// across only when the operator that binds it does.
+/// Watch the memory type this lands in. spock originally took the first
+/// `host_visible | host_coherent` type, which on this hardware is *uncached*
+/// (write-combined): CPU reads from it measured 25x slower than from an ordinary
+/// allocation, and making one operator's operands resident cost the whole step
+/// 8x. spock now prefers a cached type, which brings host reads back to parity
+/// (36ms against 34ms on the same measurement) -- but a device offering no
+/// cached host-visible heap would still pay it.
 pub const Heap = struct {
     dev: *Device,
     /// For the bookkeeping list only; the blocks themselves are device memory

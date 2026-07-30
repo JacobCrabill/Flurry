@@ -88,6 +88,49 @@ test "parse cylinder.cfg.ziggy from samples/" {
     try testing.expect(!pc.value.signals.catch_signals);
 }
 
+test "a section whose fields all have defaults can be left out" {
+    // Only `core`, `equation`, `time` and `output` have nothing sensible to
+    // fall back on. Everything else should be omittable, so a small case file
+    // stays small instead of spelling out values it does not care about.
+    const src: [:0]const u8 =
+        \\.core = .{ .n_dims = 2, .mesh_file = "m.msh", .order = 3 },
+        \\.equation = .{ .equation = .euler_ns },
+        \\.time = .{ .dt_scheme = .rk44, .n_steps = 10, .dt = 1e-3 },
+        \\.output = .{ .output_prefix = "o", .write_freq = 0, .report_freq = 0 },
+        \\
+    ;
+    var pc = try parseTest(std.testing.io, src);
+    defer pc.deinit();
+
+    try testing.expectEqual(@as(f64, 1.4), pc.value.gas_properties.gamma);
+    try testing.expectEqual(config.FluxConvType.rusanov, pc.value.flux.fconv_type);
+    try testing.expectEqual(@as(u32, 0), pc.value.boundary_conditions.mesh_bounds.fields.count());
+    try testing.expect(pc.value.create_mesh == null);
+    try testing.expect(pc.value.restart == null);
+}
+
+test "an empty struct literal takes the section's defaults" {
+    // `.{}` says "this section, all defaults" explicitly. Upstream ziggy
+    // rejected it outright; see the VENDOR FIX in Deserializer.zig.
+    const src: [:0]const u8 =
+        \\.core = .{ .n_dims = 2, .mesh_file = "m.msh", .order = 3 },
+        \\.equation = .{ .equation = .euler_ns },
+        \\.time = .{ .dt_scheme = .rk44, .n_steps = 10, .dt = 1e-3 },
+        \\.output = .{ .output_prefix = "o", .write_freq = 0, .report_freq = 0 },
+        \\.gas_properties = .{},
+        \\.freestream = .{ .mach_fs = 0.5 },
+        \\
+    ;
+    var pc = try parseTest(std.testing.io, src);
+    defer pc.deinit();
+
+    try testing.expectEqual(@as(f64, 1.4), pc.value.gas_properties.gamma);
+    try testing.expectEqual(@as(f64, 286.9), pc.value.gas_properties.R);
+    // ...and a partly-filled section still keeps the defaults it did not name
+    try testing.expectEqual(@as(f64, 0.5), pc.value.freestream.mach_fs);
+    try testing.expectEqual(@as(f64, 1.4), pc.value.freestream.rho_fs);
+}
+
 // ---------------------------------------------------------------------------
 // 2. Post-parse initialization derivations
 // ---------------------------------------------------------------------------

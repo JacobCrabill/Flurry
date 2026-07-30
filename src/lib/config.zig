@@ -173,19 +173,24 @@ pub const SignalConfig = struct {
 };
 
 /// Top-level parsed config.
+///
+/// A section whose every field has a default gets one here too, so a case file
+/// can leave it out entirely rather than having to write it out to say nothing.
+/// `core`, `equation`, `time` and `output` have no sensible defaults and stay
+/// required.
 pub const Config = struct {
     core: CoreConfig,
     equation: EquationConfig,
     time: TimeConfig,
     restart: ?RestartConfig = null,
     output: OutputConfig,
-    test_case: TestCaseConfig,
-    flux: FluxConfig,
-    gas_properties: GasPropertiesConfig,
-    freestream: FreestreamConfig,
-    wall_conditions: WallConditionsConfig,
-    boundary_conditions: BoundaryConditionsConfig,
-    signals: SignalConfig,
+    test_case: TestCaseConfig = .{},
+    flux: FluxConfig = .{},
+    gas_properties: GasPropertiesConfig = .{},
+    freestream: FreestreamConfig = .{},
+    wall_conditions: WallConditionsConfig = .{},
+    boundary_conditions: BoundaryConditionsConfig = .{},
+    signals: SignalConfig = .{},
     create_mesh: ?CreateMeshConfig = null,
 };
 

@@ -67,3 +67,10 @@ comment. Grep for those before merging an upstream update.
 4. **Tests for fixed-size arrays, vectors and sentinel arrays.** Upstream's
    `"array basics"` / `"array trailing comma"` tests deserialize into *slices*,
    so the fixed-length path had no coverage at all.
+
+5. **`.{}` — a struct with every field defaulted — was rejected.** The `.dotlb`
+   prong demanded an identifier immediately after `.{`, so an empty literal
+   never reached the loop that finalizes a struct. That loop already fills in
+   defaults and reports only the fields that genuinely have none, so the fix is
+   to let `}` through to it. Tests added for both the accepting and the still-
+   rejecting case.

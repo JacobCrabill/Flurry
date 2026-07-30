@@ -545,13 +545,21 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                 .lb => return try d.deserializeDict(T, &result, info, &seen, first),
                 .dotlb => blk: {
                     const tok = d.next();
-                    if (tok.tag != .identifier) return d.unexpected(tok);
+                    // VENDOR FIX: upstream demanded an identifier here, which
+                    // rejects `.{}` -- a struct written with every field left at
+                    // its default. The loop below already finalizes on `}` and
+                    // fills in defaults (reporting only fields that genuinely
+                    // have none), so `}` just has to be allowed through to it.
+                    switch (tok.tag) {
+                        .identifier, .rb => {},
+                        else => return d.unexpected(tok),
+                    }
                     break :blk tok;
                 },
                 else => return d.unexpectedValue(first),
             };
 
-            assert(field_token.tag == .identifier);
+            assert(field_token.tag == .identifier or field_token.tag == .rb);
             outer: while (true) { // this is safe because we're filling `seen`
                 switch (field_token.tag) {
                     .identifier => {},
@@ -1598,4 +1606,58 @@ test "simple deserialization + deserialize" {
 
     try std.testing.expectEqualStrings("bar", result.value.foo);
     try std.testing.expectEqual(true, result.value.bar);
+}
+
+// VENDOR ADDITION: `.{}` -- a struct written with every field left at its
+// default -- was rejected outright, because the `.dotlb` prong demanded an
+// identifier and never let `}` reach the loop that finalizes a struct.
+
+test "empty struct literal takes every default" {
+    const Case = struct {
+        foo: []const u8 = "bar",
+        bar: bool = true,
+        baz: u32 = 7,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta: Meta = undefined;
+
+    const result = try deserializeLeaky(Case, arena, ".{}", &meta, .{});
+    try std.testing.expectEqualStrings("bar", result.foo);
+    try std.testing.expectEqual(true, result.bar);
+    try std.testing.expectEqual(@as(u32, 7), result.baz);
+
+    // ...including as a nested field, which is where a config file wants it
+    const Outer = struct { name: []const u8, inner: Case };
+    const outer = try deserializeLeaky(Outer, arena,
+        \\.name = "x",
+        \\.inner = .{},
+    , &meta, .{});
+    try std.testing.expectEqualStrings("x", outer.name);
+    try std.testing.expectEqual(@as(u32, 7), outer.inner.baz);
+}
+
+test "empty struct literal still reports fields that have no default" {
+    const Case = struct { foo: []const u8 = "bar", required: u32 };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta: Meta = undefined;
+
+    const opts: Options = .{};
+    try std.testing.expectError(
+        error.MissingField,
+        deserializeLeaky(Case, arena, ".{}\n", &meta, opts),
+    );
+
+    // The diagnostic points at the literal that left it out
+    try std.testing.expectFmt(
+        \\<stdin>:1:3 missing field 'required'
+        \\|   .{}
+        \\|     ^
+        \\
+    , "{f}", .{meta.reportErrorsFmt(arena, opts, null, ".{}\n", error.MissingField)});
 }

@@ -45,9 +45,8 @@ pub fn dLagrange(xi_grid: []const f64, xi: f64, mode: usize) f64 {
         for (0..npts) |i| {
             if (i != mode and i != j)
                 term *= (xi - xi_grid[i]);
-
-            val += term;
         }
+        val += term;
     }
     return val / den;
 }

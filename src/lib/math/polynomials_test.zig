@@ -213,6 +213,101 @@ fn legendreClosedForm(P: u32, x: f64) f64 {
     };
 }
 
+// ---------------------------------------------------------------------------
+// 2a. Lagrange
+// ---------------------------------------------------------------------------
+
+/// A few interpolation grids, including a non-uniform one so that a bug masked
+/// by symmetry still shows up.
+const lagrange_grids = [_][]const f64{
+    &.{ -1.0, 1.0 },
+    &.{ -1.0, 0.0, 1.0 },
+    &.{ -1.0, -0.4, 0.3, 1.0 },
+    &.{ -0.9, -0.5, 0.1, 0.55, 0.95 },
+};
+
+test "Lagrange is a cardinal basis" {
+    for (lagrange_grids) |grid| {
+        for (0..grid.len) |mode| {
+            // One at its own node, zero at the others
+            for (grid, 0..) |node, k| {
+                const want: f64 = if (k == mode) 1.0 else 0.0;
+                try expectApprox(p.Lagrange(grid, node, mode), want, 1e-13);
+            }
+        }
+
+        // Partition of unity everywhere, since constants are in the span
+        for ([_]f64{ -1.0, -0.63, 0.0, 0.22, 0.81, 1.0 }) |x| {
+            var sum: f64 = 0.0;
+            for (0..grid.len) |mode| sum += p.Lagrange(grid, x, mode);
+            try expectApprox(sum, 1.0, 1e-13);
+        }
+    }
+}
+
+test "Lagrange interpolation is exact for polynomials up to grid degree" {
+    // sum_k f(x_k) l_k(x) == f(x) when deg f < grid.len
+    for (lagrange_grids) |grid| {
+        const f = struct {
+            fn eval(deg: usize, x: f64) f64 {
+                // 1 + 2x + 3x^2 + ... truncated at `deg`
+                var v: f64 = 0.0;
+                for (0..deg + 1) |i| {
+                    v += @as(f64, @floatFromInt(i + 1)) * std.math.pow(f64, x, @floatFromInt(i));
+                }
+                return v;
+            }
+        }.eval;
+
+        const deg = grid.len - 1;
+        for ([_]f64{ -0.77, -0.1, 0.35, 0.92 }) |x| {
+            var sum: f64 = 0.0;
+            for (grid, 0..) |node, k| sum += f(deg, node) * p.Lagrange(grid, x, k);
+            try expectApprox(sum, f(deg, x), 1e-12);
+        }
+    }
+}
+
+test "dLagrange matches finite differences" {
+    // This is the check that was missing: `dLagrange` accumulated its sum of
+    // products inside the inner loop rather than after it, so every derivative
+    // operator built on it was wrong.
+    for (lagrange_grids) |grid| {
+        for (0..grid.len) |mode| {
+            for ([_]f64{ -0.85, -0.4, 0.0, 0.31, 0.77 }) |x| {
+                const fd = (p.Lagrange(grid, x + fd_h, mode) -
+                    p.Lagrange(grid, x - fd_h, mode)) / (2.0 * fd_h);
+                try expectApprox(p.dLagrange(grid, x, mode), fd, 1e-6);
+            }
+        }
+    }
+}
+
+test "dLagrange sums to zero and differentiates exactly" {
+    for (lagrange_grids) |grid| {
+        // d/dx of the partition of unity
+        for ([_]f64{ -0.7, 0.0, 0.45 }) |x| {
+            var sum: f64 = 0.0;
+            for (0..grid.len) |mode| sum += p.dLagrange(grid, x, mode);
+            try expectApprox(sum, 0.0, 1e-12);
+        }
+
+        // Differentiating the interpolant of x^n gives n*x^(n-1) exactly, for
+        // n up to the grid's degree.
+        const deg = grid.len - 1;
+        for (1..deg + 1) |n| {
+            const fn_: f64 = @floatFromInt(n);
+            for ([_]f64{ -0.66, 0.12, 0.58 }) |x| {
+                var sum: f64 = 0.0;
+                for (grid, 0..) |node, k| {
+                    sum += std.math.pow(f64, node, fn_) * p.dLagrange(grid, x, k);
+                }
+                try expectApprox(sum, fn_ * std.math.pow(f64, x, fn_ - 1.0), 1e-11);
+            }
+        }
+    }
+}
+
 test "Legendre matches closed forms for P <= 4" {
     for ([_]f64{ -1.0, -0.73, -0.25, 0.0, 0.4, 0.9, 1.0 }) |x| {
         for (0..5) |P| {

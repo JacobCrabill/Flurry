@@ -1,98 +1,110 @@
 const std = @import("std");
 
 pub const Matrix = @import("util/matrix.zig").Matrix;
+const poly = @import("math/polynomials.zig");
+
+/// Errors from the tabulated point/weight sets.
+///
+/// The 1D sets below are `(N, 1)` matrices, so `.data` is the contiguous list
+/// of N values and can be passed straight to the `polynomials` routines.
+pub const Error = error{
+    OutOfMemory,
+    /// No tabulated values for the requested order
+    UnsupportedOrder,
+};
 
 /// Gauss-Legendre quadrature points (1D)
-pub fn gaussLegendrePts(gpa: std.mem.Allocator, P: u32) Matrix(f64) {
+pub fn gaussLegendrePts(gpa: std.mem.Allocator, P: u32) Error!Matrix(f64) {
     var pts = try Matrix(f64).init(gpa, P, 1, null);
+    errdefer pts.deinit(gpa);
     switch (P) {
         0 => {},
         1 => pts.at(0, 0).* = 0.0,
         2 => {
             const s: f64 = std.math.sqrt(1.0 / 3.0);
             pts.at(0, 0).* = -s;
-            pts.at(0, 1).* = s;
+            pts.at(1, 0).* = s;
         },
         3 => {
             const s = std.math.sqrt(3.0 / 5.0);
             pts.at(0, 0).* = -s;
-            pts.at(0, 1).* = 0.0;
-            pts.at(0, 2).* = s;
+            pts.at(1, 0).* = 0.0;
+            pts.at(2, 0).* = s;
         },
         4 => {
             const v6_5 = std.math.sqrt(6.0 / 5.0);
             pts.at(0, 0).* = -std.math.sqrt((3.0 + 2.0 * v6_5) / 7.0);
-            pts.at(0, 1).* = -std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
-            pts.at(0, 2).* = std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
-            pts.at(0, 3).* = std.math.sqrt((3.0 + 2.0 * v6_5) / 7.0);
+            pts.at(1, 0).* = -std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
+            pts.at(2, 0).* = std.math.sqrt((3.0 - 2.0 * v6_5) / 7.0);
+            pts.at(3, 0).* = std.math.sqrt((3.0 + 2.0 * v6_5) / 7.0);
         },
         5 => {
             const s10_7 = std.math.sqrt(10.0 / 7.0);
             const one_third = 1.0 / 3.0;
             pts.at(0, 0).* = -one_third * std.math.sqrt(5.0 + 2.0 * s10_7);
-            pts.at(0, 1).* = -one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
-            pts.at(0, 2).* = 0.0;
-            pts.at(0, 3).* = one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
-            pts.at(0, 4).* = one_third * std.math.sqrt(5.0 + 2.0 * s10_7);
+            pts.at(1, 0).* = -one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
+            pts.at(2, 0).* = 0.0;
+            pts.at(3, 0).* = one_third * std.math.sqrt(5.0 - 2.0 * s10_7);
+            pts.at(4, 0).* = one_third * std.math.sqrt(5.0 + 2.0 * s10_7);
         },
         6 => {
             pts.at(0, 0).* = -0.932469514203152;
-            pts.at(0, 1).* = -0.661209386466264;
-            pts.at(0, 2).* = -0.238619186083197;
-            pts.at(0, 3).* = 0.238619186083197;
-            pts.at(0, 4).* = 0.661209386466264;
-            pts.at(0, 5).* = 0.932469514203152;
+            pts.at(1, 0).* = -0.661209386466264;
+            pts.at(2, 0).* = -0.238619186083197;
+            pts.at(3, 0).* = 0.238619186083197;
+            pts.at(4, 0).* = 0.661209386466264;
+            pts.at(5, 0).* = 0.932469514203152;
         },
         7 => {
             pts.at(0, 0).* = -0.949107912342758;
-            pts.at(0, 1).* = -0.741531185599394;
-            pts.at(0, 2).* = -0.405845151377397;
-            pts.at(0, 3).* = 0;
-            pts.at(0, 4).* = 0.405845151377397;
-            pts.at(0, 5).* = 0.741531185599394;
-            pts.at(0, 6).* = 0.949107912342758;
+            pts.at(1, 0).* = -0.741531185599394;
+            pts.at(2, 0).* = -0.405845151377397;
+            pts.at(3, 0).* = 0;
+            pts.at(4, 0).* = 0.405845151377397;
+            pts.at(5, 0).* = 0.741531185599394;
+            pts.at(6, 0).* = 0.949107912342758;
         },
         8 => {
             pts.at(0, 0).* = -0.960289856497536;
-            pts.at(0, 1).* = -0.796666477413627;
-            pts.at(0, 2).* = -0.525532409916329;
-            pts.at(0, 3).* = -0.183434642495650;
-            pts.at(0, 4).* = 0.183434642495650;
-            pts.at(0, 5).* = 0.525532409916329;
-            pts.at(0, 6).* = 0.796666477413627;
-            pts.at(0, 7).* = 0.960289856497536;
+            pts.at(1, 0).* = -0.796666477413627;
+            pts.at(2, 0).* = -0.525532409916329;
+            pts.at(3, 0).* = -0.183434642495650;
+            pts.at(4, 0).* = 0.183434642495650;
+            pts.at(5, 0).* = 0.525532409916329;
+            pts.at(6, 0).* = 0.796666477413627;
+            pts.at(7, 0).* = 0.960289856497536;
         },
         9 => {
             pts.at(0, 0).* = -0.968160239507626;
-            pts.at(0, 1).* = -0.836031107326636;
-            pts.at(0, 2).* = -0.613371432700590;
-            pts.at(0, 3).* = -0.324253423403809;
-            pts.at(0, 4).* = 0.0;
-            pts.at(0, 5).* = 0.324253423403809;
-            pts.at(0, 6).* = 0.613371432700590;
-            pts.at(0, 7).* = 0.836031107326636;
-            pts.at(0, 8).* = 0.968160239507626;
+            pts.at(1, 0).* = -0.836031107326636;
+            pts.at(2, 0).* = -0.613371432700590;
+            pts.at(3, 0).* = -0.324253423403809;
+            pts.at(4, 0).* = 0.0;
+            pts.at(5, 0).* = 0.324253423403809;
+            pts.at(6, 0).* = 0.613371432700590;
+            pts.at(7, 0).* = 0.836031107326636;
+            pts.at(8, 0).* = 0.968160239507626;
         },
         10 => {
             pts.at(0, 0).* = -0.973906528517172;
-            pts.at(0, 1).* = -0.865063366688985;
-            pts.at(0, 2).* = -0.679409568299024;
-            pts.at(0, 3).* = -0.433895394129247;
-            pts.at(0, 4).* = -0.148874338981631;
-            pts.at(0, 5).* = 0.148874338981631;
-            pts.at(0, 6).* = 0.433895394129247;
-            pts.at(0, 7).* = 0.679409568299024;
-            pts.at(0, 8).* = 0.865063366688985;
-            pts.at(0, 9).* = 0.973906528517172;
+            pts.at(1, 0).* = -0.865063366688985;
+            pts.at(2, 0).* = -0.679409568299024;
+            pts.at(3, 0).* = -0.433395394129247;
+            pts.at(4, 0).* = -0.148874338981631;
+            pts.at(5, 0).* = 0.148874338981631;
+            pts.at(6, 0).* = 0.433395394129247;
+            pts.at(7, 0).* = 0.679409568299024;
+            pts.at(8, 0).* = 0.865063366688985;
+            pts.at(9, 0).* = 0.973906528517172;
         },
-        else => @panic("Gauss-Legendre only supported up to degree 10"),
+        else => return error.UnsupportedOrder,
     }
     return pts;
 }
 
 /// Direct Flux Reconstruction (DFR) solution points (??)
-pub fn dfrSpts(gpa: std.mem.Allocator, P: u32, z1: f64) !Matrix(f64) {
-    if (P != 4) return error.DFRSptsNotSupported;
+pub fn dfrSpts(gpa: std.mem.Allocator, P: u32, z1: f64) Error!Matrix(f64) {
+    if (P != 4) return error.UnsupportedOrder;
     var pts = try Matrix(f64).init(gpa, 4, 1, null);
     const s = z1 * z1;
     pts.at(0, 0).* = -std.math.sqrt((3.0 - 5.0 * s) / (5.0 - 15.0 * s));
@@ -103,8 +115,15 @@ pub fn dfrSpts(gpa: std.mem.Allocator, P: u32, z1: f64) !Matrix(f64) {
 }
 
 /// Gauss-Legendre quadrature weights
-pub fn gaussLegendreWeights(gpa: std.mem.Allocator, n: u32) !Matrix(f64) {
+///
+/// Exact closed forms are tabulated up to n = 5; beyond that the weights are
+/// computed from the tabulated points, which reach n = 10. Without the fallback
+/// the two functions would disagree about which orders they support.
+pub fn gaussLegendreWeights(gpa: std.mem.Allocator, n: u32) Error!Matrix(f64) {
+    if (n > 5) return gaussLegendreWeightsComputed(gpa, n);
+
     var w = try Matrix(f64).init(gpa, n, 1, null);
+    errdefer w.deinit(gpa);
     switch (n) {
         0 => {},
         1 => w.at(0, 0).* = 2.0,
@@ -134,12 +153,28 @@ pub fn gaussLegendreWeights(gpa: std.mem.Allocator, n: u32) !Matrix(f64) {
             w.at(3, 0).* = one_900 * (322.0 + 13.0 * s70);
             w.at(4, 0).* = one_900 * (322.0 - 13.0 * s70);
         },
-        else => return error.GaussLegendreWeightsNotSupported,
+        else => unreachable, // n > 5 handled above
     }
     return w;
 }
 
-pub fn shapePts(gpa: std.mem.Allocator, P: u32) !Matrix(f64) {
+/// Gauss-Legendre weights from the nodes, via
+/// `w_i = 2 / ((1 - x_i^2) * P'_n(x_i)^2)`.
+fn gaussLegendreWeightsComputed(gpa: std.mem.Allocator, n: u32) Error!Matrix(f64) {
+    var pts = try gaussLegendrePts(gpa, n);
+    defer pts.deinit(gpa);
+
+    var w = try Matrix(f64).init(gpa, n, 1, null);
+    errdefer w.deinit(gpa);
+
+    for (pts.data, 0..) |x, i| {
+        const dp = poly.dLegendre(n, x);
+        w.at(i, 0).* = 2.0 / ((1.0 - x * x) * dp * dp);
+    }
+    return w;
+}
+
+pub fn shapePts(gpa: std.mem.Allocator, P: u32) Error!Matrix(f64) {
     const P_f = @as(f64, @floatFromInt(P));
     var nodes = try Matrix(f64).init(gpa, P + 1, 1, null);
     const dx = 2.0 / P_f;

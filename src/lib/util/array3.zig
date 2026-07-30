@@ -10,8 +10,10 @@ pub const Array3z = Array3(usize);
 pub fn Array3(T: type) type {
     return struct {
         const Self = @This();
-        dims: [3]usize,
-        data: []T,
+        dims: [3]usize = .{ 0, 0, 0 },
+        data: []T = &.{},
+
+        pub const empty: Self = .{};
 
         /// Initialize a new Array3(T) with the given size and stride.
         /// Initializes the full array to 0.

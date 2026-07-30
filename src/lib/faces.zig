@@ -1,33 +1,40 @@
-//! Interface (flux point) coupling: common solution and common normal flux.
+//! Interface (flux point) coupling: common solution, common normal flux, and
+//! boundary conditions.
 //!
-//! STATUS: data layout and the numerical flux are implemented; the two pieces
-//! that need mesh connectivity we do not have yet are stubbed.
+//! Every interface appears once here, as a *global flux point* (gfpt) with a
+//! left (slot 0) and right (slot 1) side. Interior gfpts come first; boundary
+//! ones occupy the tail, where the right-hand state is manufactured by
+//! `applyBcs` rather than gathered from a neighbour. Elements scatter into and
+//! gather from these through `geo.fpt2gfpt` / `fpt2gfpt_slot`.
 //!
-//! Every interior interface appears once here, as a *global flux point* (gfpt)
-//! with a left (slot 0) and right (slot 1) side. Elements gather/scatter
-//! through `fpt2gfpt` and `fpt2gfpt_slot`, which map an element-local flux
-//! point to its gfpt and side.
+//! Two states are carried at a boundary. `u` is the *ghost* state the Rusanov
+//! flux sees, chosen so the Riemann average gives the right physics -- a no-slip
+//! wall reflects the velocity so the average is zero. `u_ldg` is the state
+//! *prescribed* to the viscous flux, which for that same wall is the wall
+//! velocity itself. They coincide on interior faces and for most conditions.
 //!
-//! ## What is missing
+//! ## Not ported
 //!
-//! 1. `geo` does not build `fpt2gfpt` / `fpt2gfpt_slot` yet. That needs the
-//!    flux points of two adjoining cells matched up in the right rotational
-//!    order -- ZEFR's `Elements::setup` plus `FRSolver::orient_fpts`, on top of
-//!    the `compareOrientation` logic in Flurry-cpp's `geo.cpp`. Until then
-//!    `gatherU`/`scatterF` have nothing to walk and `n_gfpts` is 0.
+//! - `.periodic`: a periodic face is really an interior face, and pairing the
+//!   two sides needs Flurry-cpp's `processPeriodicBoundaries`. Reported as
+//!   `error.UnsupportedBoundaryCondition` rather than silently mishandled.
+//! - MPI processor boundaries.
+//! - The `rus_bias` / `LDG_bias` machinery: ZEFR uses the "prescribed" Rusanov
+//!   variant only for its implicit method, so the explicit path always takes the
+//!   ghost-state branch implemented here.
 //!
-//! 2. `applyBcs` needs the boundary condition set (characteristic, slip wall,
-//!    isothermal/adiabatic no-slip, ...). `geo.bc_type` already says which BC
-//!    each boundary face carries, so the missing part is purely the per-BC
-//!    state construction.
-//!
-//! The solver calls both, so the call sites and the data they need are pinned
-//! down; filling them in should not change `Solver`.
+//! Ported from ZEFR's `faces.cpp`.
 
 pub const Error = error{
     OutOfMemory,
-    /// A required piece of face connectivity or boundary handling is not ported
-    NotImplemented,
+    /// A boundary condition with no implementation: periodic faces need
+    /// `processPeriodicBoundaries`, which is not ported
+    UnsupportedBoundaryCondition,
+    /// A boundary face that matched no declared boundary, so there is no
+    /// condition to apply
+    UnmatchedBoundaryFace,
+    /// A no-slip wall on an inviscid run, or a slip wall on a viscous one
+    WallConditionMismatch,
 };
 
 pub const Faces = struct {
@@ -40,6 +47,8 @@ pub const Faces = struct {
 
     /// Global flux points: interior interfaces plus boundary faces
     n_gfpts: usize = 0,
+    /// Interior gfpts, which come first
+    n_gfpts_int: usize = 0,
     /// Of those, the ones on a mesh boundary (they occupy the tail)
     n_gfpts_bnd: usize = 0,
 
@@ -50,6 +59,12 @@ pub const Faces = struct {
 
     /// Common (single-valued) solution, for the viscous gradient correction
     u_comm: Array3(f64) = .empty,
+
+    /// The state the *viscous* (LDG) flux sees. Equal to `u` everywhere except
+    /// at boundaries, where a wall's prescribed state differs from the ghost
+    /// state the convective flux needs -- a no-slip wall prescribes zero
+    /// velocity but reflects it for the Riemann solve.
+    u_ldg: Array3(f64) = .empty,
 
     /// Common normal flux, already scaled by `dA` and signed per slot so that
     /// each element can add it directly through `oppDiv_fpts`
@@ -74,6 +89,14 @@ pub const Faces = struct {
     /// Maximum wave speed at each flux point, for the time-step limit
     wave_sp: []f64 = &.{},
 
+    // ---- Boundary information, borrowed from the mesh ----
+
+    /// Boundary index of each boundary gfpt, indexed by `gfpt - n_gfpts_int`
+    gfpt2bnd: []const usize = &.{},
+
+    /// Condition applied on each boundary, indexed by boundary
+    bc_list: []const cfg.BoundaryCondition = &.{},
+
     pub fn init(
         gpa: std.mem.Allocator,
         config: *const Config,
@@ -91,6 +114,7 @@ pub const Faces = struct {
             .n_dims = n_dims,
             .n_vars = n_vars,
             .n_gfpts = n_gfpts,
+            .n_gfpts_int = n_gfpts - n_gfpts_bnd,
             .n_gfpts_bnd = n_gfpts_bnd,
         };
         errdefer f.deinit();
@@ -105,6 +129,7 @@ pub const Faces = struct {
 
         if (config.equation.viscous) {
             f.u_comm = try Array3(f64).init(gpa, 2, n_vars, n_gfpts);
+            f.u_ldg = try Array3(f64).init(gpa, 2, n_vars, n_gfpts);
             f.du = try Array4(f64).init(gpa, 2, n_dims, n_vars, n_gfpts);
         }
 
@@ -115,6 +140,7 @@ pub const Faces = struct {
         const gpa = f.gpa;
         f.u.deinit(gpa);
         f.u_comm.deinit(gpa);
+        f.u_ldg.deinit(gpa);
         f.f_comm.deinit(gpa);
         f.du.deinit(gpa);
         f.norm.deinit(gpa);
@@ -123,30 +149,224 @@ pub const Faces = struct {
         gpa.free(f.wave_sp);
     }
 
-    /// Fill the right-hand state of every boundary flux point from its boundary
-    /// condition.
+    /// Fill the right-hand state of every boundary flux point from its
+    /// boundary condition.
     ///
-    /// STUB. Needs the per-BC state construction; `geo.bc_type` already carries
-    /// which condition applies to each boundary face. A no-op here leaves the
-    /// right state at whatever `gatherU` wrote, which for a boundary face is
-    /// zero -- so the residual is only meaningful once this is real.
+    /// Writes `u` (the ghost state the Rusanov flux sees) and, on viscous runs,
+    /// `u_ldg` (the state prescribed to the viscous flux). They differ at a
+    /// no-slip wall: the ghost state reflects the velocity so that the Riemann
+    /// average is zero, while the prescribed state *is* the wall velocity.
     pub fn applyBcs(f: *Faces) Error!void {
-        if (f.n_gfpts_bnd > 0) return error.NotImplemented;
+        return switch (f.n_dims) {
+            2 => f.applyBcsDim(2),
+            3 => f.applyBcsDim(3),
+            else => unreachable,
+        };
     }
 
-    /// Same, for the solution gradient (viscous runs only).
+    fn applyBcsDim(f: *Faces, comptime nd: usize) Error!void {
+        const equation = f.config.equation.equation;
+        const viscous = f.config.equation.viscous;
+        const n_vars = f.n_vars;
+        const p = f.params;
+        const u_fs = p.freestreamState(nd, equation);
+
+        for (f.n_gfpts_int..f.n_gfpts) |gf| {
+            const bnd = f.gfpt2bnd[gf - f.n_gfpts_int];
+            if (bnd == geo.none) return error.UnmatchedBoundaryFace;
+            const bc = f.bc_list[bnd];
+
+            var ul: [nd + 2]f64 = @splat(0.0);
+            for (0..n_vars) |n| ul[n] = f.u.get(0, n, gf);
+
+            var norm: [nd]f64 = undefined;
+            for (0..nd) |d| norm[d] = f.norm.get(d, gf);
+
+            // Ghost state for the convective flux, and prescribed state for the
+            // viscous one. Most conditions set them the same.
+            var ur: [nd + 2]f64 = @splat(0.0);
+            var ug: [nd + 2]f64 = @splat(0.0);
+
+            switch (bc) {
+                .sup_in => {
+                    // Farfield / supersonic inflow: impose the freestream
+                    ur = u_fs;
+                    ug = u_fs;
+                },
+
+                .sup_out => {
+                    // Supersonic outflow: everything leaves, so extrapolate
+                    ur = ul;
+                    ug = ul;
+                },
+
+                .characteristic => {
+                    switch (equation) {
+                        // For a scalar equation the characteristic condition is
+                        // just upwinding: prescribe on inflow, extrapolate on
+                        // outflow. ZEFR only handles the Euler case here.
+                        .adv_diff => {
+                            var an: f64 = 0.0;
+                            for (0..nd) |d| an += p.adv_vel[d] * norm[d];
+                            ur[0] = if (an < 0.0) u_fs[0] else ul[0];
+                            ug = ur;
+                        },
+                        .euler_ns => {
+                            ur = characteristicState(nd, ul, norm, p);
+                            ug = ur;
+                        },
+                    }
+                },
+
+                .slip_wall, .symmetry => {
+                    if (viscous) return error.WallConditionMismatch;
+                    if (equation == .adv_diff) {
+                        // No normal transport: mirror the scalar
+                        ur[0] = ul[0];
+                        ug = ur;
+                    } else {
+                        // Reflect the normal momentum, so the Riemann average
+                        // has none and the wall is impermeable. Density and
+                        // energy are unchanged because |momentum| is.
+                        var mom_n: f64 = 0.0;
+                        for (0..nd) |d| mom_n += ul[1 + d] * norm[d];
+
+                        ur[0] = ul[0];
+                        for (0..nd) |d| ur[1 + d] = ul[1 + d] - 2.0 * mom_n * norm[d];
+                        ur[nd + 1] = ul[nd + 1];
+                        ug = ur;
+                    }
+                },
+
+                .isothermal_noslip => {
+                    if (!viscous or equation != .euler_ns) return error.WallConditionMismatch;
+
+                    const rho = ul[0];
+                    ur[0] = rho;
+                    ug[0] = rho;
+
+                    var v_sq: f64 = 0.0;
+                    for (0..nd) |d| {
+                        const vl = ul[1 + d] / rho;
+                        const v = 2.0 * p.vel_wall[d] - vl;
+                        ur[1 + d] = rho * v;
+                        ug[1 + d] = rho * p.vel_wall[d];
+                        v_sq += v * v;
+                    }
+
+                    // e_int is fixed by the wall temperature
+                    const cv_t = p.r_ref / (p.gamma - 1.0) * p.t_wall;
+                    ur[nd + 1] = rho * (cv_t + 0.5 * v_sq);
+                    ug[nd + 1] = rho * cv_t;
+                },
+
+                .adiabatic_noslip => {
+                    if (!viscous or equation != .euler_ns) return error.WallConditionMismatch;
+
+                    const rho = ul[0];
+                    ur[0] = rho;
+                    ug[0] = rho;
+
+                    // Energy is extrapolated instead of prescribed, with only
+                    // the kinetic part adjusted for the new velocity.
+                    var v_sq: f64 = 0.0;
+                    var vl_sq: f64 = 0.0;
+                    var vw_sq: f64 = 0.0;
+                    for (0..nd) |d| {
+                        const vl = ul[1 + d] / rho;
+                        const v = 2.0 * p.vel_wall[d] - vl;
+                        ur[1 + d] = rho * v;
+                        ug[1 + d] = rho * p.vel_wall[d];
+                        v_sq += v * v;
+                        vl_sq += vl * vl;
+                        vw_sq += p.vel_wall[d] * p.vel_wall[d];
+                    }
+
+                    const e_l = ul[nd + 1];
+                    ur[nd + 1] = e_l + 0.5 * rho * (v_sq - vl_sq);
+                    ug[nd + 1] = e_l + 0.5 * rho * (vw_sq - vl_sq);
+                },
+
+                // A periodic face is really an interior face; pairing the two
+                // sides needs Flurry-cpp's processPeriodicBoundaries, which is
+                // not ported. `.none` means the input file left it unset.
+                .periodic, .none => return error.UnsupportedBoundaryCondition,
+            }
+
+            for (0..n_vars) |n| f.u.at(1, n, gf).* = ur[n];
+            if (viscous) {
+                for (0..n_vars) |n| f.u_ldg.at(1, n, gf).* = ug[n];
+            }
+        }
+    }
+
+    /// Boundary conditions on the solution gradient (viscous runs only).
+    ///
+    /// Only an adiabatic wall constrains the gradient: the wall-normal
+    /// temperature gradient must vanish, so there is no heat flux through it.
+    /// Every other condition leaves the extrapolated gradient alone.
     pub fn applyBcsGrad(f: *Faces) Error!void {
-        if (f.n_gfpts_bnd > 0) return error.NotImplemented;
+        if (!f.config.equation.viscous) return;
+        return switch (f.n_dims) {
+            2 => f.applyBcsGradDim(2),
+            3 => f.applyBcsGradDim(3),
+            else => unreachable,
+        };
+    }
+
+    fn applyBcsGradDim(f: *Faces, comptime nd: usize) Error!void {
+        const n_vars = f.n_vars;
+
+        for (f.n_gfpts_int..f.n_gfpts) |gf| {
+            const bnd = f.gfpt2bnd[gf - f.n_gfpts_int];
+            if (bnd == geo.none) return error.UnmatchedBoundaryFace;
+
+            // Default: the right side sees the same gradient as the left
+            for (0..nd) |dim| {
+                for (0..n_vars) |n| f.du.at(1, dim, n, gf).* = f.du.get(0, dim, n, gf);
+            }
+
+            if (f.bc_list[bnd] != .adiabatic_noslip) continue;
+
+            const rho = f.u.get(0, 0, gf);
+            const e = f.u.get(0, nd + 1, gf);
+
+            var vel: [nd]f64 = undefined;
+            for (0..nd) |d| vel[d] = f.u.get(0, 1 + d, gf) / rho;
+
+            // Remove the wall-normal part of the temperature gradient from the
+            // energy gradient. `dt` here is C_v * rho * grad(T).
+            var dt: [nd]f64 = undefined;
+            for (0..nd) |dim| {
+                const drho = f.du.get(0, dim, 0, gf);
+                var v_dot_dv: f64 = 0.0;
+                for (0..nd) |d| {
+                    const dmom = f.du.get(0, dim, 1 + d, gf);
+                    v_dot_dv += vel[d] * (dmom - drho * vel[d]) / rho;
+                }
+                dt[dim] = f.du.get(0, dim, nd + 1, gf) - drho * e / rho - rho * v_dot_dv;
+            }
+
+            var dt_dn: f64 = 0.0;
+            for (0..nd) |dim| dt_dn += dt[dim] * f.norm.get(dim, gf);
+
+            for (0..nd) |dim| {
+                f.du.at(1, dim, nd + 1, gf).* =
+                    f.du.get(0, dim, nd + 1, gf) - dt_dn * f.norm.get(dim, gf);
+            }
+        }
     }
 
     /// Single-valued interface solution, used by the viscous gradient
     /// correction. LDG with `ldg_b` biasing between the two sides.
     pub fn computeCommonU(f: *Faces) void {
-        const b = f.config.flux.ldg_b;
         for (0..f.n_gfpts) |gf| {
+            // A boundary prescribes its common state outright; only an interior
+            // interface has two sides to bias between.
+            const b = if (gf < f.n_gfpts_int) f.config.flux.ldg_b else -0.5;
             for (0..f.n_vars) |n| {
-                const ul = f.u.get(0, n, gf);
-                const ur = f.u.get(1, n, gf);
+                const ul = f.u_ldg.get(0, n, gf);
+                const ur = f.u_ldg.get(1, n, gf);
                 const uc = (0.5 + b) * ul + (0.5 - b) * ur;
                 // Both sides see the same value, scaled into each one's
                 // reference space and signed for its outward normal.
@@ -227,10 +447,79 @@ pub const Faces = struct {
     }
 };
 
+/// Riemann-invariant ("characteristic") far-field state, after PyFR.
+///
+/// One incoming and one outgoing invariant are combined into a boundary state
+/// that lets waves leave without reflecting, and matches the freestream on
+/// inflow. Reduces exactly to the freestream when the interior state already
+/// is the freestream.
+fn characteristicState(
+    comptime nd: usize,
+    ul: [nd + 2]f64,
+    norm: [nd]f64,
+    p: flux.FlowParams,
+) [nd + 2]f64 {
+    const gam = p.gamma;
+    const gm1 = gam - 1.0;
+
+    const rho_l = ul[0];
+    var vn_l: f64 = 0.0;
+    var vn_r: f64 = 0.0;
+    for (0..nd) |d| {
+        vn_l += ul[1 + d] / rho_l * norm[d];
+        vn_r += p.vel_fs[d] * norm[d];
+    }
+
+    const press_l = flux.pressure(nd, ul, gam);
+    const press_r = p.p_fs;
+
+    const c_l = @sqrt(gam * press_l / rho_l);
+    const c_r = @sqrt(gam * press_r / p.rho_fs);
+
+    // Outgoing invariant, unless the far field is supersonic into the domain
+    const r_l = if (@abs(vn_r) >= c_r and vn_l >= 0.0)
+        vn_r + 2.0 / gm1 * c_r
+    else
+        vn_l + 2.0 / gm1 * c_l;
+
+    const r_b = if (@abs(vn_r) >= c_r and vn_l < 0.0)
+        vn_l - 2.0 / gm1 * c_l
+    else
+        vn_r - 2.0 / gm1 * c_r;
+
+    const c_star = 0.25 * gm1 * (r_l - r_b);
+    const vn_star = 0.5 * (r_l + r_b);
+
+    // Entropy comes from whichever side the flow is coming from
+    var rho_r = c_star * c_star / gam;
+    var vel: [nd]f64 = undefined;
+    if (vn_l < 0.0) { // inflow
+        rho_r *= std.math.pow(f64, p.rho_fs, gam) / press_r;
+        for (0..nd) |d| vel[d] = p.vel_fs[d] + (vn_star - vn_r) * norm[d];
+    } else { // outflow
+        rho_r *= std.math.pow(f64, rho_l, gam) / press_l;
+        for (0..nd) |d| vel[d] = ul[1 + d] / rho_l + (vn_star - vn_l) * norm[d];
+    }
+    rho_r = std.math.pow(f64, rho_r, 1.0 / gm1);
+
+    var ur: [nd + 2]f64 = @splat(0.0);
+    ur[0] = rho_r;
+    var ke: f64 = 0.0;
+    for (0..nd) |d| {
+        ur[1 + d] = rho_r * vel[d];
+        ke += vel[d] * vel[d];
+    }
+    const press = rho_r / gam * c_star * c_star;
+    ur[nd + 1] = press / gm1 + 0.5 * rho_r * ke;
+    return ur;
+}
+
 const std = @import("std");
 
 const Config = @import("config.zig").Config;
+const cfg = @import("config.zig");
 const flux = @import("flux.zig");
+const geo = @import("geo.zig");
 const Matrix = @import("util/matrix.zig").Matrix;
 const Array3 = @import("util/array3.zig").Array3;
 const Array4 = @import("util/array4.zig").Array4;

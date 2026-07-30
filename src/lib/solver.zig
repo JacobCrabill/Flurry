@@ -4,7 +4,7 @@
 //! residual using the reference-element operators from `element.zig`:
 //!
 //!   1. `extrapolateU`      U_spts  -> U_fpts       via oppE
-//!   2. faces: apply BCs, compute the common normal flux at each interface
+//!   2. faces: scatter, apply BCs, compute the common normal flux
 //!   3. `computeFluxSpts`   U_spts  -> F_spts       physical flux, then
 //!                                                  transformed to reference space
 //!   4. `computeDivFSpts`   F_spts  -> divF_spts    via oppDiv
@@ -31,7 +31,7 @@ pub const Error = error{
     /// `mesh.setupGlobalFpts` was not run, or was run for a different order
     ConnectivityNotProcessed,
     NotImplemented,
-};
+} || faces_mod.Error;
 
 /// Explicit Runge-Kutta tableau.
 ///
@@ -229,6 +229,9 @@ pub const Solver = struct {
 
         s.faces.deinit();
         s.faces = try Faces.init(gpa, config, params, mesh.n_gfpts, mesh.n_gfpts_bnd);
+        // Borrowed from the mesh, which outlives the solver
+        s.faces.gfpt2bnd = mesh.gfpt2bnd.items;
+        s.faces.bc_list = mesh.bc_list.items;
 
         try s.allocate();
         try s.computeTransforms();
@@ -722,6 +725,13 @@ pub const Solver = struct {
                 for (0..s.n_vars) |n| {
                     s.faces.u.at(slot, n, gf).* = s.u_fpts.get(fpt, n, e);
                 }
+                // The viscous flux reads u_ldg; on an interior face it is the
+                // same state, and applyBcs overwrites the boundary side.
+                if (s.config.equation.viscous) {
+                    for (0..s.n_vars) |n| {
+                        s.faces.u_ldg.at(slot, n, gf).* = s.u_fpts.get(fpt, n, e);
+                    }
+                }
             }
         }
     }
@@ -980,7 +990,8 @@ const geo_mod = @import("geo.zig");
 const Geo = geo_mod.Geo;
 const Element = @import("element.zig").Element;
 const Quad = @import("eles/quads.zig").Quad;
-const Faces = @import("faces.zig").Faces;
+const faces_mod = @import("faces.zig");
+const Faces = faces_mod.Faces;
 
 const Matrix = @import("util/matrix.zig").Matrix;
 const Array3 = @import("util/array3.zig").Array3;

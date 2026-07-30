@@ -47,6 +47,16 @@ pub const FlowParams = struct {
     /// Freestream velocity vector
     vel_fs: [3]f64 = .{ 0, 0, 0 },
 
+    // ---- Wall state, for the no-slip boundary conditions ----
+
+    /// Gas constant in the same units as the state, so that
+    /// `e_int = R_ref/(gamma-1) * T`
+    r_ref: f64 = 1.0,
+    /// Wall temperature
+    t_wall: f64 = 1.0,
+    /// Wall velocity vector
+    vel_wall: [3]f64 = .{ 0, 0, 0 },
+
     pub fn fromConfig(config: *const cfg.Config) FlowParams {
         const eq = config.equation;
         const gp = config.gas_properties;
@@ -77,6 +87,8 @@ pub const FlowParams = struct {
             .p_fs = fs.P_fs,
         };
 
+        const wc = config.wall_conditions;
+
         if (eq.disable_nondim) {
             // Run in the input file's own units: rho, P, Mach, Re and L are
             // given and everything else follows for consistency.
@@ -88,6 +100,11 @@ pub const FlowParams = struct {
             // dimensional path does not establish, so viscosity is held fixed.
             p.fix_vis = true;
             for (0..n_dims) |d| p.vel_fs[d] = v_mag * norm[d];
+
+            p.r_ref = gp.R;
+            p.t_wall = wc.T_wall;
+            const vw = wc.mach_wall * @sqrt(gp.gamma * gp.R * wc.T_wall);
+            for (0..n_dims) |d| p.vel_wall[d] = vw * wc.norm_wall[d] / v_mag;
             return p;
         }
 
@@ -112,6 +129,12 @@ pub const FlowParams = struct {
         // Velocity is scaled by its own magnitude, so the freestream is a unit
         // vector along `norm_fs`.
         for (0..n_dims) |d| p.vel_fs[d] = norm[d];
+
+        // Wall quantities in the same nondimensional units
+        p.r_ref = gp.R * fs.T_fs / (v_mag * v_mag);
+        p.t_wall = wc.T_wall / fs.T_fs;
+        const vw = wc.mach_wall * @sqrt(gp.gamma * gp.R * wc.T_wall);
+        for (0..n_dims) |d| p.vel_wall[d] = vw * wc.norm_wall[d] / v_mag;
 
         return p;
     }

@@ -753,6 +753,92 @@ test "free-stream is preserved on cells away from the boundary" {
     }
 }
 
+test "free-stream is preserved over the whole domain" {
+    const gpa = testing.allocator;
+
+    // The definitive check on the boundary conditions: with a characteristic
+    // far-field on every side, a uniform freestream must give exactly zero
+    // residual *everywhere*, boundary cells included. Any inconsistency between
+    // the interior scheme and a boundary state shows up here.
+    for ([_]u8{ 1, 2, 3 }) |order| {
+        for ([_]bool{ false, true }) |distorted| {
+            var config = testConfig(order, .euler_ns, false, 4, 4);
+            config.create_mesh.?.xmax = 4.0;
+            config.create_mesh.?.ymax = 4.0;
+            config.create_mesh.?.bc_bottom = .characteristic;
+            config.create_mesh.?.bc_top = .characteristic;
+            config.create_mesh.?.bc_left = .characteristic;
+            config.create_mesh.?.bc_right = .characteristic;
+
+            var mesh = if (distorted)
+                try testMeshDistorted(gpa, &config)
+            else
+                try testMesh(gpa, &config);
+            defer mesh.deinit();
+
+            var s = try Solver.init(gpa, &config, &mesh);
+            defer s.deinit();
+
+            s.initializeU();
+            try s.computeResidual(0);
+
+            const ele = &s.quad.ele;
+            for (0..s.n_eles) |e| {
+                for (0..ele.n_spts) |spt| {
+                    for (0..s.n_vars) |n| {
+                        try testing.expectApproxEqAbs(
+                            @as(f64, 0.0),
+                            s.divf_spts.get(0, spt, n, e),
+                            1e-9,
+                        );
+                    }
+                }
+            }
+
+            // And a full step leaves it alone
+            const before = try gpa.dupe(f64, s.u_spts.data);
+            defer gpa.free(before);
+            try s.update();
+            for (before, s.u_spts.data) |a, b| {
+                try testing.expectApproxEqAbs(a, b, 1e-11);
+            }
+        }
+    }
+}
+
+test "a slip wall reflects without generating mass" {
+    const gpa = testing.allocator;
+
+    // Slip walls top and bottom, characteristic in and out: a uniform flow
+    // parallel to the walls must also be preserved exactly.
+    var config = testConfig(3, .euler_ns, false, 4, 4);
+    config.create_mesh.?.xmax = 4.0;
+    config.create_mesh.?.ymax = 4.0;
+    config.create_mesh.?.bc_bottom = .slip_wall;
+    config.create_mesh.?.bc_top = .slip_wall;
+    config.create_mesh.?.bc_left = .characteristic;
+    config.create_mesh.?.bc_right = .characteristic;
+    config.freestream.norm_fs = .{ 1.0, 0.0, 0.0 }; // along the walls
+
+    var mesh = try testMesh(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh);
+    defer s.deinit();
+
+    s.initializeU();
+    try s.computeResidual(0);
+
+    const ele = &s.quad.ele;
+    for (0..s.n_eles) |e| {
+        for (0..ele.n_spts) |spt| {
+            for (0..s.n_vars) |n| {
+                try testing.expectApproxEqAbs(@as(f64, 0.0), s.divf_spts.get(0, spt, n, e), 1e-9);
+            }
+        }
+    }
+}
+
 test "solver requires the global flux point layout" {
     const gpa = testing.allocator;
 
@@ -786,10 +872,17 @@ test "solver requires the global flux point layout" {
     }
 }
 
-test "computeResidual still reports the missing boundary conditions" {
+test "computeResidual and update run end to end" {
     const gpa = testing.allocator;
 
-    var config = testConfig(2, .euler_ns, false, 2, 2);
+    // Characteristic far-field on every side: the whole residual chain now runs,
+    // boundary conditions included.
+    var config = testConfig(2, .euler_ns, false, 3, 3);
+    config.create_mesh.?.bc_bottom = .characteristic;
+    config.create_mesh.?.bc_top = .characteristic;
+    config.create_mesh.?.bc_left = .characteristic;
+    config.create_mesh.?.bc_right = .characteristic;
+
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
@@ -797,12 +890,12 @@ test "computeResidual still reports the missing boundary conditions" {
     defer s.deinit();
     s.initializeU();
 
-    // The element <-> face coupling is real now; what remains is the per-BC
-    // right-hand state.
-    try testing.expect(s.faces.n_gfpts > 0);
     try testing.expect(s.faces.n_gfpts_bnd > 0);
-    try testing.expectError(error.NotImplemented, s.computeResidual(0));
-    try testing.expectError(error.NotImplemented, s.update());
+    try s.computeResidual(0);
+    try s.update();
+
+    try testing.expectEqual(@as(u32, 1), s.current_iter);
+    try testing.expectApproxEqRel(config.time.dt.?, s.flow_time, 1e-14);
 }
 
 test "residualNorm is zero for a zero residual and scales linearly" {
@@ -940,8 +1033,9 @@ test "common solution is single-valued and biased by ldg_b" {
     var f = try testFaces(gpa, &config, 1);
     defer f.deinit();
 
-    f.u.at(0, 0, 0).* = 2.0;
-    f.u.at(1, 0, 0).* = 8.0;
+    // computeCommonU reads u_ldg, which scatterUToFaces fills alongside u
+    f.u_ldg.at(0, 0, 0).* = 2.0;
+    f.u_ldg.at(1, 0, 0).* = 8.0;
     f.computeCommonU();
 
     try testing.expectApproxEqRel(@as(f64, 2.0), f.u_comm.get(0, 0, 0), 1e-12);
@@ -955,32 +1049,237 @@ test "common solution is single-valued and biased by ldg_b" {
     try testing.expectApproxEqRel(@as(f64, 5.0), f.u_comm.get(0, 0, 0), 1e-12);
 }
 
-test "boundary flux points report the missing boundary conditions" {
-    const gpa = testing.allocator;
-    const config = testConfig(2, .euler_ns, true, 2, 2);
-    const params = flux.FlowParams.fromConfig(&config);
-
-    // No boundary points: nothing to do, so both calls succeed
-    {
-        var f = try Faces.init(gpa, &config, params, 4, 0);
-        defer f.deinit();
-        try f.applyBcs();
-        try f.applyBcsGrad();
+/// A `Faces` whose every flux point is a boundary point on boundary 0, with the
+/// given condition and an outward normal along +x.
+fn testBndFaces(
+    gpa: std.mem.Allocator,
+    config: *const cfg.Config,
+    bc: *const [1]cfg.BoundaryCondition,
+    gfpt2bnd: []const usize,
+) !Faces {
+    const params = flux.FlowParams.fromConfig(config);
+    var f = try Faces.init(gpa, config, params, gfpt2bnd.len, gfpt2bnd.len);
+    f.gfpt2bnd = gfpt2bnd;
+    f.bc_list = bc;
+    for (0..f.n_gfpts) |gf| {
+        f.norm.at(0, gf).* = 1.0;
+        f.norm.at(1, gf).* = 0.0;
+        f.d_a.at(0, gf).* = 1.0;
     }
+    return f;
+}
 
-    // With boundary points, the unported BC handling surfaces explicitly rather
-    // than leaving the right-hand state at zero.
-    {
-        var f = try Faces.init(gpa, &config, params, 4, 2);
-        defer f.deinit();
-        try testing.expectError(error.NotImplemented, f.applyBcs());
-        try testing.expectError(error.NotImplemented, f.applyBcsGrad());
+/// Write `state` into the interior (left) side of every flux point.
+fn setLeftState(f: *Faces, state: []const f64) void {
+    for (0..f.n_gfpts) |gf| {
+        for (state, 0..) |v, n| {
+            f.u.at(0, n, gf).* = v;
+            if (f.config.equation.viscous) f.u_ldg.at(0, n, gf).* = v;
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Metric terms
-// ---------------------------------------------------------------------------
+test "sup_out extrapolates, sup_in imposes the freestream" {
+    const gpa = testing.allocator;
+    const config = testConfig(2, .euler_ns, false, 2, 2);
+    const params = flux.FlowParams.fromConfig(&config);
+    const u_fs = params.freestreamState(2, .euler_ns);
+    const interior = [4]f64{ 1.3, 0.4, -0.2, 3.1 };
+
+    {
+        var f = try testBndFaces(gpa, &config, &.{.sup_out}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &interior);
+        try f.applyBcs();
+        for (0..4) |n| try testing.expectApproxEqRel(interior[n], f.u.get(1, n, 0), 1e-14);
+    }
+
+    {
+        var f = try testBndFaces(gpa, &config, &.{.sup_in}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &interior);
+        try f.applyBcs();
+        for (0..4) |n| try testing.expectApproxEqAbs(u_fs[n], f.u.get(1, n, 0), 1e-14);
+    }
+}
+
+test "slip wall is impermeable" {
+    const gpa = testing.allocator;
+    const config = testConfig(2, .euler_ns, false, 2, 2);
+
+    for ([_]cfg.BoundaryCondition{ .slip_wall, .symmetry }) |bc| {
+        var f = try testBndFaces(gpa, &config, &.{bc}, &.{0});
+        defer f.deinit();
+
+        const interior = [4]f64{ 1.3, 0.4, -0.2, 3.1 };
+        setLeftState(&f, &interior);
+        try f.applyBcs();
+
+        // Normal momentum reflected, tangential kept, density and energy alike
+        try testing.expectApproxEqRel(interior[0], f.u.get(1, 0, 0), 1e-14);
+        try testing.expectApproxEqRel(-interior[1], f.u.get(1, 1, 0), 1e-14);
+        try testing.expectApproxEqRel(interior[2], f.u.get(1, 2, 0), 1e-14);
+        try testing.expectApproxEqRel(interior[3], f.u.get(1, 3, 0), 1e-14);
+
+        // The physical requirement: no mass crosses the wall. Pressure still
+        // acts on it, so the normal momentum flux must not vanish.
+        f.computeCommonF();
+        try testing.expectApproxEqAbs(@as(f64, 0.0), f.f_comm.get(0, 0, 0), 1e-14);
+        try testing.expect(@abs(f.f_comm.get(0, 1, 0)) > 1e-3);
+    }
+}
+
+test "characteristic far-field preserves the freestream exactly" {
+    const gpa = testing.allocator;
+    const config = testConfig(2, .euler_ns, false, 2, 2);
+    const params = flux.FlowParams.fromConfig(&config);
+    const u_fs = params.freestreamState(2, .euler_ns);
+
+    // The property free-stream preservation depends on: if the interior state
+    // already is the freestream, the Riemann invariants must return it unchanged
+    // whichever way the boundary faces.
+    for ([_][2]f64{ .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 }, .{ 0.6, -0.8 } }) |n| {
+        var f = try testBndFaces(gpa, &config, &.{.characteristic}, &.{0});
+        defer f.deinit();
+        f.norm.at(0, 0).* = n[0];
+        f.norm.at(1, 0).* = n[1];
+
+        setLeftState(&f, &u_fs);
+        try f.applyBcs();
+
+        for (0..4) |v| try testing.expectApproxEqAbs(u_fs[v], f.u.get(1, v, 0), 1e-12);
+    }
+}
+
+test "characteristic far-field lets an outgoing perturbation leave" {
+    const gpa = testing.allocator;
+    const config = testConfig(2, .euler_ns, false, 2, 2);
+    const params = flux.FlowParams.fromConfig(&config);
+    var u_fs = params.freestreamState(2, .euler_ns);
+
+    // Outflow (normal along the flow): the boundary state should track the
+    // interior, not snap back to the freestream.
+    var f = try testBndFaces(gpa, &config, &.{.characteristic}, &.{0});
+    defer f.deinit();
+
+    u_fs[0] *= 1.05; // denser than freestream
+    setLeftState(&f, &u_fs);
+    try f.applyBcs();
+
+    const rho_r = f.u.get(1, 0, 0);
+    const rho_ref = params.freestreamState(2, .euler_ns)[0];
+    try testing.expect(rho_r > rho_ref);
+}
+
+test "no-slip walls prescribe the wall state and reflect for the Riemann solve" {
+    const gpa = testing.allocator;
+    var config = testConfig(2, .euler_ns, true, 2, 2);
+    config.wall_conditions.mach_wall = 0.0; // stationary wall
+    const params = flux.FlowParams.fromConfig(&config);
+
+    const rho: f64 = 1.2;
+    const interior = [4]f64{ rho, rho * 0.3, rho * -0.1, 3.0 };
+
+    {
+        var f = try testBndFaces(gpa, &config, &.{.isothermal_noslip}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &interior);
+        try f.applyBcs();
+
+        // Ghost state: velocity reversed so the average is zero
+        try testing.expectApproxEqRel(rho, f.u.get(1, 0, 0), 1e-14);
+        try testing.expectApproxEqRel(-interior[1], f.u.get(1, 1, 0), 1e-13);
+        try testing.expectApproxEqRel(-interior[2], f.u.get(1, 2, 0), 1e-13);
+
+        // Prescribed state: at rest, at the wall temperature
+        try testing.expectApproxEqAbs(@as(f64, 0.0), f.u_ldg.get(1, 1, 0), 1e-14);
+        try testing.expectApproxEqAbs(@as(f64, 0.0), f.u_ldg.get(1, 2, 0), 1e-14);
+        const cv_t = params.r_ref / (params.gamma - 1.0) * params.t_wall;
+        try testing.expectApproxEqRel(rho * cv_t, f.u_ldg.get(1, 3, 0), 1e-12);
+    }
+
+    {
+        var f = try testBndFaces(gpa, &config, &.{.adiabatic_noslip}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &interior);
+        try f.applyBcs();
+
+        try testing.expectApproxEqRel(-interior[1], f.u.get(1, 1, 0), 1e-13);
+        try testing.expectApproxEqAbs(@as(f64, 0.0), f.u_ldg.get(1, 1, 0), 1e-14);
+
+        // Energy is extrapolated, not prescribed: the ghost state keeps the
+        // interior's kinetic energy, the prescribed one has none.
+        try testing.expectApproxEqRel(interior[3], f.u.get(1, 3, 0), 1e-13);
+        const ke = 0.5 * (interior[1] * interior[1] + interior[2] * interior[2]) / rho;
+        try testing.expectApproxEqRel(interior[3] - ke, f.u_ldg.get(1, 3, 0), 1e-12);
+    }
+}
+
+test "adiabatic wall removes the normal temperature gradient" {
+    const gpa = testing.allocator;
+    const config = testConfig(2, .euler_ns, true, 2, 2);
+
+    var f = try testBndFaces(gpa, &config, &.{.adiabatic_noslip}, &.{0});
+    defer f.deinit();
+
+    const rho: f64 = 1.0;
+    setLeftState(&f, &.{ rho, 0.0, 0.0, 2.5 });
+
+    // A purely wall-normal energy gradient, no density or momentum gradient.
+    // With the velocity zero this is entirely a temperature gradient, so the
+    // boundary must cancel it.
+    f.du.at(0, 0, 3, 0).* = 1.0;
+    try f.applyBcsGrad();
+
+    try testing.expectApproxEqAbs(@as(f64, 0.0), f.du.get(1, 0, 3, 0), 1e-13);
+    // Density gradient is extrapolated untouched
+    try testing.expectApproxEqAbs(@as(f64, 0.0), f.du.get(1, 0, 0, 0), 1e-14);
+
+    // A purely *tangential* energy gradient carries no heat through the wall,
+    // so it must survive.
+    @memset(f.du.data, 0.0);
+    f.du.at(0, 1, 3, 0).* = 1.0;
+    try f.applyBcsGrad();
+    try testing.expectApproxEqRel(@as(f64, 1.0), f.du.get(1, 1, 3, 0), 1e-13);
+}
+
+test "unsupported and unmatched boundaries are reported" {
+    const gpa = testing.allocator;
+
+    // Periodic faces need processPeriodicBoundaries, which is not ported
+    {
+        const config = testConfig(2, .euler_ns, false, 2, 2);
+        var f = try testBndFaces(gpa, &config, &.{.periodic}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &.{ 1.0, 0.1, 0.0, 2.0 });
+        try testing.expectError(error.UnsupportedBoundaryCondition, f.applyBcs());
+    }
+
+    // A boundary face that matched no declared boundary
+    {
+        const config = testConfig(2, .euler_ns, false, 2, 2);
+        var f = try testBndFaces(gpa, &config, &.{.sup_out}, &.{geo_mod.none});
+        defer f.deinit();
+        setLeftState(&f, &.{ 1.0, 0.1, 0.0, 2.0 });
+        try testing.expectError(error.UnmatchedBoundaryFace, f.applyBcs());
+    }
+
+    // A no-slip wall needs a viscous run, a slip wall an inviscid one
+    {
+        const config = testConfig(2, .euler_ns, false, 2, 2);
+        var f = try testBndFaces(gpa, &config, &.{.adiabatic_noslip}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &.{ 1.0, 0.1, 0.0, 2.0 });
+        try testing.expectError(error.WallConditionMismatch, f.applyBcs());
+    }
+    {
+        const config = testConfig(2, .euler_ns, true, 2, 2);
+        var f = try testBndFaces(gpa, &config, &.{.slip_wall}, &.{0});
+        defer f.deinit();
+        setLeftState(&f, &.{ 1.0, 0.1, 0.0, 2.0 });
+        try testing.expectError(error.WallConditionMismatch, f.applyBcs());
+    }
+}
 
 test "the metric adjugate satisfies adj . jaco = |J| I" {
     const gpa = testing.allocator;

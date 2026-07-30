@@ -59,10 +59,17 @@ which remains the reference the GPU path is checked against.
 ./zig-out/bin/flurry --gpu samples/vortex.cfg.ziggy
 ```
 
-Ported so far: `extrapolateU`. It is *slower* than the CPU at the moment,
-because each dispatch copies its operands in and out — the solver's arrays are
-still ordinary host allocations. Moving them into device-visible memory is the
-next step and removes the copies rather than optimizing them.
+Ported so far: `extrapolateU`. Its operands are device-resident, so a dispatch
+binds them where they lie — nothing is copied. Because that memory is
+host-mapped, every un-ported operation still reads and writes it as an ordinary
+slice, which is what lets the port advance one operator at a time.
+
+It is still *slower* than the CPU, and for a reason worth knowing: Spock asks
+for `host_visible | host_coherent` and takes the first matching memory type,
+which on the test hardware is an uncached (write-combined) one. CPU reads from it
+measured **25× slower** than from an ordinary allocation, even though a
+`host_cached` type was available one index later. So an array is only moved into
+device memory when the operator that binds it moves too.
 
 Everything is f64. A device without `shaderFloat64` will not run this.
 

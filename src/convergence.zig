@@ -187,7 +187,7 @@ fn runCase(
     var config = studyConfig(study, order, n, dt, n_steps);
 
     var run: Run = undefined;
-    try run.init(gpa, io, &config);
+    try run.init(gpa, io, &config, .{});
     defer run.deinit();
 
     // Driven directly rather than through `Run.run`, so the loop stops on

@@ -11,10 +11,10 @@
 //! all, and this will refuse to run on those -- which is the right trade for a
 //! solver whose accuracy claims are the point.
 //!
-//! State of the port: `Solver.extrapolateU` only, and it still copies its
-//! operands in and out around every dispatch. That cost exists solely because
-//! the solver's arrays are ordinary host allocations; moving them into
-//! device-visible memory is the next step and deletes the copies outright.
+//! State of the port: `Solver.extrapolateU`. Its operands are already on the
+//! device -- the solver allocates its arrays through `Heap`, so a dispatch binds
+//! them where they lie rather than copying them in and out. `gemmHost` still
+//! exists for callers holding ordinary host memory.
 
 const std = @import("std");
 const spock = @import("spock");
@@ -32,6 +32,9 @@ pub const Error = error{
     DeviceFailure,
     OutOfMemory,
 };
+
+/// A device buffer handle, as a dispatch binds it.
+pub const Buffer = spock.vk.Buffer;
 
 /// Whether a product overwrites its destination or accumulates into it,
 /// matching the CPU `gemm`'s `Mode`.
@@ -105,12 +108,53 @@ pub const Device = struct {
         return d.ctx.deviceName();
     }
 
-    /// `C = A*B`, or `C += A*B`, over host slices: the GPU counterpart of the
-    /// solver's `gemm`, with the same argument order.
+    /// `C = A*B`, or `C += A*B`, over buffers that are already on the device:
+    /// the GPU counterpart of the solver's `gemm`, with the same argument order.
     ///
     /// `A` is (m, k), `B` is (k, n), `C` is (m, n), all row-major and densely
-    /// packed. The operands are copied into device-visible staging around the
-    /// dispatch, which is the whole per-call overhead of this first step.
+    /// packed. Nothing is copied -- this is what allocating the solver's arrays
+    /// through `Heap` buys.
+    pub fn gemm(
+        d: *Device,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: spock.vk.Buffer,
+        b: spock.vk.Buffer,
+        c: spock.vk.Buffer,
+        mode: Mode,
+    ) Error!void {
+        if (m == 0 or n == 0 or k == 0) return;
+
+        const pc: dgemm.PushConstants = .{
+            .M = @intCast(m),
+            .K = @intCast(k),
+            .N = @intCast(n),
+            .alpha = 1.0,
+            .beta = if (mode == .accumulate) 1.0 else 0.0,
+        };
+
+        // One thread per output element
+        const threads: u32 = @intCast(m * n);
+        const groups = std.math.divCeil(u32, threads, dgemm.WgSize.x) catch unreachable;
+
+        d.dgemm_kernel.dispatch(.{
+            .buffers = &.{ a, b, c },
+            .push_constant = std.mem.asBytes(&pc),
+            .groups = .{ groups, 1, 1 },
+        }) catch |err| return translate(err, "dispatching dgemm");
+
+        // `dispatch` submits without blocking; the results are not there until
+        // the fence clears.
+        d.ctx.wait() catch |err| return translate(err, "waiting on dgemm");
+    }
+
+    /// The same product over ordinary host slices, staged in and out around the
+    /// dispatch.
+    ///
+    /// Only for callers whose data is not already device-resident; the solver's
+    /// own arrays are, and use `gemm`. The staging buffers are grown on demand
+    /// and reused.
     pub fn gemmHost(
         d: *Device,
         m: usize,
@@ -136,27 +180,7 @@ pub const Device = struct {
         // worth uploading.
         if (mode == .accumulate) c_buf.copyFromHost(c[0 .. m * n]);
 
-        const pc: dgemm.PushConstants = .{
-            .M = @intCast(m),
-            .K = @intCast(k),
-            .N = @intCast(n),
-            .alpha = 1.0,
-            .beta = if (mode == .accumulate) 1.0 else 0.0,
-        };
-
-        // One thread per output element
-        const threads: u32 = @intCast(m * n);
-        const groups = std.math.divCeil(u32, threads, dgemm.WgSize.x) catch unreachable;
-
-        d.dgemm_kernel.dispatch(.{
-            .buffers = &.{ a_buf.raw(), b_buf.raw(), c_buf.raw() },
-            .push_constant = std.mem.asBytes(&pc),
-            .groups = .{ groups, 1, 1 },
-        }) catch |err| return translate(err, "dispatching dgemm");
-
-        // `dispatch` submits without blocking; the results are not there until
-        // the fence clears.
-        d.ctx.wait() catch |err| return translate(err, "waiting on dgemm");
+        try d.gemm(m, n, k, a_buf.raw(), b_buf.raw(), c_buf.raw(), mode);
 
         c_buf.copyToHost(c[0 .. m * n]);
     }
@@ -195,3 +219,136 @@ fn translate(err: anyerror, doing: []const u8) Error {
         },
     };
 }
+
+/// A `std.mem.Allocator` whose allocations live in device-visible memory.
+///
+/// The memory is host-coherent and persistently mapped, so what comes back is an
+/// ordinary slice: operations still running on the CPU keep writing it directly
+/// while ported ones read the same bytes on the device. That is the whole point
+/// -- it is what lets the port proceed one operator at a time instead of all at
+/// once.
+///
+/// Every allocation is its own Vulkan buffer, because spock binds descriptors
+/// with `offset = 0, range = WHOLE_SIZE` and gives no way to point at part of
+/// one. That makes this the wrong tool for many small allocations and the right
+/// one for the handful of large solver arrays it holds.
+///
+/// Beware what this costs the CPU. spock asks for `host_visible | host_coherent`
+/// and takes the first memory type that matches, which on this hardware is an
+/// *uncached* (write-combined) one -- CPU reads from it measured 25x slower than
+/// from an ordinary allocation, even though a `host_cached` type was available
+/// one index later. Until spock prefers the cached type, every un-ported
+/// operation that reads a resident array pays that, so an array should move
+/// across only when the operator that binds it does.
+pub const Heap = struct {
+    dev: *Device,
+    /// For the bookkeeping list only; the blocks themselves are device memory
+    gpa: std.mem.Allocator,
+    blocks: std.ArrayList(Block),
+
+    const Block = struct {
+        ptr: [*]u8,
+        len: usize,
+        buf: spock.Buffer(u8),
+    };
+
+    pub fn init(dev: *Device, gpa: std.mem.Allocator) Heap {
+        return .{ .dev = dev, .gpa = gpa, .blocks = .empty };
+    }
+
+    pub fn deinit(h: *Heap) void {
+        for (h.blocks.items) |b| b.buf.deinit();
+        h.blocks.deinit(h.gpa);
+    }
+
+    pub fn allocator(h: *Heap) std.mem.Allocator {
+        return .{
+            .ptr = h,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    /// The buffer holding `ptr`, or null if it did not come from here.
+    ///
+    /// A linear scan over a handful of blocks, and only when a dispatch is being
+    /// recorded, so there is nothing to gain from an index.
+    pub fn bufferFor(h: *const Heap, ptr: *const anyopaque) ?spock.vk.Buffer {
+        const addr = @intFromPtr(ptr);
+        for (h.blocks.items) |b| {
+            const base = @intFromPtr(b.ptr);
+            if (addr >= base and addr < base + b.len) return b.buf.raw();
+        }
+        return null;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        const h: *Heap = @ptrCast(@alignCast(ctx));
+
+        h.blocks.ensureUnusedCapacity(h.gpa, 1) catch return null;
+        const buf = spock.Buffer(u8).create(h.dev.ctx, len) catch return null;
+
+        // A mapped Vulkan allocation starts at the base of its own memory
+        // object, so it is aligned far past anything an f64 array asks for --
+        // but say so rather than assume it.
+        const ptr = @as([*]u8, @ptrCast(buf.ptr));
+        if (!alignment.check(@intFromPtr(ptr))) {
+            buf.deinit();
+            return null;
+        }
+
+        h.blocks.appendAssumeCapacity(.{ .ptr = ptr, .len = len, .buf = buf });
+        return ptr;
+    }
+
+    /// Never in place: a block is a whole Vulkan buffer, and growing one means
+    /// a new allocation and a new descriptor. The solver never resizes these.
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+        const h: *Heap = @ptrCast(@alignCast(ctx));
+        for (h.blocks.items, 0..) |b, i| {
+            if (b.ptr != memory.ptr) continue;
+            b.buf.deinit();
+            _ = h.blocks.swapRemove(i);
+            return;
+        }
+        unreachable; // freed something this heap never handed out
+    }
+};
+
+/// A standalone device buffer holding a copy of host data.
+///
+/// For the reference-element operators: they are constant for the whole run and
+/// tiny -- an order-3 quad's `oppE` is 16x16 -- so uploading a copy at setup is
+/// cheaper than routing `Element`'s allocations through a `Heap` would be
+/// invasive.
+pub const Array = struct {
+    buf: spock.Buffer(f64),
+
+    pub fn upload(d: *Device, src: []const f64) Error!Array {
+        const buf = spock.Buffer(f64).create(d.ctx, src.len) catch |err| {
+            return translate(err, "allocating a device array");
+        };
+        buf.copyFromHost(src);
+        return .{ .buf = buf };
+    }
+
+    pub fn raw(a: Array) spock.vk.Buffer {
+        return a.buf.raw();
+    }
+
+    pub fn deinit(a: *Array) void {
+        a.buf.deinit();
+    }
+};

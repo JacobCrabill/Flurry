@@ -274,7 +274,7 @@ test "transforms on a uniform Cartesian mesh" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     const ele = &s.quad.ele;
@@ -328,7 +328,7 @@ test "face normals and areas" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     const ele = &s.quad.ele;
@@ -376,7 +376,7 @@ test "solver rejects meshes it has no element for" {
         config.core.n_dims = 3;
         var mesh = try testMesh(gpa, &config);
         defer mesh.deinit();
-        try testing.expectError(error.UnsupportedDimension, Solver.init(gpa, &config, &mesh));
+        try testing.expectError(error.UnsupportedDimension, Solver.init(gpa, &config, &mesh, .{}));
     }
 
     // Triangles have no element type yet either
@@ -385,7 +385,7 @@ test "solver rejects meshes it has no element for" {
         var mesh = try testMesh(gpa, &config);
         defer mesh.deinit();
         mesh.ctype.items[0] = .tri;
-        try testing.expectError(error.UnsupportedCellType, Solver.init(gpa, &config, &mesh));
+        try testing.expectError(error.UnsupportedCellType, Solver.init(gpa, &config, &mesh, .{}));
     }
 }
 
@@ -440,7 +440,7 @@ test "uniform flow has exactly zero residual" {
             var mesh = try testMesh(gpa, &config);
             defer mesh.deinit();
 
-            var s = try Solver.init(gpa, &config, &mesh);
+            var s = try Solver.init(gpa, &config, &mesh, .{});
             defer s.deinit();
 
             try s.initializeU();
@@ -476,7 +476,7 @@ test "linear flow reproduces its analytic divergence" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     const ele = &s.quad.ele;
@@ -513,7 +513,7 @@ test "extrapolateU matches applying oppE by hand" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     const ele = &s.quad.ele;
@@ -572,7 +572,7 @@ test "RK stages integrate du/dt = -c exactly" {
         var mesh = try testMesh(gpa, &config);
         defer mesh.deinit();
 
-        var s = try Solver.init(gpa, &config, &mesh);
+        var s = try Solver.init(gpa, &config, &mesh, .{});
         defer s.deinit();
 
         const ele = &s.quad.ele;
@@ -670,7 +670,7 @@ test "the two sides of every interface meet at the same point" {
         var mesh = try testMesh(gpa, &config);
         defer mesh.deinit();
 
-        var s = try Solver.init(gpa, &config, &mesh);
+        var s = try Solver.init(gpa, &config, &mesh, .{});
         defer s.deinit();
 
         try testing.expect(s.fptPairingError() < 1e-13);
@@ -684,7 +684,7 @@ test "faces receive their geometry from the elements" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     // Every gfpt got a unit normal and a positive face scaling on both sides
@@ -720,7 +720,7 @@ test "free-stream is preserved on cells away from the boundary" {
             var mesh = try testMesh(gpa, &config);
             defer mesh.deinit();
 
-            var s = try Solver.init(gpa, &config, &mesh);
+            var s = try Solver.init(gpa, &config, &mesh, .{});
             defer s.deinit();
 
             try s.initializeU();
@@ -808,7 +808,7 @@ test "periodic pairing wraps opposite sides of the domain" {
     var mesh = try testMeshPeriodic(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     const lx = config.create_mesh.?.xmax - config.create_mesh.?.xmin;
@@ -845,7 +845,7 @@ test "free-stream is preserved on a periodic mesh" {
             var mesh = try testMeshPeriodic(gpa, &config);
             defer mesh.deinit();
 
-            var s = try Solver.init(gpa, &config, &mesh);
+            var s = try Solver.init(gpa, &config, &mesh, .{});
             defer s.deinit();
 
             try s.initializeU();
@@ -878,7 +878,7 @@ test "a periodic mesh conserves mass exactly" {
     var mesh = try testMeshPeriodic(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     // A non-uniform state, so the fluxes are genuinely doing something
@@ -983,7 +983,7 @@ test "a direction is only periodic if its boundary faces say so" {
     }
 
     // And the solver still preserves free-stream across the wrap
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     try testing.expect(s.fptPairingErrorPeriodic() < 1e-12);
@@ -1024,7 +1024,7 @@ test "free-stream is preserved over the whole domain" {
                 try testMesh(gpa, &config);
             defer mesh.deinit();
 
-            var s = try Solver.init(gpa, &config, &mesh);
+            var s = try Solver.init(gpa, &config, &mesh, .{});
             defer s.deinit();
 
             try s.initializeU();
@@ -1071,7 +1071,7 @@ test "a slip wall reflects without generating mass" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     try s.initializeU();
@@ -1098,7 +1098,7 @@ test "solver requires the global flux point layout" {
         defer mesh.deinit();
         try mesh.createMesh();
         try mesh.processConnectivity();
-        try testing.expectError(error.ConnectivityNotProcessed, Solver.init(gpa, &config, &mesh));
+        try testing.expectError(error.ConnectivityNotProcessed, Solver.init(gpa, &config, &mesh, .{}));
     }
 
     // Laid out for the wrong order
@@ -1108,7 +1108,7 @@ test "solver requires the global flux point layout" {
         try mesh.createMesh();
         try mesh.processConnectivity();
         try mesh.setupGlobalFpts(7);
-        try testing.expectError(error.ConnectivityNotProcessed, Solver.init(gpa, &config, &mesh));
+        try testing.expectError(error.ConnectivityNotProcessed, Solver.init(gpa, &config, &mesh, .{}));
     }
 
     // And it cannot be built before the connectivity exists
@@ -1134,7 +1134,7 @@ test "computeResidual and update run end to end" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
     try s.initializeU();
 
@@ -1153,7 +1153,7 @@ test "residualNorm is zero for a zero residual and scales linearly" {
     var mesh = try testMesh(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     var norms: [1]f64 = undefined;
@@ -1547,7 +1547,7 @@ test "the metric adjugate satisfies adj . jaco = |J| I" {
     var mesh = try testMeshDistorted(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     const ele = &s.quad.ele;
@@ -1582,7 +1582,7 @@ test "free-stream is preserved on a non-affine mesh" {
             var mesh = try testMeshDistorted(gpa, &config);
             defer mesh.deinit();
 
-            var s = try Solver.init(gpa, &config, &mesh);
+            var s = try Solver.init(gpa, &config, &mesh, .{});
             defer s.deinit();
 
             // Without these two properties the test proves nothing:
@@ -1648,7 +1648,7 @@ test "interfaces pair up on a non-affine mesh" {
     var mesh = try testMeshDistorted(gpa, &config);
     defer mesh.deinit();
 
-    var s = try Solver.init(gpa, &config, &mesh);
+    var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
     try testing.expect(s.fptPairingError() < 1e-12);

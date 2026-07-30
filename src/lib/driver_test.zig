@@ -55,7 +55,7 @@ test "a run builds its mesh and solver from the config alone" {
     const config = testConfig(3, 4, 4, 0, 1e-3);
 
     var r: Run = undefined;
-    try r.init(testing.allocator, testing.io, &config);
+    try r.init(testing.allocator, testing.io, &config, .{});
     defer r.deinit();
 
     // The mesh came from `create_mesh`, and it is periodic, so it has no
@@ -72,7 +72,7 @@ test "the time loop advances the solver by n_steps" {
     const config = testConfig(2, 4, 4, 7, 1e-3);
 
     var r: Run = undefined;
-    try r.init(testing.allocator, testing.io, &config);
+    try r.init(testing.allocator, testing.io, &config, .{});
     defer r.deinit();
 
     try runQuiet(&r);
@@ -91,7 +91,7 @@ test "free-stream survives a whole time integration" {
     const config = testConfig(3, 5, 5, 100, 1e-3);
 
     var r: Run = undefined;
-    try r.init(gpa, testing.io, &config);
+    try r.init(gpa, testing.io, &config, .{});
     defer r.deinit();
 
     const s = &r.solver;
@@ -115,7 +115,7 @@ test "the run reports what it set up and how it stopped" {
     const config = testConfig(2, 4, 4, 4, 1e-3);
 
     var r: Run = undefined;
-    try r.init(gpa, testing.io, &config);
+    try r.init(gpa, testing.io, &config, .{});
     defer r.deinit();
 
     var out: Io.Writer.Allocating = .init(gpa);
@@ -144,7 +144,7 @@ test "a run with no time step is rejected" {
     const config = testConfig(2, 4, 4, 10, null);
 
     var r: Run = undefined;
-    try testing.expectError(error.NoTimeStep, r.init(testing.allocator, testing.io, &config));
+    try testing.expectError(error.NoTimeStep, r.init(testing.allocator, testing.io, &config, .{}));
 }
 
 test "res_tol stops the run before n_steps" {
@@ -159,7 +159,7 @@ test "res_tol stops the run before n_steps" {
     config.output.report_freq = 1;
 
     var r: Run = undefined;
-    try r.init(gpa, testing.io, &config);
+    try r.init(gpa, testing.io, &config, .{});
     defer r.deinit();
 
     var out: Io.Writer.Allocating = .init(gpa);
@@ -177,7 +177,7 @@ test "tfinal stops the run before n_steps" {
     config.time.tfinal = 5e-3;
 
     var r: Run = undefined;
-    try r.init(gpa, testing.io, &config);
+    try r.init(gpa, testing.io, &config, .{});
     defer r.deinit();
 
     var out: Io.Writer.Allocating = .init(gpa);
@@ -198,7 +198,7 @@ test "a diverging run fails instead of returning a NaN solution" {
     config.output.report_freq = 1;
 
     var r: Run = undefined;
-    try r.init(gpa, testing.io, &config);
+    try r.init(gpa, testing.io, &config, .{});
     defer r.deinit();
 
     var out: Io.Writer.Allocating = .init(gpa);

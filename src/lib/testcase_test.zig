@@ -146,7 +146,7 @@ test "l2Error is zero when the solution is the exact one" {
     const config = testConfig(5, 8, 2, .adv_diff, 1.0);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     try testing.expect(try run.solver.l2Error(gpa) < 1e-7);
@@ -160,7 +160,7 @@ test "l2Error measures the size of a deliberate offset" {
     const config = testConfig(3, 4, 2, .adv_diff, 1.0);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     const s = &run.solver;
@@ -180,7 +180,7 @@ test "a case with no exact solution says so" {
     const config = testConfig(2, 4, 0, .euler_ns, 1.0);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     try testing.expectError(error.NoExactSolution, run.solver.l2Error(gpa));
@@ -195,7 +195,7 @@ test "measuring error without a quadrature rule says so" {
     config.test_case.n_qpts_1d = 0;
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     try testing.expectError(error.NoQuadraturePoints, run.solver.l2Error(gpa));
@@ -234,7 +234,7 @@ test "the scheme converges at its design order" {
             config.time.n_steps = n_steps;
 
             var run: driver.Run = undefined;
-            try run.init(gpa, testing.io, &config);
+            try run.init(gpa, testing.io, &config, .{});
             defer run.deinit();
 
             for (0..n_steps) |_| try run.solver.update();

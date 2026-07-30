@@ -63,17 +63,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var run: Run = undefined;
-    run.init(gpa, io, &pc.value) catch |err| {
+    run.init(gpa, io, &pc.value, .{ .device = if (device) |*d| d else null }) catch |err| {
         try stderr.interface.print("setup failed: {t}\n", .{err});
         try stderr.interface.flush();
         return err;
     };
     defer run.deinit();
 
-    if (device) |*d| {
-        run.solver.device = d;
-        try stdout.interface.print("\n device    {s}\n", .{d.name()});
-    }
+    if (device) |*d| try stdout.interface.print("\n device    {s}\n", .{d.name()});
 
     try run.run(&stdout.interface);
 }

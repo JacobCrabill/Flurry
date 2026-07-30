@@ -22,7 +22,7 @@ pub const Error = error{
 /// value, which makes that constraint impossible to get wrong:
 ///
 ///     var run: Run = undefined;
-///     try run.init(gpa, io, &parsed.value);
+///     try run.init(gpa, io, &parsed.value, .{});
 ///     defer run.deinit();
 ///     try run.run(&stdout.interface);
 pub const Run = struct {
@@ -37,11 +37,22 @@ pub const Run = struct {
     /// Whether the "no exact solution" notice has already been printed
     warned_no_error: bool = false,
 
+    pub const Options = struct {
+        /// Run the ported operators on this device. Must outlive the run.
+        device: ?*gpu.Device = null,
+    };
+
     /// Build the mesh, set up the solver and apply the initial condition.
     ///
     /// `config` must outlive the run: the solver keeps a pointer to it, and the
     /// mesh's shallow copy still has slices pointing into the config's arena.
-    pub fn init(r: *Run, gpa: std.mem.Allocator, io: Io, config: *const cfg.Config) !void {
+    pub fn init(
+        r: *Run,
+        gpa: std.mem.Allocator,
+        io: Io,
+        config: *const cfg.Config,
+        opts: Options,
+    ) !void {
         // Nothing to fall back on: a CFL-derived step size is not ported yet, and
         // a dt of zero would step forever without advancing.
         if (config.time.dt == null) return error.NoTimeStep;
@@ -65,7 +76,7 @@ pub const Run = struct {
         try r.mesh.processConnectivity();
         try r.mesh.setupGlobalFpts(@as(usize, config.core.order) + 1);
 
-        r.solver = try Solver.init(gpa, config, &r.mesh);
+        r.solver = try Solver.init(gpa, config, &r.mesh, .{ .device = opts.device });
         try r.solver.initializeU();
     }
 
@@ -311,4 +322,5 @@ const Io = std.Io;
 const cfg = @import("config.zig");
 const Geo = @import("geo.zig").Geo;
 const Solver = @import("solver.zig").Solver;
+const gpu = @import("gpu.zig");
 const vtu = @import("vtu.zig");

@@ -98,6 +98,52 @@ pub const RkScheme = struct {
     }
 };
 
+/// The device-side half of a solver: the device, the heap its solution arrays
+/// are cut from, and device copies of the reference-element operators.
+///
+/// Heap-allocated because `Heap.allocator()` captures the heap's address and a
+/// `Solver` is returned by value from `init`.
+const GpuState = struct {
+    gpa: std.mem.Allocator,
+    dev: *gpu.Device,
+    heap: gpu.Heap,
+
+    /// `oppE`. Operators are constant for the whole run and tiny -- an order-3
+    /// quad's is 16x16 -- so a copy uploaded once beats routing `Element`'s
+    /// allocations through the heap.
+    opp_e: gpu.Array,
+
+    fn create(gpa: std.mem.Allocator, dev: *gpu.Device, ele: *const Element) Error!*GpuState {
+        const g = try gpa.create(GpuState);
+        errdefer gpa.destroy(g);
+
+        g.* = .{ .gpa = gpa, .dev = dev, .heap = .init(dev, gpa), .opp_e = undefined };
+        errdefer g.heap.deinit();
+
+        g.opp_e = try gpu.Array.upload(dev, ele.oppE.data);
+        return g;
+    }
+
+    fn destroy(g: *GpuState) void {
+        const gpa = g.gpa;
+        g.opp_e.deinit();
+        g.heap.deinit();
+        gpa.destroy(g);
+    }
+
+    /// The device buffer a solver array lives in.
+    ///
+    /// Every array a dispatch binds is allocated from `heap`; one that is not is
+    /// a bug in `allocate` rather than a runtime condition, so this says so
+    /// instead of quietly falling back to a copy.
+    fn bufferFor(g: *const GpuState, data: []const f64) Error!gpu.Buffer {
+        return g.heap.bufferFor(data.ptr) orelse {
+            std.debug.print("gpu: solver array at {*} is not device memory\n", .{data.ptr});
+            return error.DeviceFailure;
+        };
+    }
+};
+
 pub const Solver = struct {
     gpa: std.mem.Allocator,
     config: *const cfg.Config,
@@ -119,11 +165,10 @@ pub const Solver = struct {
     flow_time: f64 = 0.0,
     dt: f64 = 0.0,
 
-    /// Optional GPU back end. When set, the operators that have been ported run
-    /// there and the rest stay on the CPU; when null everything is on the CPU,
-    /// which is the reference the GPU path is checked against. Must outlive the
-    /// solver.
-    device: ?*gpu.Device = null,
+    /// Everything the GPU path needs, present exactly when a device was given
+    /// to `init`. When absent every operator runs on the CPU, which stays the
+    /// reference the GPU path is checked against.
+    gpu_state: ?*GpuState = null,
 
     // ---- Solution Variables ----
 
@@ -192,13 +237,20 @@ pub const Solver = struct {
     ///     try mesh.createMesh();            // or readGmsh
     ///     try mesh.processConnectivity();
     ///     try mesh.setupGlobalFpts(config.core.order + 1);
-    ///     var solver = try Solver.init(gpa, &config, &mesh);
+    ///     var solver = try Solver.init(gpa, &config, &mesh, .{});
     ///
     /// `mesh` and `config` must outlive the solver.
+    pub const InitOptions = struct {
+        /// Run the ported operators here, and allocate the solution arrays in
+        /// its memory. Must outlive the solver.
+        device: ?*gpu.Device = null,
+    };
+
     pub fn init(
         gpa: std.mem.Allocator,
         config: *const cfg.Config,
         mesh: *const Geo,
+        opts: InitOptions,
     ) Error!Solver {
         const n_dims: usize = config.core.n_dims;
         if (n_dims != 2) {
@@ -245,6 +297,9 @@ pub const Solver = struct {
         s.faces.gfpt2bnd = mesh.gfpt2bnd.items;
         s.faces.bc_list = mesh.bc_list.items;
 
+        // Before `allocate`, which asks it where the solution arrays go
+        if (opts.device) |dev| s.gpu_state = try GpuState.create(gpa, dev, &s.quad.ele);
+
         try s.allocate();
         try s.computeTransforms();
         s.setFaceGeometry();
@@ -254,10 +309,13 @@ pub const Solver = struct {
 
     pub fn deinit(s: *Solver) void {
         const gpa = s.gpa;
+        // The solution arrays came from `arrayAllocator`, which is the device
+        // heap when there is one; the rest are plain `gpa` allocations.
+        const arr = s.arrayAllocator();
 
-        s.u_spts.deinit(gpa);
+        s.u_spts.deinit(arr);
+        s.u_fpts.deinit(arr);
         s.u_ini.deinit(gpa);
-        s.u_fpts.deinit(gpa);
         s.du_spts.deinit(gpa);
         s.du_fpts.deinit(gpa);
         s.f_spts.deinit(gpa);
@@ -278,6 +336,27 @@ pub const Solver = struct {
 
         s.faces.deinit();
         s.quad.deinit();
+
+        // Last: the heap owns the memory the arrays above were just freed into
+        if (s.gpu_state) |g| g.destroy();
+    }
+
+    /// The device buffer a solver array lives in, or null when there is no
+    /// device or the array is not resident there.
+    ///
+    /// Which arrays are resident is a property of how far the port has got, so
+    /// this is how a test pins it down.
+    pub fn deviceBufferFor(s: *const Solver, data: []const f64) ?gpu.Buffer {
+        const g = s.gpu_state orelse return null;
+        return g.heap.bufferFor(data.ptr);
+    }
+
+    /// Where the arrays a dispatch binds come from: device-visible memory when
+    /// there is a device, the ordinary allocator otherwise. Either way it is a
+    /// plain slice, which is what lets un-ported operations keep using it.
+    fn arrayAllocator(s: *Solver) std.mem.Allocator {
+        if (s.gpu_state) |g| return g.heap.allocator();
+        return s.gpa;
     }
 
     fn allocate(s: *Solver) Error!void {
@@ -287,8 +366,13 @@ pub const Solver = struct {
         const ne = s.n_eles;
         const nd = s.n_dims;
 
-        s.u_spts = try Array3(f64).init(gpa, ele.n_spts, nv, ne);
-        s.u_fpts = try Array3(f64).init(gpa, ele.n_fpts, nv, ne);
+        // An array moves into device memory when the operator that binds it
+        // does, and not before: on a discrete GPU this memory is across PCIe,
+        // so anything still read on the CPU is better left where it is.
+        const dev = s.arrayAllocator();
+
+        s.u_spts = try Array3(f64).init(dev, ele.n_spts, nv, ne);
+        s.u_fpts = try Array3(f64).init(dev, ele.n_fpts, nv, ne);
         s.f_spts = try Array4(f64).init(gpa, nd, ele.n_spts, nv, ne);
         s.f_comm = try Array3(f64).init(gpa, ele.n_fpts, nv, ne);
         s.divf_spts = try Array4(f64).init(gpa, s.rk.n_stages, ele.n_spts, nv, ne);
@@ -653,20 +737,21 @@ pub const Solver = struct {
 
     /// U at the solution points -> U at the flux points.
     ///
-    /// The first operator to have a GPU path: with `device` set it dispatches
-    /// spock's dgemm instead of running `gemm` here. Everything else in the
-    /// step still runs on the CPU, which works only because the device copies
-    /// its operands in and out around the dispatch -- see `gpu.zig`.
+    /// The first operator to have a GPU path: with a device it dispatches
+    /// spock's dgemm instead of running `gemm` here. Both operands are already
+    /// in device memory, so nothing is copied -- and because that memory is
+    /// host-mapped, the CPU operations either side of this still read and write
+    /// it directly.
     pub fn extrapolateU(s: *Solver) Error!void {
         const ele = &s.quad.ele;
-        if (s.device) |dev| {
-            return dev.gemmHost(
+        if (s.gpu_state) |g| {
+            return g.dev.gemm(
                 ele.n_fpts,
                 s.n_vars * s.n_eles,
                 ele.n_spts,
-                ele.oppE.data,
-                s.u_spts.data,
-                s.u_fpts.data,
+                g.opp_e.raw(),
+                try g.bufferFor(s.u_spts.data),
+                try g.bufferFor(s.u_fpts.data),
                 .overwrite,
             );
         }

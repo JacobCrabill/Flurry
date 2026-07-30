@@ -127,7 +127,7 @@ test "the appended blob is exactly where the XML says it is" {
     const config = testConfig(3, 3, 2);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     const doc = try writeDoc(gpa, &run);
@@ -176,7 +176,7 @@ test "the sub-cells tile every element exactly once" {
     const config = testConfig(3, 4, 3);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     const doc = try writeDoc(gpa, &run);
@@ -237,7 +237,7 @@ test "a field the basis represents exactly reaches the plot points intact" {
     const config = testConfig(3, 4, 3);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     const s = &run.solver;
@@ -284,7 +284,7 @@ test "plot points span each element, corner to corner" {
     const config = testConfig(1, 2, 2);
 
     var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
+    try run.init(gpa, testing.io, &config, .{});
     defer run.deinit();
 
     const doc = try writeDoc(gpa, &run);
@@ -314,5 +314,5 @@ test "order 0 is rejected rather than crashing" {
     const config = testConfig(0, 2, 2);
 
     var run: driver.Run = undefined;
-    try testing.expectError(error.UnsupportedOrder, run.init(gpa, testing.io, &config));
+    try testing.expectError(error.UnsupportedOrder, run.init(gpa, testing.io, &config, .{}));
 }

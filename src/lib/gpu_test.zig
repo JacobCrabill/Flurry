@@ -210,21 +210,17 @@ test "extrapolateU on the device matches the CPU" {
     // hide in a constant.
     const config = testConfig(3, 6);
 
-    var run: driver.Run = undefined;
-    try run.init(gpa, testing.io, &config);
-    defer run.deinit();
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+    try cpu_run.solver.extrapolateU();
 
-    const s = &run.solver;
-    try s.extrapolateU();
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+    try gpu_run.solver.extrapolateU();
 
-    const want = try gpa.dupe(f64, s.u_fpts.data);
-    defer gpa.free(want);
-
-    @memset(s.u_fpts.data, std.math.nan(f64));
-    s.device = d;
-    try s.extrapolateU();
-
-    try expectClose(want, s.u_fpts.data, 1e-13);
+    try expectClose(cpu_run.solver.u_fpts.data, gpu_run.solver.u_fpts.data, 1e-13);
 }
 
 test "a residual with the operator on the device matches the CPU" {
@@ -238,14 +234,13 @@ test "a residual with the operator on the device matches the CPU" {
     const config = testConfig(3, 6);
 
     var cpu_run: driver.Run = undefined;
-    try cpu_run.init(gpa, testing.io, &config);
+    try cpu_run.init(gpa, testing.io, &config, .{});
     defer cpu_run.deinit();
     try cpu_run.solver.computeResidual(0);
 
     var gpu_run: driver.Run = undefined;
-    try gpu_run.init(gpa, testing.io, &config);
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
     defer gpu_run.deinit();
-    gpu_run.solver.device = d;
     try gpu_run.solver.computeResidual(0);
 
     try expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-11);
@@ -260,13 +255,12 @@ test "several steps with the operator on the device stay together" {
     const config = testConfig(2, 5);
 
     var cpu_run: driver.Run = undefined;
-    try cpu_run.init(gpa, testing.io, &config);
+    try cpu_run.init(gpa, testing.io, &config, .{});
     defer cpu_run.deinit();
 
     var gpu_run: driver.Run = undefined;
-    try gpu_run.init(gpa, testing.io, &config);
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
     defer gpu_run.deinit();
-    gpu_run.solver.device = d;
 
     for (0..10) |_| {
         try cpu_run.solver.update();
@@ -274,4 +268,61 @@ test "several steps with the operator on the device stay together" {
     }
 
     try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-11);
+}
+
+test "only the arrays a dispatch binds are device-resident" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // This is the split the port advances one operator at a time. `u_spts` and
+    // `u_fpts` are bound by `extrapolateU`, so they live in device memory; the
+    // geometry is still read on the CPU every step, and on a discrete GPU that
+    // memory is across PCIe, so it stays where the CPU can get at it quickly.
+    const config = testConfig(3, 4);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    const s = &run.solver;
+    try testing.expect(s.deviceBufferFor(s.u_spts.data) != null);
+    try testing.expect(s.deviceBufferFor(s.u_fpts.data) != null);
+
+    try testing.expect(s.deviceBufferFor(s.nodes.data) == null);
+    try testing.expect(s.deviceBufferFor(s.coord_spts.data) == null);
+    try testing.expect(s.deviceBufferFor(s.divf_spts.data) == null);
+
+    // ...and with no device nothing is
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+    try testing.expect(cpu_run.solver.deviceBufferFor(cpu_run.solver.u_spts.data) == null);
+}
+
+test "device memory is still an ordinary slice to the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The whole reason the port can proceed piecemeal: `u_spts` is a Vulkan
+    // mapping, and the un-ported operations either side of a dispatch read and
+    // write it exactly as before.
+    const config = testConfig(2, 4);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    const s = &run.solver;
+    for (s.u_spts.data, 0..) |*v, i| v.* = @floatFromInt(i);
+    try s.extrapolateU();
+
+    // The host writes survived the dispatch reading them...
+    for (s.u_spts.data, 0..) |v, i| try testing.expectEqual(@as(f64, @floatFromInt(i)), v);
+
+    // ...and what the dispatch wrote is visible without any read-back
+    var nonzero: usize = 0;
+    for (s.u_fpts.data) |v| {
+        if (v != 0.0) nonzero += 1;
+    }
+    try testing.expect(nonzero > 0);
 }

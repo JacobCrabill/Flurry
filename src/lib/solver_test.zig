@@ -1158,7 +1158,7 @@ test "residualNorm is zero for a zero residual and scales linearly" {
 
     var norms: [1]f64 = undefined;
 
-    s.residualNorm(0, &norms);
+    try s.residualNorm(0, &norms);
     try testing.expectApproxEqAbs(@as(f64, 0.0), norms[0], 1e-15);
 
     // divF carries a factor of |J|, so a residual of |J| * c has norm c
@@ -1169,7 +1169,7 @@ test "residualNorm is zero for a zero residual and scales linearly" {
             s.divf_spts.at(0, spt, 0, e).* = c * s.jaco_det_spts.get(spt, e);
         }
     }
-    s.residualNorm(0, &norms);
+    try s.residualNorm(0, &norms);
     try testing.expectApproxEqRel(c, norms[0], 1e-12);
 }
 

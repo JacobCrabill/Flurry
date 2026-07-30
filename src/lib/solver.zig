@@ -126,14 +126,19 @@ const GpuState = struct {
     /// Null when some condition has no kernel, which sends `applyBcs` to the CPU.
     bc_code: ?gpu.IndexArray,
 
-    fn create(gpa: std.mem.Allocator, dev: *gpu.Device, ele: *const Element) Error!*GpuState {
+    fn create(
+        gpa: std.mem.Allocator,
+        dev: *gpu.Device,
+        ele: *const Element,
+        location: gpu.Location,
+    ) Error!*GpuState {
         const g = try gpa.create(GpuState);
         errdefer gpa.destroy(g);
 
         g.* = .{
             .gpa = gpa,
             .dev = dev,
-            .heap = .init(dev, gpa),
+            .heap = .init(dev, gpa, location),
             .opp_e = undefined,
             .opp_div = undefined,
             .opp_div_fpts = undefined,
@@ -381,9 +386,21 @@ pub const Solver = struct {
             return error.ConnectivityNotProcessed;
         }
 
-        // Before the arrays, all of which ask it where they should live
+        // Before the arrays, all of which ask it where they should live.
+        //
+        // Device-local memory is far faster for the kernels but the host cannot
+        // read it, so it is only usable when the whole step is on the device.
+        // Anything with a CPU fallback in the loop -- advection-diffusion, the
+        // viscous terms -- keeps host-visible arrays and pays for them.
         if (opts.device) |dev| {
-            s.gpu_state = try GpuState.create(gpa, dev, &s.quad.ele);
+            const fully_gpu = config.equation.equation == .euler_ns and
+                !config.equation.viscous;
+            s.gpu_state = try GpuState.create(
+                gpa,
+                dev,
+                &s.quad.ele,
+                if (fully_gpu) .device else .host,
+            );
             try s.gpu_state.?.uploadConnectivity(gpa, mesh);
         }
 
@@ -398,6 +415,9 @@ pub const Solver = struct {
         try s.allocate();
         try s.computeTransforms();
         s.setFaceGeometry();
+
+        // The geometry was just written on the host and never changes again
+        try s.syncToDevice();
 
         return s;
     }
@@ -434,6 +454,24 @@ pub const Solver = struct {
 
         // Last: the heap owns the memory the arrays above were just freed into
         if (s.gpu_state) |g| g.destroy();
+    }
+
+    /// Push the arrays the host has just written out to the device.
+    ///
+    /// A no-op unless the arrays are in device-local memory, where the host and
+    /// device copies are separate. Called after setup and after the initial
+    /// condition -- not per step, which is the whole point of getting the time
+    /// loop onto the device first.
+    pub fn syncToDevice(s: *const Solver) Error!void {
+        const g = s.gpu_state orelse return;
+        return g.heap.syncToDevice();
+    }
+
+    /// Pull the arrays back for the host to read: the residual norms, the error
+    /// measure, solution output. All of those run at report intervals.
+    pub fn syncToHost(s: *const Solver) Error!void {
+        const g = s.gpu_state orelse return;
+        return g.heap.syncToHost();
     }
 
     /// The device buffer a solver array lives in, or null when there is no
@@ -703,7 +741,7 @@ pub const Solver = struct {
                     for (0..s.n_eles) |e| s.u_spts.at(spt, n, e).* = state[n];
                 }
             }
-            return;
+            return s.syncToDevice();
         }
 
         const bounds = s.meshBounds();
@@ -720,6 +758,7 @@ pub const Solver = struct {
                 for (0..s.n_vars) |n| s.u_spts.at(spt, n, e).* = state[n];
             }
         }
+        return s.syncToDevice();
     }
 
     /// L2 norm of the error in variable `test_case.err_field`, against the
@@ -735,6 +774,7 @@ pub const Solver = struct {
     /// comparable across meshes, which is the whole point of a refinement study.
     pub fn l2Error(s: *const Solver, gpa: std.mem.Allocator) Error!f64 {
         const ele = &s.quad.ele;
+        try s.syncToHost();
         if (ele.n_qpts == 0) return error.NoQuadraturePoints;
 
         const tc = try testcase.TestCase.fromConfig(s.config);
@@ -865,7 +905,8 @@ pub const Solver = struct {
     ///
     /// `out` is `(ppt, var, ele)` and must already be that size. Kept off the
     /// solver's own arrays because this runs at `write_freq`, not every step.
-    pub fn extrapolateToPpts(s: *const Solver, out: *Array3(f64)) void {
+    pub fn extrapolateToPpts(s: *const Solver, out: *Array3(f64)) Error!void {
+        try s.syncToHost();
         const ele = &s.quad.ele;
         gemm(
             ele.n_ppts,
@@ -1568,8 +1609,9 @@ pub const Solver = struct {
     // ---- Diagnostics ----
 
     /// L2 norm of the current residual, per variable.
-    pub fn residualNorm(s: *Solver, stage: usize, out: []f64) void {
+    pub fn residualNorm(s: *Solver, stage: usize, out: []f64) Error!void {
         const ele = &s.quad.ele;
+        try s.syncToHost();
         std.debug.assert(out.len >= s.n_vars);
         @memset(out[0..s.n_vars], 0.0);
 

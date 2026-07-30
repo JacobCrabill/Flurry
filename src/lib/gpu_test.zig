@@ -229,6 +229,7 @@ test "extrapolateU on the device matches the CPU" {
     try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
     defer gpu_run.deinit();
     try gpu_run.solver.extrapolateU();
+    try gpu_run.solver.syncToHost();
 
     try expectClose(cpu_run.solver.u_fpts.data, gpu_run.solver.u_fpts.data, 1e-13);
 }
@@ -252,6 +253,7 @@ test "a residual with the operator on the device matches the CPU" {
     try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
     defer gpu_run.deinit();
     try gpu_run.solver.computeResidual(0);
+    try gpu_run.solver.syncToHost();
 
     try expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-11);
 }
@@ -276,6 +278,7 @@ test "several steps with the operator on the device stay together" {
         try cpu_run.solver.update();
         try gpu_run.solver.update();
     }
+    try gpu_run.solver.syncToHost();
 
     try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-11);
 }
@@ -323,13 +326,13 @@ test "only the arrays a dispatch binds are device-resident" {
     try testing.expect(cpu_run.solver.deviceBufferFor(cpu_run.solver.u_spts.data) == null);
 }
 
-test "device memory is still an ordinary slice to the CPU" {
+test "host and device copies are pushed together explicitly" {
     const gpa = testing.allocator;
     const d = try device();
 
-    // The whole reason the port can proceed piecemeal: `u_spts` is a Vulkan
-    // mapping, and the un-ported operations either side of a dispatch read and
-    // write it exactly as before.
+    // The arrays live in device-local memory now, which the host cannot read.
+    // What the solver hands out is a host-side block that only matches after a
+    // sync -- so writing it takes an upload and reading it takes a download.
     const config = testConfig(2, 4);
 
     var run: driver.Run = undefined;
@@ -337,18 +340,53 @@ test "device memory is still an ordinary slice to the CPU" {
     defer run.deinit();
 
     const s = &run.solver;
-    for (s.u_spts.data, 0..) |*v, i| v.* = @floatFromInt(i);
+    for (s.u_spts.data, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+    try s.syncToDevice();
+
     try s.extrapolateU();
 
-    // The host writes survived the dispatch reading them...
-    for (s.u_spts.data, 0..) |v, i| try testing.expectEqual(@as(f64, @floatFromInt(i)), v);
+    // The dispatch left the host copy of its output alone...
+    for (s.u_fpts.data) |v| try testing.expectEqual(@as(f64, 0.0), v);
 
-    // ...and what the dispatch wrote is visible without any read-back
+    // ...until it is asked for
+    try s.syncToHost();
     var nonzero: usize = 0;
     for (s.u_fpts.data) |v| {
         if (v != 0.0) nonzero += 1;
     }
     try testing.expect(nonzero > 0);
+
+    // ...and the input the host wrote came back unchanged
+    for (s.u_spts.data, 0..) |v, i| {
+        try testing.expectEqual(@as(f64, @floatFromInt(i + 1)), v);
+    }
+}
+
+test "a case with a CPU fallback keeps host-visible arrays" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // Device-local memory only works when the whole step is on the device.
+    // Advection-diffusion still runs its flux on the CPU, which would read a
+    // stale block, so those runs stay host-visible and pay for it.
+    var config = testConfig(2, 4);
+    config.equation.equation = .adv_diff;
+    config.test_case.test_case = 2;
+    config.create_mesh.?.xmin = -1.0;
+    config.create_mesh.?.xmax = 1.0;
+    config.create_mesh.?.ymin = -1.0;
+    config.create_mesh.?.ymax = 1.0;
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    // Ten steps with no explicit sync anywhere: the host arrays have to be live
+    // throughout, or the CPU flux would be working from stale data.
+    const s = &run.solver;
+    for (0..10) |_| try s.update();
+
+    for (s.u_spts.data) |v| try testing.expect(std.math.isFinite(v));
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +413,7 @@ test "the Euler flux kernel matches the CPU one" {
     // Both start from the vortex, so `u_spts` already varies across the mesh
     try cpu_run.solver.computeFluxSpts();
     try gpu_run.solver.computeFluxSpts();
+    try gpu_run.solver.syncToHost();
 
     try expectClose(cpu_run.solver.f_spts.data, gpu_run.solver.f_spts.data, 1e-13);
 }
@@ -537,6 +576,7 @@ test "boundary conditions on the device match the CPU" {
 
         try cpu_run.solver.computeResidual(0);
         try gpu_run.solver.computeResidual(0);
+        try gpu_run.solver.syncToHost();
 
         expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-10) catch |err| {
             std.debug.print("boundary condition: {t}\n", .{bc});
@@ -582,6 +622,7 @@ test "several steps with boundaries stay together" {
         try cpu_run.solver.update();
         try gpu_run.solver.update();
     }
+    try gpu_run.solver.syncToHost();
 
     try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-10);
 }

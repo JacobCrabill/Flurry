@@ -83,7 +83,7 @@ pub fn write(s: *const Solver, gpa: std.mem.Allocator, w: *Io.Writer) !void {
     var coord_ppts = try Array3(f64).init(gpa, n_ppts, s.n_dims, s.n_eles);
     defer coord_ppts.deinit(gpa);
 
-    s.extrapolateToPpts(&u_ppts);
+    try s.extrapolateToPpts(&u_ppts);
     try s.plotPointCoords(gpa, &coord_ppts);
 
     try w.writeAll(

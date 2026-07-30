@@ -68,24 +68,31 @@ and nothing is copied.
 Anything the kernels do not cover falls back rather than failing:
 advection-diffusion, the viscous terms, and the viscous wall conditions.
 
+The arrays live in the device's own memory, with a host-visible block beside
+each one that they are pushed to and from explicitly — at setup, at the initial
+condition, and before the residual norms, the error measure or solution output.
+Between those points the CPU touches nothing. A case with a CPU fallback in the
+step (advection-diffusion, the viscous terms) keeps host-visible arrays instead,
+since a stale block would be read.
+
 Performance, 50 steps of the vortex sample:
 
 | mesh | CPU | GPU |
 |---|---|---|
-| 32×32 | 0.69 s | 0.67 s |
-| 64×64 | 3.25 s | 4.06 s |
-| 128×128 | 13.22 s | 16.10 s |
+| 32×32 | 0.68 s | **0.34 s** |
+| 64×64 | 3.23 s | **0.69 s** |
+| 128×128 | 13.07 s | **1.99 s** |
 
-Ahead when small, ~1.2× behind when large. That is not submission overhead —
-200 submissions over the 128² run, at ~0.4 ms each, is under a tenth of a
-second. It works out to about 80 ms per residual for ~60 MFLOP over ~80 MB of
-traffic: roughly 1 GB/s and 0.75 GFLOP/s, both an order of magnitude below what
-the hardware will do. Spock's buffers are host-visible by design — its own docs
-say so — so every array the kernels touch lives in system memory rather than
-VRAM.
+Host-visible memory was the whole story. The same dgemm, 16×65536 with K=16,
+measured on both:
 
-Device-local memory with staging is the next structural step, and it is only
-viable now that nothing on the CPU reads these arrays between reports.
+| | | |
+|---|---|---|
+| host-visible | 1.32 GB/s | 2.64 GFLOP/s |
+| device-local | **15.09 GB/s** | **30.19 GFLOP/s** |
+
+There is more to get — the dgemm is naive, with no tiling or shared memory —
+but the memory was worth an order of magnitude on its own.
 
 Getting there needed a fix in Spock. It asked for `host_visible | host_coherent`
 and took the first matching memory type, which on the test hardware is an

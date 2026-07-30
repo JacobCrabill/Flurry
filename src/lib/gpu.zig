@@ -22,6 +22,12 @@
 //! which run at report intervals rather than every step, and anything the
 //! kernels do not cover -- advection-diffusion, the viscous terms, and the
 //! viscous wall conditions -- each of which falls back rather than failing.
+//!
+//! Because nothing on the CPU reads the arrays between reports, they live in
+//! the device's own memory rather than host-visible memory, which is worth an
+//! order of magnitude: the same dgemm measured 1.32 GB/s on one and 15.09 GB/s
+//! on the other. A case that does fall back keeps host-visible arrays, since it
+//! would otherwise read a stale block.
 
 const std = @import("std");
 const spock = @import("spock");
@@ -111,6 +117,9 @@ pub const Buffer = spock.vk.Buffer;
 /// One storage-buffer argument: a whole buffer, or a byte range of one.
 /// `.whole(buf)` is the common case.
 pub const Binding = spock.Kernel.Binding;
+
+/// Where a `Heap`'s allocations live: host-visible, or the device's own memory.
+pub const Location = spock.Location;
 
 /// Whether a product overwrites its destination or accumulates into it,
 /// matching the CPU `gemm`'s `Mode`.
@@ -577,44 +586,55 @@ fn translate(err: anyerror, doing: []const u8) Error {
     };
 }
 
-/// A `std.mem.Allocator` whose allocations live in device-visible memory.
+/// A `std.mem.Allocator` for the arrays a dispatch binds.
 ///
-/// The memory is host-coherent and persistently mapped, so what comes back is an
-/// ordinary slice: operations still running on the CPU keep writing it directly
-/// while ported ones read the same bytes on the device. That is the whole point
-/// -- it is what lets the port proceed one operator at a time instead of all at
-/// once.
+/// Two modes, chosen by `Location`:
+///
+///   * `.host` -- one host-visible, persistently mapped buffer per allocation.
+///     What comes back *is* the device memory, so operations still on the CPU
+///     keep reading and writing it as an ordinary slice and nothing has to be
+///     synchronised. That is what let the port proceed one operator at a time.
+///
+///   * `.device` -- a pair: a host-visible block, which is what the allocation
+///     returns, and a device-local one the kernels actually bind. They are
+///     separate memory, so the two have to be pushed together explicitly with
+///     `syncToDevice` / `syncToHost`. Only worth it once nothing on the CPU
+///     touches these arrays between those points.
+///
+/// The second is much faster and the first is much simpler. Measured on a
+/// Quadro T1000, a dgemm of the shape this solver dispatches ran at 1.30 GB/s
+/// on host-visible memory -- an order of magnitude under PCIe, two under the
+/// card's own memory.
 ///
 /// Every allocation is its own Vulkan buffer, because spock binds descriptors
 /// with `offset = 0, range = WHOLE_SIZE` and gives no way to point at part of
 /// one. That makes this the wrong tool for many small allocations and the right
 /// one for the handful of large solver arrays it holds.
-///
-/// Watch the memory type this lands in. spock originally took the first
-/// `host_visible | host_coherent` type, which on this hardware is *uncached*
-/// (write-combined): CPU reads from it measured 25x slower than from an ordinary
-/// allocation, and making one operator's operands resident cost the whole step
-/// 8x. spock now prefers a cached type, which brings host reads back to parity
-/// (36ms against 34ms on the same measurement) -- but a device offering no
-/// cached host-visible heap would still pay it.
 pub const Heap = struct {
     dev: *Device,
     /// For the bookkeeping list only; the blocks themselves are device memory
     gpa: std.mem.Allocator,
+    location: spock.Location,
     blocks: std.ArrayList(Block),
 
     const Block = struct {
         ptr: [*]u8,
         len: usize,
-        buf: spock.Buffer(u8),
+        /// Host-visible, and mapped to `ptr`
+        host: spock.Buffer(u8),
+        /// What a dispatch binds. The same as `host` in `.host` mode.
+        device: spock.Buffer(u8),
     };
 
-    pub fn init(dev: *Device, gpa: std.mem.Allocator) Heap {
-        return .{ .dev = dev, .gpa = gpa, .blocks = .empty };
+    pub fn init(dev: *Device, gpa: std.mem.Allocator, location: spock.Location) Heap {
+        return .{ .dev = dev, .gpa = gpa, .location = location, .blocks = .empty };
     }
 
     pub fn deinit(h: *Heap) void {
-        for (h.blocks.items) |b| b.buf.deinit();
+        for (h.blocks.items) |b| {
+            if (h.location == .device) b.device.deinit();
+            b.host.deinit();
+        }
         h.blocks.deinit(h.gpa);
     }
 
@@ -630,35 +650,72 @@ pub const Heap = struct {
         };
     }
 
-    /// The buffer holding `ptr`, or null if it did not come from here.
+    /// The buffer a dispatch should bind for `ptr`, or null if it did not come
+    /// from here.
     ///
     /// A linear scan over a handful of blocks, and only when a dispatch is being
     /// recorded, so there is nothing to gain from an index.
     pub fn bufferFor(h: *const Heap, ptr: *const anyopaque) ?spock.vk.Buffer {
+        const b = h.blockFor(ptr) orelse return null;
+        return b.device.raw();
+    }
+
+    fn blockFor(h: *const Heap, ptr: *const anyopaque) ?Block {
         const addr = @intFromPtr(ptr);
         for (h.blocks.items) |b| {
             const base = @intFromPtr(b.ptr);
-            if (addr >= base and addr < base + b.len) return b.buf.raw();
+            if (addr >= base and addr < base + b.len) return b;
         }
         return null;
+    }
+
+    /// Push every block's host contents to the device.
+    ///
+    /// A no-op in `.host` mode, where there is only one copy of anything. Coarse
+    /// on purpose: this runs when the host has just written the arrays, which is
+    /// setup and the initial condition, not per step.
+    pub fn syncToDevice(h: *Heap) Error!void {
+        if (h.location == .host) return;
+        for (h.blocks.items) |b| {
+            b.device.copyFrom(b.host) catch |err| return translate(err, "uploading to the device");
+        }
+    }
+
+    /// Pull every block's contents back, for the host to read.
+    ///
+    /// Called before the residual norms, the error measure and solution output
+    /// -- all of which run at report intervals rather than every step.
+    pub fn syncToHost(h: *Heap) Error!void {
+        if (h.location == .host) return;
+        for (h.blocks.items) |b| {
+            b.host.copyFrom(b.device) catch |err| return translate(err, "reading back from the device");
+        }
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
         const h: *Heap = @ptrCast(@alignCast(ctx));
 
         h.blocks.ensureUnusedCapacity(h.gpa, 1) catch return null;
-        const buf = spock.Buffer(u8).create(h.dev.ctx, len) catch return null;
+        const host = spock.Buffer(u8).create(h.dev.ctx, len) catch return null;
 
         // A mapped Vulkan allocation starts at the base of its own memory
         // object, so it is aligned far past anything an f64 array asks for --
         // but say so rather than assume it.
-        const ptr = @as([*]u8, @ptrCast(buf.ptr));
+        const ptr = @as([*]u8, @ptrCast(host.ptr.?));
         if (!alignment.check(@intFromPtr(ptr))) {
-            buf.deinit();
+            host.deinit();
             return null;
         }
 
-        h.blocks.appendAssumeCapacity(.{ .ptr = ptr, .len = len, .buf = buf });
+        const device = switch (h.location) {
+            .host => host,
+            .device => spock.Buffer(u8).createIn(h.dev.ctx, len, .device) catch {
+                host.deinit();
+                return null;
+            },
+        };
+
+        h.blocks.appendAssumeCapacity(.{ .ptr = ptr, .len = len, .host = host, .device = device });
         return ptr;
     }
 
@@ -676,7 +733,8 @@ pub const Heap = struct {
         const h: *Heap = @ptrCast(@alignCast(ctx));
         for (h.blocks.items, 0..) |b, i| {
             if (b.ptr != memory.ptr) continue;
-            b.buf.deinit();
+            if (h.location == .device) b.device.deinit();
+            b.host.deinit();
             _ = h.blocks.swapRemove(i);
             return;
         }

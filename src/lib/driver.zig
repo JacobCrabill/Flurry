@@ -109,7 +109,7 @@ pub const Run = struct {
         // stopping conditions deliberately do not apply to it: a run that exits
         // before taking a step looks broken even when it is right.
         try s.computeResidual(0);
-        s.residualNorm(0, &res);
+        try s.residualNorm(0, &res);
 
         try r.writeReportHeader(w);
         try r.writeReport(w, started, &res);
@@ -134,7 +134,7 @@ pub const Run = struct {
                 // `divf_spts` holds one residual per RK stage; stage 0 is the one
                 // evaluated on the solution at the start of the step just taken,
                 // which is the dU/dt convergence is measured against.
-                s.residualNorm(0, &res);
+                try s.residualNorm(0, &res);
                 if (due) {
                     try r.writeReport(w, started, &res);
                     last_reported = s.current_iter;
@@ -153,7 +153,7 @@ pub const Run = struct {
 
         // The last step is always worth seeing, however the loop ended.
         if (last_reported != s.current_iter) {
-            s.residualNorm(0, &res);
+            try s.residualNorm(0, &res);
             try r.writeReport(w, started, &res);
             if (residualStop(res[0..s.n_vars], t)) |why| reason = why;
         }

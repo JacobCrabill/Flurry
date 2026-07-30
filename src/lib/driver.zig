@@ -238,14 +238,27 @@ pub const Run = struct {
         try w.flush();
     }
 
-    /// Solution output, once there is a writer for it.
+    /// Write the solution for ParaView, if the config asked for it.
     fn writeSolution(r: *Run, w: *Io.Writer) !void {
-        if (r.warned_no_output) return;
-        r.warned_no_output = true;
-        try w.print(
-            "\n note: output.write_freq is set, but no solution writer is ported yet\n\n",
-            .{},
+        if (!r.config.output.write_paraview) {
+            if (r.warned_no_output) return;
+            r.warned_no_output = true;
+            try w.writeAll(
+                "\n note: write_freq is set but write_paraview is off, so nothing is written\n\n",
+            );
+            return;
+        }
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try vtu.writeSolution(
+            &r.solver,
+            r.gpa,
+            r.io,
+            Io.Dir.cwd(),
+            r.config.output.output_prefix,
+            &path_buf,
         );
+        try w.print(" wrote {s}\n", .{path});
     }
 };
 
@@ -269,3 +282,4 @@ const Io = std.Io;
 const cfg = @import("config.zig");
 const Geo = @import("geo.zig").Geo;
 const Solver = @import("solver.zig").Solver;
+const vtu = @import("vtu.zig");

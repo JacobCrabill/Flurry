@@ -13,6 +13,9 @@ zig-pkg/
 *.so
 *.a
 
+# Solver output (a run writes <output_prefix>/<output_prefix>_<iter>.vtu)
+quadbox/
+
 # Typical temporary/staging dirs
 tmp/
 .worktrees/

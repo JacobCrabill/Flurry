@@ -524,6 +524,49 @@ pub const Solver = struct {
         );
     }
 
+    /// U at the solution points -> U at the equispaced plot points, for output.
+    ///
+    /// `out` is `(ppt, var, ele)` and must already be that size. Kept off the
+    /// solver's own arrays because this runs at `write_freq`, not every step.
+    pub fn extrapolateToPpts(s: *const Solver, out: *Array3(f64)) void {
+        const ele = &s.quad.ele;
+        gemm(
+            ele.n_ppts,
+            s.n_vars * s.n_eles,
+            ele.n_spts,
+            ele.oppE_ppts.data,
+            s.u_spts.data,
+            out.data,
+            .overwrite,
+        );
+    }
+
+    /// Physical coordinates of the plot points, `(ppt, dim, ele)`.
+    ///
+    /// The same mapping `computeTransforms` applies at the solution and flux
+    /// points, evaluated where the output needs it instead of being carried
+    /// around for the whole run.
+    pub fn plotPointCoords(s: *const Solver, gpa: std.mem.Allocator, out: *Array3(f64)) Error!void {
+        const ele = &s.quad.ele;
+        const nd = s.n_dims;
+
+        const shape = try gpa.alloc(f64, ele.n_nodes);
+        defer gpa.free(shape);
+
+        for (0..ele.n_ppts) |ppt| {
+            const loc = Element.locRow(&ele.loc_ppts, ppt, nd);
+            try ele.vtable.calcShape(ele, loc, shape);
+
+            for (0..s.n_eles) |e| {
+                for (0..nd) |d| {
+                    var sum: f64 = 0.0;
+                    for (0..ele.n_nodes) |node| sum += shape[node] * s.nodes.get(node, d, e);
+                    out.at(ppt, d, e).* = sum;
+                }
+            }
+        }
+    }
+
     /// Reference-space gradient contribution from the solution points.
     pub fn computeGradSpts(s: *Solver) void {
         const ele = &s.quad.ele;

@@ -174,7 +174,12 @@ fn gaussLegendreWeightsComputed(gpa: std.mem.Allocator, n: u32) Error!Matrix(f64
     return w;
 }
 
+/// `P + 1` equispaced points spanning [-1, 1], the shape and plot point set.
 pub fn shapePts(gpa: std.mem.Allocator, P: u32) Error!Matrix(f64) {
+    // Order 0 is a single point with no span, and the loop below would run
+    // `1..0` -- an unsigned reverse range, which panics rather than skipping.
+    if (P == 0) return error.UnsupportedOrder;
+
     const P_f = @as(f64, @floatFromInt(P));
     var nodes = try Matrix(f64).init(gpa, P + 1, 1, null);
     const dx = 2.0 / P_f;

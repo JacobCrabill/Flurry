@@ -79,20 +79,22 @@ Performance, 50 steps of the vortex sample:
 
 | mesh | CPU | GPU |
 |---|---|---|
-| 32×32 | 0.68 s | **0.34 s** |
-| 64×64 | 3.23 s | **0.69 s** |
-| 128×128 | 13.07 s | **1.99 s** |
+| 32×32 | 0.69 s | **0.35 s** |
+| 64×64 | 3.25 s | **0.59 s** |
+| 128×128 | 13.37 s | **1.66 s** |
 
-Host-visible memory was the whole story. The same dgemm, 16×65536 with K=16,
-measured on both:
+Two things got it there, both measured on the same dgemm — 16×65536 with K=16,
+the shape the solver dispatches:
 
 | | | |
 |---|---|---|
-| host-visible | 1.32 GB/s | 2.64 GFLOP/s |
-| device-local | **15.09 GB/s** | **30.19 GFLOP/s** |
+| host-visible, thread per element | 1.32 GB/s | 2.64 GFLOP/s |
+| device-local, thread per element | 15.09 GB/s | 30.19 GFLOP/s |
+| device-local, tiled over rows | **25.5 GB/s** | **51.0 GFLOP/s** |
 
-There is more to get — the dgemm is naive, with no tiling or shared memory —
-but the memory was worth an order of magnitude on its own.
+The tiling is upstream in Spock. It is now compute-bound at ~64% of this card's
+double-precision peak, so the next gain would have to come from the arithmetic
+rather than the memory.
 
 Getting there needed a fix in Spock. It asked for `host_visible | host_coherent`
 and took the first matching memory type, which on the test hardware is an

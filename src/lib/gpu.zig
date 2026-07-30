@@ -26,8 +26,9 @@
 //! Because nothing on the CPU reads the arrays between reports, they live in
 //! the device's own memory rather than host-visible memory, which is worth an
 //! order of magnitude: the same dgemm measured 1.32 GB/s on one and 15.09 GB/s
-//! on the other. A case that does fall back keeps host-visible arrays, since it
-//! would otherwise read a stale block.
+//! on the other, and 25.5 GB/s once spock's dgemm was tiled over rows. A case
+//! that does fall back keeps host-visible arrays, since it would otherwise read
+//! a stale block.
 
 const std = @import("std");
 const spock = @import("spock");
@@ -332,14 +333,12 @@ pub const Device = struct {
             .beta = if (mode == .accumulate) 1.0 else 0.0,
         };
 
-        // One thread per output element
-        const threads: u32 = @intCast(m * n);
-        const groups = std.math.divCeil(u32, threads, dgemm.WgSize.x) catch unreachable;
-
         try d.run(.dgemm, .{
             .buffers = &.{ a, b, c },
             .push_constant = std.mem.asBytes(&pc),
-            .groups = .{ groups, 1, 1 },
+            // The kernel tiles over rows and dispatches in two dimensions, so
+            // the mapping comes from it rather than from here.
+            .groups = dgemm.groups(pc.M, pc.N),
         }, "dispatching dgemm");
     }
 

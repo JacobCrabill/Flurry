@@ -28,6 +28,11 @@ pub const ConnError = error{
     InconsistentCellType,
     /// A cell type that does not exist in this many dimensions
     UnsupportedCellType,
+    /// A face on a periodic boundary found no partner across the domain
+    UnmatchedPeriodicFace,
+    /// Periodic vertex merging aliased two distinct faces onto one, which
+    /// happens when a periodic direction spans only two cells
+    PeriodicDirectionTooThin,
     /// `core.n_dims` is neither 2 nor 3
     UnsupportedDimension,
     /// `setupGlobalFpts` was called before `processConnectivity`
@@ -1012,14 +1017,45 @@ pub const Geo = struct {
     pub fn processConnectivity(geo: *Geo) !void {
         report("Geo: Processing element connectivity\n", .{});
 
+        // Validate before doing any work, so nothing below has to cope with a
+        // dimension or cell type it was not written for.
+        switch (geo.n_dims) {
+            2 => for (geo.ctype.items) |ct| {
+                if (ct == .hex) return error.UnsupportedCellType;
+            },
+            3 => for (geo.ctype.items) |ct| {
+                if (ct != .hex) return error.UnsupportedCellType;
+            },
+            else => return error.UnsupportedDimension,
+        }
+
         var arena_state: std.heap.ArenaAllocator = .init(geo.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
+        // Periodic faces are interior faces whose two sides sit on opposite
+        // ends of the domain. Giving each periodic vertex pair a shared
+        // canonical ID makes them merge during face construction.
+        const pm = try geo.buildPeriodicVertexMap(arena);
+        const canon: ?[]const usize = if (pm) |m| m.canon else null;
+
         switch (geo.n_dims) {
-            2 => try geo.processConn2D(arena),
-            3 => try geo.processConn3D(arena),
+            2 => try geo.processConn2D(arena, canon),
+            3 => try geo.processConn3D(arena, canon),
             else => return error.UnsupportedDimension,
+        }
+
+        if (pm) |m| {
+            try geo.checkPeriodicFaceConsistency(arena, m);
+
+            // A periodic face that found no partner stayed a boundary face, and
+            // there is no boundary condition that can stand in for one.
+            for (geo.bc_type.items) |bc| {
+                if (bc == .periodic) {
+                    report("Geo: a periodic boundary face found no partner\n", .{});
+                    return error.UnmatchedPeriodicFace;
+                }
+            }
         }
     }
 
@@ -1116,33 +1152,253 @@ pub const Geo = struct {
         return null;
     }
 
-    /// 2D: the faces are the cell edges.
-    fn processConn2D(geo: *Geo, arena: std.mem.Allocator) !void {
-        for (geo.ctype.items) |ct| {
-            if (ct == .hex) return error.UnsupportedCellType;
+    /// Which axis directions the mesh is genuinely periodic in.
+    ///
+    /// Vertex positions alone cannot answer this. In a mesh periodic in x but
+    /// walled in y, the corners `(xmin, ymin)` and `(xmin, ymax)` both sit on
+    /// the periodic boundary and are separated by exactly the bounding-box y
+    /// extent, so a raw pairwise sweep identifies them across a direction that
+    /// is not periodic at all.
+    ///
+    /// Boundary *faces* settle it: direction `d` is periodic exactly when the
+    /// periodic boundary includes faces lying in the plane normal to `d` at
+    /// both ends of the domain. Boundary faces are the cell faces claimed by
+    /// exactly one cell, which is the same counting `buildFaces` does -- but it
+    /// has to happen before that, since the answer decides how faces are keyed.
+    fn periodicDirections(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        on_periodic: *const std.AutoArrayHashMapUnmanaged(usize, void),
+        lo: [3]f64,
+        hi: [3]f64,
+        tol: f64,
+    ) ![3]bool {
+        const nd = geo.n_dims;
+
+        var counts: std.AutoArrayHashMapUnmanaged(FaceKey, usize) = .empty;
+        const min_verts: usize = if (nd == 3) 3 else 2;
+        var verts: [max_face_verts]usize = undefined;
+
+        for (0..geo.n_eles) |ic| {
+            for (localFaces(geo.ctype.items[ic])) |lf| {
+                for (lf, 0..) |lv, i| verts[i] = geo.c2v.get(ic, lv);
+                const key = FaceKey.init(verts[0..lf.len]);
+                if (key.n_verts < min_verts) continue;
+
+                const gop = try counts.getOrPut(arena, key);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
         }
 
+        var at_lo: [3]bool = .{ false, false, false };
+        var at_hi: [3]bool = .{ false, false, false };
+
+        for (counts.keys(), counts.values()) |key, n_cells| {
+            if (n_cells != 1) continue; // interior face
+
+            const fv = key.verts[0..key.n_verts];
+            for (fv) |iv| {
+                if (!on_periodic.contains(iv)) break;
+            } else {
+                // A planar axis-aligned face is normal to whichever direction
+                // it has no extent in, and a periodic plane spans the domain,
+                // so it sits at one end of the bounding box.
+                for (0..nd) |d| {
+                    var f_lo = std.math.inf(f64);
+                    var f_hi = -std.math.inf(f64);
+                    for (fv) |iv| {
+                        f_lo = @min(f_lo, geo.xv.get(iv, d));
+                        f_hi = @max(f_hi, geo.xv.get(iv, d));
+                    }
+                    if (f_hi - f_lo >= tol) continue;
+                    if (@abs(f_lo - lo[d]) < tol) at_lo[d] = true;
+                    if (@abs(f_lo - hi[d]) < tol) at_hi[d] = true;
+                }
+            }
+        }
+
+        var dirs: [3]bool = .{ false, false, false };
+        for (0..nd) |d| dirs[d] = at_lo[d] and at_hi[d];
+        return dirs;
+    }
+
+    /// Give every vertex on a periodic boundary a canonical ID shared with its
+    /// image(s) across the domain, so that `buildFaces` sees a periodic face and
+    /// its partner as the same face.
+    ///
+    /// Returns `null` when the mesh has no periodic boundary, in which case face
+    /// construction uses real vertex IDs directly.
+    ///
+    /// A vertex `b` is the periodic image of `a` when, for some non-empty set of
+    /// directions, their separation equals that direction's period and is zero
+    /// in every other direction. That covers domain corners, which are images of
+    /// one another in two or three directions at once -- hence the union-find,
+    /// so all four corners of a doubly-periodic box collapse to one ID.
+    ///
+    /// Flurry-cpp instead paired faces after the fact, enumerating the four 2D
+    /// orientation cases explicitly and comparing face normals and centroids in
+    /// 3D, then rewired `f2c`/`c2f`/`c2b` and left the absorbed faces as holes
+    /// in the face list. Matching at the vertex level is dimension-generic and
+    /// leaves the face arrays with no gaps.
+    fn buildPeriodicVertexMap(geo: *Geo, arena: std.mem.Allocator) !?PeriodicMap {
+        const nd = geo.n_dims;
+
+        // Which vertices sit on a periodic boundary?
+        var on_periodic: std.AutoArrayHashMapUnmanaged(usize, void) = .empty;
+        for (geo.bc_list.items, 0..) |bc, bnd| {
+            if (bc != .periodic) continue;
+            for (0..geo.n_bnd_pts.items[bnd]) |j| {
+                try on_periodic.put(arena, geo.bnd_pts.get(bnd, j), {});
+            }
+        }
+        if (on_periodic.count() == 0) return null;
+
+        // Periods: whatever the mesh recorded, else the bounding box extents,
+        // which is the standard assumption for a periodic mesh read from a file.
+        var lo: [3]f64 = .{ std.math.inf(f64), std.math.inf(f64), std.math.inf(f64) };
+        var hi: [3]f64 = .{ -std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
+        for (0..geo.n_verts) |iv| {
+            for (0..nd) |d| {
+                lo[d] = @min(lo[d], geo.xv.get(iv, d));
+                hi[d] = @max(hi[d], geo.xv.get(iv, d));
+            }
+        }
+
+        var period: [3]f64 = .{ geo.periodic_dx, geo.periodic_dy, geo.periodic_dz };
+        var diag: f64 = 0.0;
+        for (0..nd) |d| {
+            if (period[d] == 0.0) period[d] = hi[d] - lo[d];
+            diag += (hi[d] - lo[d]) * (hi[d] - lo[d]);
+        }
+        diag = @sqrt(diag);
+
+        // Relative to the domain size, so the same tolerance works whatever
+        // units the mesh is in.
+        const tol = 1e-8 * diag;
+
+        // A zero period means "no shift is allowed here", which is what the
+        // matching below needs for a direction that is not actually periodic:
+        // only vertices at the same coordinate in `d` may be identified.
+        const dirs = try geo.periodicDirections(arena, &on_periodic, lo, hi, tol);
+        var any_dir = false;
+        for (0..nd) |d| {
+            if (dirs[d]) any_dir = true else period[d] = 0.0;
+        }
+        if (!any_dir) {
+            report("Geo: a periodic boundary is declared but spans no periodic direction\n", .{});
+            return error.UnmatchedPeriodicFace;
+        }
+
+        const parent = try arena.alloc(usize, geo.n_verts);
+        for (parent, 0..) |*p, i| p.* = i;
+
+        // Pairwise over periodic boundary vertices only, which is a thin shell
+        // of the mesh. A spatial hash would make this linear if it ever matters.
+        const pts = on_periodic.keys();
+        for (pts, 0..) |a, i| {
+            for (pts[i + 1 ..]) |b| {
+                var shifted = false;
+                var matches = true;
+                for (0..nd) |d| {
+                    const sep = @abs(geo.xv.get(b, d) - geo.xv.get(a, d));
+                    if (sep < tol) continue; // same position in this direction
+                    if (@abs(sep - period[d]) < tol) {
+                        shifted = true;
+                        continue;
+                    }
+                    matches = false;
+                    break;
+                }
+                if (matches and shifted) unite(parent, a, b);
+            }
+        }
+
+        const canon = try arena.alloc(usize, geo.n_verts);
+        var n_merged: usize = 0;
+        for (canon, 0..) |*c, iv| {
+            c.* = find(parent, iv);
+            if (c.* != iv) n_merged += 1;
+        }
+
+        report("Geo: merged {d} periodic vertex images\n", .{n_merged});
+        return .{ .canon = canon, .period = period, .tol = tol };
+    }
+
+    /// Verify that the two cells sharing a face agree on where it is, allowing
+    /// for one periodic offset.
+    ///
+    /// Merging periodic vertices identifies faces by vertex set, which is exact
+    /// as long as no two distinct faces end up with the same set. That fails when
+    /// a periodic direction spans only two cells: the boundary line normal to it
+    /// closes into a two-edge loop whose edges span the same vertex pair. Without
+    /// this check the result is either a non-manifold face or, worse, a pair of
+    /// unrelated faces silently fused into one.
+    fn checkPeriodicFaceConsistency(geo: *Geo, arena: std.mem.Allocator, pm: PeriodicMap) !void {
+        const nd = geo.n_dims;
+
+        const seen = try arena.alloc(?[3]f64, geo.n_faces);
+        @memset(seen, null);
+
+        for (0..geo.n_eles) |ic| {
+            for (localFaces(geo.ctype.items[ic]), 0..) |lf, j| {
+                const ff = geo.c2f.get(ic, j);
+                if (ff == none) continue;
+
+                // Centroid of this cell's copy of the face
+                var c: [3]f64 = .{ 0, 0, 0 };
+                for (lf) |lv| {
+                    const iv = geo.c2v.get(ic, lv);
+                    for (0..nd) |d| c[d] += geo.xv.get(iv, d);
+                }
+                for (0..nd) |d| c[d] /= @floatFromInt(lf.len);
+
+                const other = seen[ff] orelse {
+                    seen[ff] = c;
+                    continue;
+                };
+
+                // The two copies must coincide, or be one period apart
+                for (0..nd) |d| {
+                    const sep = @abs(c[d] - other[d]);
+                    if (sep < pm.tol) continue;
+                    if (@abs(sep - pm.period[d]) < pm.tol) continue;
+
+                    report(
+                        "Geo: periodic merging fused two different faces into one.\n" ++
+                            "A periodic direction needs at least three cells across it.\n",
+                        .{},
+                    );
+                    return error.PeriodicDirectionTooThin;
+                }
+            }
+        }
+    }
+
+    /// 2D: the faces are the cell edges.
+    fn processConn2D(geo: *Geo, arena: std.mem.Allocator, canon: ?[]const usize) !void {
         var faces: FaceBuilder = .empty;
-        try geo.buildFaces(arena, &faces);
-        try geo.finishConn(arena, &faces);
+        try geo.buildFaces(arena, &faces, canon);
+        try geo.finishConn(arena, &faces, canon != null);
     }
 
     /// 3D: the faces come from each cell type's local face table, and the edge
     /// list is accumulated alongside them.
-    fn processConn3D(geo: *Geo, arena: std.mem.Allocator) !void {
-        for (geo.ctype.items) |ct| {
-            if (ct != .hex) return error.UnsupportedCellType;
-        }
-
+    fn processConn3D(geo: *Geo, arena: std.mem.Allocator, canon: ?[]const usize) !void {
         var faces: FaceBuilder = .empty;
-        try geo.buildFaces(arena, &faces);
+        try geo.buildFaces(arena, &faces, canon);
         try geo.buildEdges(arena);
-        try geo.finishConn(arena, &faces);
+        try geo.finishConn(arena, &faces, canon != null);
     }
 
     /// Walk every cell face, registering it in `faces` and recording which
     /// global face each cell slot maps to in `c2f`.
-    fn buildFaces(geo: *Geo, arena: std.mem.Allocator, faces: *FaceBuilder) !void {
+    fn buildFaces(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        faces: *FaceBuilder,
+        canon: ?[]const usize,
+    ) !void {
         const gpa = geo.gpa;
 
         var max_nf: usize = 0;
@@ -1152,6 +1408,7 @@ pub const Geo = struct {
         @memset(geo.c2f.data, none);
 
         var verts: [max_face_verts]usize = undefined;
+        var canon_verts: [max_face_verts]usize = undefined;
 
         // A 2D face (edge) needs two distinct vertices, a 3D face three; with
         // fewer it has collapsed to a line or a point and is not a face.
@@ -1172,10 +1429,20 @@ pub const Geo = struct {
 
             for (local, 0..) |lf, j| {
                 for (lf, 0..) |lv, i| verts[i] = geo.c2v.get(ic, lv);
-                const key = FaceKey.init(verts[0..lf.len]);
-                if (key.n_verts < min_verts) continue;
+                const real = FaceKey.init(verts[0..lf.len]);
+                if (real.n_verts < min_verts) continue;
 
-                geo.c2f.at(ic, j).* = try faces.add(arena, key);
+                // Under periodicity a face is identified by its canonical
+                // vertices, so it and its image across the domain register as
+                // one face with two cells -- and everything downstream
+                // (int/bnd classification, c2c, c2b, the global flux points)
+                // then treats it as interior with no further special casing.
+                const key = if (canon) |c| blk: {
+                    for (lf, 0..) |lv, i| canon_verts[i] = c[geo.c2v.get(ic, lv)];
+                    break :blk FaceKey.init(canon_verts[0..lf.len]);
+                } else real;
+
+                geo.c2f.at(ic, j).* = try faces.add(arena, key, real);
             }
         }
     }
@@ -1212,7 +1479,12 @@ pub const Geo = struct {
     /// Everything after face enumeration, shared by 2D and 3D: pack `f2v`,
     /// classify each face, match boundary faces to boundaries, and link cells
     /// to faces and to each other.
-    fn finishConn(geo: *Geo, arena: std.mem.Allocator, faces: *FaceBuilder) !void {
+    fn finishConn(
+        geo: *Geo,
+        arena: std.mem.Allocator,
+        faces: *FaceBuilder,
+        periodic: bool,
+    ) !void {
         const gpa = geo.gpa;
 
         // --- f2v / f2nv ---
@@ -1220,12 +1492,12 @@ pub const Geo = struct {
         // traversal; matching duplicates is all they are used for.
         geo.n_faces = faces.keys.count();
         var max_fnv: usize = 0;
-        for (faces.keys.keys()) |key| max_fnv = @max(max_fnv, key.n_verts);
+        for (faces.verts.items) |key| max_fnv = @max(max_fnv, key.n_verts);
 
         geo.f2v = try Matrix(usize).init(gpa, geo.n_faces, max_fnv, null);
         @memset(geo.f2v.data, none);
         try geo.f2nv.resize(gpa, geo.n_faces);
-        for (faces.keys.keys(), 0..) |key, ff| {
+        for (faces.verts.items, 0..) |key, ff| {
             geo.f2nv.items[ff] = key.n_verts;
             for (0..key.n_verts) |j| geo.f2v.at(ff, j).* = key.verts[j];
         }
@@ -1249,6 +1521,15 @@ pub const Geo = struct {
                     geo.n_int_faces += 1;
                 },
                 else => {
+                    if (periodic) {
+                        // Far and away the likeliest cause on a periodic mesh
+                        report(
+                            "Geo: periodic merging fused {d} cells onto face {d}.\n" ++
+                                "A periodic direction needs at least three cells across it.\n",
+                            .{ n_cells, ff },
+                        );
+                        return error.PeriodicDirectionTooThin;
+                    }
                     report("Geo: face {d} is shared by {d} cells\n", .{ ff, n_cells });
                     return error.NonManifoldFace;
                 },
@@ -1414,20 +1695,64 @@ const FaceKey = struct {
 /// face, making its 3D connectivity O(n_eles * n_faces); a hash lookup keeps it
 /// linear.
 const FaceBuilder = struct {
+    /// Identity used for de-duplication. Under periodicity this holds canonical
+    /// vertex IDs, so a face and its periodic image collapse into one.
     keys: std.AutoArrayHashMapUnmanaged(FaceKey, void),
+
+    /// The face's *actual* vertices, as first registered. Kept separately
+    /// because `f2v` has to describe real geometry -- boundary matching compares
+    /// it against `bnd_pts`, which is in real vertex IDs.
+    verts: std.ArrayList(FaceKey),
+
     n_cells: std.ArrayList(usize),
 
-    const empty: FaceBuilder = .{ .keys = .empty, .n_cells = .empty };
+    const empty: FaceBuilder = .{ .keys = .empty, .verts = .empty, .n_cells = .empty };
 
     /// Global ID of `key`, registering it the first time it is seen. Face IDs
     /// are assignment order, which the hash map preserves.
-    fn add(fb: *FaceBuilder, arena: std.mem.Allocator, key: FaceKey) !usize {
+    fn add(fb: *FaceBuilder, arena: std.mem.Allocator, key: FaceKey, real: FaceKey) !usize {
         const gop = try fb.keys.getOrPut(arena, key);
-        if (!gop.found_existing) try fb.n_cells.append(arena, 0);
+        if (!gop.found_existing) {
+            try fb.n_cells.append(arena, 0);
+            try fb.verts.append(arena, real);
+        }
         fb.n_cells.items[gop.index] += 1;
         return gop.index;
     }
 };
+
+/// The vertex identification that makes periodic faces merge, plus the periods
+/// it was derived from.
+const PeriodicMap = struct {
+    /// `canon[iv]` is the representative of `iv`'s periodic equivalence class
+    canon: []const usize,
+    /// Domain period in each direction
+    period: [3]f64,
+    /// Absolute position tolerance, relative to the domain size
+    tol: f64,
+};
+
+/// Union-find root of `i`, with path compression.
+fn find(parent: []usize, i: usize) usize {
+    var root = i;
+    while (parent[root] != root) root = parent[root];
+    var walk = i;
+    while (parent[walk] != root) {
+        const next = parent[walk];
+        parent[walk] = root;
+        walk = next;
+    }
+    return root;
+}
+
+/// Merge two vertices' equivalence classes, keeping the lower ID as the root so
+/// the canonical representative is deterministic.
+fn unite(parent: []usize, a: usize, b: usize) void {
+    const ra = find(parent, a);
+    const rb = find(parent, b);
+    if (ra == rb) return;
+    if (ra < rb) parent[rb] = ra else parent[ra] = rb;
+}
 
 /// Corner-vertex indices of each face of a cell, in cyclic order. In 2D a
 /// "face" is an edge.
@@ -2298,7 +2623,17 @@ test "processConnectivity: 3D, two hexes share one face" {
     const gpa = t.allocator;
 
     var config: cfg.Config = undefined;
-    var geo = testCreateGeo(gpa, &config, 3, .{ .nx = 2, .ny = 1, .nz = 1 });
+    var geo = testCreateGeo(gpa, &config, 3, .{
+        .nx = 2,
+        .ny = 1,
+        .nz = 1,
+        .bc_bottom = .slip_wall,
+        .bc_right = .sup_out,
+        .bc_top = .symmetry,
+        .bc_left = .sup_in,
+        .bc_front = .characteristic,
+        .bc_back = .adiabatic_noslip,
+    });
     defer geo.deinit();
 
     try geo.createMesh();
@@ -2335,6 +2670,8 @@ test "processConnectivity: invariants hold on larger meshes" {
             .ny = 4,
             .bc_bottom = .slip_wall,
             .bc_top = .symmetry,
+            .bc_left = .sup_in,
+            .bc_right = .sup_out,
         });
         defer geo.deinit();
         try geo.createMesh();
@@ -2354,6 +2691,10 @@ test "processConnectivity: invariants hold on larger meshes" {
             .nz = 2,
             .bc_left = .sup_in,
             .bc_right = .sup_out,
+            .bc_bottom = .slip_wall,
+            .bc_top = .symmetry,
+            .bc_front = .characteristic,
+            .bc_back = .adiabatic_noslip,
         });
         defer geo.deinit();
         try geo.createMesh();

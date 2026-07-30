@@ -796,6 +796,28 @@ pub const Solver = struct {
         }
     }
 
+    /// Domain period in direction `d`, from the mesh if it recorded one and
+    /// otherwise from the extent of the mesh nodes.
+    fn periodInDim(s: *const Solver, d: usize) f64 {
+        const recorded = switch (d) {
+            0 => s.mesh.periodic_dx,
+            1 => s.mesh.periodic_dy,
+            else => s.mesh.periodic_dz,
+        };
+        if (recorded > 0.0) return recorded;
+
+        var lo = std.math.inf(f64);
+        var hi = -std.math.inf(f64);
+        for (0..s.n_eles) |e| {
+            for (0..s.quad.ele.n_nodes) |node| {
+                const v = s.nodes.get(node, d, e);
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+        }
+        return hi - lo;
+    }
+
     /// Hand the faces their geometry: the left element's outward unit normal,
     /// each side's face scaling, and the flux point coordinates.
     ///
@@ -823,6 +845,17 @@ pub const Solver = struct {
         }
     }
 
+    /// Largest mismatch between the two sides' flux point coordinates, allowing
+    /// for one periodic wrap.
+    ///
+    /// This is the one to use on a mesh with periodic boundaries: the two sides
+    /// of a periodic interface sit a full domain length apart, which
+    /// `fptPairingError` reports as a mismatch. A wrong pairing shows up as a
+    /// distance that is neither zero nor a period.
+    pub fn fptPairingErrorPeriodic(s: *const Solver) f64 {
+        return s.pairingError(true);
+    }
+
     /// Largest mismatch between the two sides' flux point coordinates.
     ///
     /// `geo.setupGlobalFpts` pairs the two sides of an interface by reversing
@@ -830,6 +863,17 @@ pub const Solver = struct {
     /// but is an *assumption*. This measures it: on a valid mesh the result is
     /// at roundoff, and anything larger means the pairing is wrong.
     pub fn fptPairingError(s: *const Solver) f64 {
+        return s.pairingError(false);
+    }
+
+    fn pairingError(s: *const Solver, comptime wrap: bool) f64 {
+        // Hoisted: periodInDim scans every mesh node when the mesh recorded no
+        // period, which inside the flux point loop is quadratic in mesh size.
+        var period: [3]f64 = .{ 0, 0, 0 };
+        if (wrap) {
+            for (0..s.n_dims) |d| period[d] = s.periodInDim(d);
+        }
+
         const ele = &s.quad.ele;
         const mesh = s.mesh;
 
@@ -843,7 +887,12 @@ pub const Solver = struct {
 
                 var d2: f64 = 0.0;
                 for (0..s.n_dims) |d| {
-                    const diff = s.coord_fpts.get(fpt, d, e) - s.faces.coord.get(d, gf);
+                    var diff = @abs(s.coord_fpts.get(fpt, d, e) - s.faces.coord.get(d, gf));
+                    if (wrap) {
+                        // Fold out a whole period: a periodic partner is exactly
+                        // one domain length away, which is not an error.
+                        if (period[d] > 0.0) diff = @min(diff, @abs(diff - period[d]));
+                    }
                     d2 += diff * diff;
                 }
                 worst = @max(worst, @sqrt(d2));

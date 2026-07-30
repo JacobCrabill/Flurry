@@ -53,6 +53,14 @@ fn testConfig(
         .xmax = 2.0,
         .ymin = 0.0,
         .ymax = 3.0,
+        // CreateMeshConfig defaults every side to periodic; make that opt-in so
+        // a test only exercises the periodic path when it means to.
+        .bc_bottom = .characteristic,
+        .bc_right = .characteristic,
+        .bc_top = .characteristic,
+        .bc_left = .characteristic,
+        .bc_front = .characteristic,
+        .bc_back = .characteristic,
     };
     return config;
 }
@@ -749,6 +757,246 @@ test "free-stream is preserved on cells away from the boundary" {
             }
             // A 4x4 mesh has a 2x2 block of fully interior cells
             try testing.expectEqual(@as(usize, 4), n_interior);
+        }
+    }
+}
+
+/// A doubly-periodic Cartesian mesh, ready for a solver.
+fn testMeshPeriodic(gpa: std.mem.Allocator, config: *cfg.Config) !Geo {
+    config.create_mesh.?.bc_bottom = .periodic;
+    config.create_mesh.?.bc_top = .periodic;
+    config.create_mesh.?.bc_left = .periodic;
+    config.create_mesh.?.bc_right = .periodic;
+    return testMesh(gpa, config);
+}
+
+test "a periodic mesh has no boundary faces at all" {
+    const gpa = testing.allocator;
+
+    // Every face of a doubly-periodic box is interior: the boundary faces pair
+    // up across the domain and merge.
+    var config = testConfig(2, .euler_ns, false, 4, 3);
+    var mesh = try testMeshPeriodic(gpa, &config);
+    defer mesh.deinit();
+
+    // A 4x3 torus: 4*3 faces normal to x, 4*3 normal to y
+    try testing.expectEqual(@as(usize, 24), mesh.n_faces);
+    try testing.expectEqual(@as(usize, 24), mesh.n_int_faces);
+    try testing.expectEqual(@as(usize, 0), mesh.n_bnd_faces);
+    try testing.expectEqual(@as(usize, 0), mesh.n_gfpts_bnd);
+
+    // Every cell has four neighbours, and no cell face is marked as boundary
+    for (0..mesh.n_eles) |e| {
+        for (0..mesh.c2nf.items[e]) |j| {
+            try testing.expectEqual(@as(usize, 0), mesh.c2b.get(e, j));
+            try testing.expect(mesh.c2c.get(e, j) != geo_mod.none);
+        }
+    }
+
+    // Every face is shared by exactly two cells
+    for (0..mesh.n_faces) |ff| {
+        try testing.expect(mesh.f2c.get(ff, 0) != geo_mod.none);
+        try testing.expect(mesh.f2c.get(ff, 1) != geo_mod.none);
+        try testing.expectEqual(FaceType.internal, mesh.face_type.items[ff]);
+    }
+}
+
+test "periodic pairing wraps opposite sides of the domain" {
+    const gpa = testing.allocator;
+
+    var config = testConfig(3, .euler_ns, false, 4, 3);
+    var mesh = try testMeshPeriodic(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh);
+    defer s.deinit();
+
+    const lx = config.create_mesh.?.xmax - config.create_mesh.?.xmin;
+    const ly = config.create_mesh.?.ymax - config.create_mesh.?.ymin;
+
+    // The two sides of a periodic interface are a full domain length apart, so
+    // the plain coordinate check must see that -- and the periodic-aware one
+    // must not.
+    try testing.expect(s.fptPairingError() > 0.5 * @min(lx, ly));
+    try testing.expect(s.fptPairingErrorPeriodic() < 1e-12);
+
+    // Cells on opposite edges really are neighbours: cell 0 is at the
+    // lower-left, and its -x and -y neighbours are on the far side.
+    const nx: usize = 4;
+    const ny: usize = 3;
+    var found_wrap = false;
+    for (0..mesh.c2nf.items[0]) |j| {
+        const nb = mesh.c2c.get(0, j);
+        // createMesh numbers cells x-outer, y-inner
+        if (nb == (nx - 1) * ny or nb == ny - 1) found_wrap = true;
+    }
+    try testing.expect(found_wrap);
+}
+
+test "free-stream is preserved on a periodic mesh" {
+    const gpa = testing.allocator;
+
+    // With no boundaries at all, a uniform state must be preserved exactly --
+    // and unlike the characteristic far field, nothing here can quietly damp an
+    // error back towards the freestream.
+    for ([_]cfg.Equation{ .adv_diff, .euler_ns }) |equation| {
+        for ([_]u8{ 1, 2, 3 }) |order| {
+            var config = testConfig(order, equation, false, 4, 3);
+            var mesh = try testMeshPeriodic(gpa, &config);
+            defer mesh.deinit();
+
+            var s = try Solver.init(gpa, &config, &mesh);
+            defer s.deinit();
+
+            s.initializeU();
+            try s.computeResidual(0);
+
+            const ele = &s.quad.ele;
+            for (0..s.n_eles) |e| {
+                for (0..ele.n_spts) |spt| {
+                    for (0..s.n_vars) |n| {
+                        try testing.expectApproxEqAbs(
+                            @as(f64, 0.0),
+                            s.divf_spts.get(0, spt, n, e),
+                            1e-9,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "a periodic mesh conserves mass exactly" {
+    const gpa = testing.allocator;
+
+    // A closed domain: the total of every conserved variable cannot change,
+    // because the flux out of one cell is the flux into its neighbour. This is
+    // the strongest statement about the periodic wiring -- it fails if any
+    // interface is paired to the wrong partner or with the wrong sign.
+    var config = testConfig(3, .euler_ns, false, 4, 3);
+    var mesh = try testMeshPeriodic(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh);
+    defer s.deinit();
+
+    // A non-uniform state, so the fluxes are genuinely doing something
+    const ele = &s.quad.ele;
+    for (0..ele.n_spts) |spt| {
+        for (0..s.n_eles) |e| {
+            const x = s.coord_spts.get(spt, 0, e);
+            const y = s.coord_spts.get(spt, 1, e);
+            const bump = 0.1 * @sin(std.math.pi * x) * @cos(2.0 * std.math.pi * y / 3.0);
+            s.u_spts.at(spt, 0, e).* = 1.0 + bump;
+            s.u_spts.at(spt, 1, e).* = 0.3 * (1.0 + bump);
+            s.u_spts.at(spt, 2, e).* = -0.1 * (1.0 + bump);
+            s.u_spts.at(spt, 3, e).* = 2.5 + bump;
+        }
+    }
+
+    try s.computeResidual(0);
+
+    // The integral of the divergence over a closed domain is zero for every
+    // variable. divF already carries |J|, so the reference weights suffice.
+    for (0..s.n_vars) |n| {
+        var total: f64 = 0.0;
+        var scale: f64 = 0.0;
+        for (0..ele.n_spts) |spt| {
+            for (0..s.n_eles) |e| {
+                const r = ele.weights_spts[spt] * s.divf_spts.get(0, spt, n, e);
+                total += r;
+                scale += @abs(r);
+            }
+        }
+        try testing.expect(scale > 1e-6); // the fluxes are non-trivial
+        try testing.expectApproxEqAbs(@as(f64, 0.0), total / scale, 1e-12);
+    }
+}
+
+test "a periodic direction spanning two cells is rejected" {
+    const gpa = testing.allocator;
+
+    // Identifying periodic faces by vertex set is exact only while no two
+    // distinct faces share one. Two cells across a periodic direction breaks
+    // that: the boundary line running along that direction closes into a
+    // two-edge loop, and both edges span the same vertex pair. Note this shows
+    // up in the faces normal to the *other* direction, so it does not matter
+    // whether that one is periodic as well.
+    for ([_][2]u32{ .{ 2, 4 }, .{ 4, 2 }, .{ 2, 2 } }) |n| {
+        var config = testConfig(2, .euler_ns, false, n[0], n[1]);
+        config.create_mesh.?.bc_left = .periodic;
+        config.create_mesh.?.bc_right = .periodic;
+        if (n[1] == 2) {
+            config.create_mesh.?.bc_bottom = .periodic;
+            config.create_mesh.?.bc_top = .periodic;
+        }
+
+        var mesh: Geo = .{ .gpa = gpa, .io = undefined, .config = config };
+        defer mesh.deinit();
+        try mesh.createMesh();
+
+        try testing.expectError(error.PeriodicDirectionTooThin, mesh.processConnectivity());
+    }
+
+    // Three cells across is enough
+    {
+        var config = testConfig(2, .euler_ns, false, 3, 3);
+        var mesh = try testMeshPeriodic(gpa, &config);
+        defer mesh.deinit();
+        try testing.expectEqual(@as(usize, 0), mesh.n_bnd_faces);
+    }
+}
+
+test "a direction is only periodic if its boundary faces say so" {
+    const gpa = testing.allocator;
+
+    // A channel: periodic in x, walled in y, and deliberately only two cells
+    // thick. Matching vertices purely by separation would call y periodic too,
+    // because the two ends of the domain are exactly the bounding-box y extent
+    // apart and both lie on the x-periodic boundary. That misreading fuses the
+    // channel's two x-boundary edges and rejects a perfectly good mesh.
+    const nx: usize = 4;
+    const ny: usize = 2;
+
+    var config = testConfig(3, .euler_ns, false, nx, ny);
+    config.create_mesh.?.bc_left = .periodic;
+    config.create_mesh.?.bc_right = .periodic;
+
+    var mesh = try testMesh(gpa, &config);
+    defer mesh.deinit();
+
+    // Only the walls are left: x wrapped, y did not.
+    try testing.expectEqual(nx * ny * 4, 2 * mesh.n_int_faces + mesh.n_bnd_faces);
+    try testing.expectEqual(2 * nx, mesh.n_bnd_faces);
+
+    // Every cell has a neighbour in x, and the end cells wrap to each other
+    const ymin = config.create_mesh.?.ymin;
+    const ymax = config.create_mesh.?.ymax;
+    for (0..mesh.n_faces) |ff| {
+        if (mesh.face_type.items[ff] == .internal) continue;
+        // A boundary face must be one of the y walls
+        var y: f64 = 0.0;
+        for (0..mesh.f2nv.items[ff]) |j| y += mesh.xv.get(mesh.f2v.get(ff, j), 1);
+        y /= @floatFromInt(mesh.f2nv.items[ff]);
+        try testing.expect(@abs(y - ymin) < 1e-12 or @abs(y - ymax) < 1e-12);
+    }
+
+    // And the solver still preserves free-stream across the wrap
+    var s = try Solver.init(gpa, &config, &mesh);
+    defer s.deinit();
+
+    try testing.expect(s.fptPairingErrorPeriodic() < 1e-12);
+
+    s.initializeU();
+    try s.computeResidual(0);
+
+    const ele = &s.quad.ele;
+    for (0..s.n_eles) |e| {
+        for (0..ele.n_spts) |spt| {
+            for (0..s.n_vars) |n| {
+                try testing.expectApproxEqAbs(@as(f64, 0.0), s.divf_spts.get(0, spt, n, e), 1e-9);
+            }
         }
     }
 }

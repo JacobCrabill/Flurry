@@ -1,0 +1,63 @@
+// Shu's isentropic Euler vortex on a doubly-periodic box.
+//
+// The vortex is an exact solution of the Euler equations that simply convects,
+// here at (1, 1), so it returns to where it started after t = 10 -- and the
+// difference between what comes back and what was there to begin with is the
+// scheme's error, reported as `L2 error[rho]` every `error_freq` steps.
+//
+// This is the case free-stream preservation cannot stand in for: a constant is
+// in the span of every basis and survives operators that are wrong, whereas a
+// vortex exercises the derivative and divergence operators, the metric terms,
+// the Rusanov flux and the periodic pairing all at once.
+//
+// For the full refinement sweep, run `zig build convergence`.
+.{
+  .core = .{
+      .n_dims = 2,
+      .mesh_file = "",
+      .order = 3,
+  },
+
+  .equation = .{
+      .equation = .euler_ns,
+      .viscous = false,
+  },
+
+  .time = .{
+      .dt_scheme = .rk44,
+      .n_steps = 2000,
+      .dt = 5e-3,
+  },
+
+  .output = .{
+      .output_prefix = "vortex",
+      .write_freq = 500,
+      .report_freq = 250,
+      // Non-zero, which is also what keeps `test_case.n_qpts_1d` from being
+      // zeroed during post-parse init
+      .error_freq = 500,
+  },
+
+  .test_case = .{
+      // 1 = Shu vortex; 3 is the Vincent et al. vortex, on a stream of (0, 1)
+      .test_case = 1,
+      // Density: on a finite domain the vortex still carries ~2e-5 of velocity
+      // perturbation at the boundary but only ~1e-11 of density, so density is
+      // the variable whose error is the scheme's rather than the domain's
+      .err_field = 0,
+      .n_qpts_1d = 6,
+  },
+
+  .create_mesh = .{
+      .nx = 32,
+      .ny = 32,
+      .xmin = -5.0,
+      .xmax = 5.0,
+      .ymin = -5.0,
+      .ymax = 5.0,
+      .bc_bottom = .periodic,
+      .bc_top = .periodic,
+      .bc_left = .periodic,
+      .bc_right = .periodic,
+  },
+}

@@ -32,8 +32,10 @@ pub const Run = struct {
     mesh: Geo,
     solver: Solver,
 
-    /// Whether the "no solution output yet" notice has already been printed
+    /// Whether the "nothing is written" notice has already been printed
     warned_no_output: bool = false,
+    /// Whether the "no exact solution" notice has already been printed
+    warned_no_error: bool = false,
 
     /// Build the mesh, set up the solver and apply the initial condition.
     ///
@@ -64,7 +66,7 @@ pub const Run = struct {
         try r.mesh.setupGlobalFpts(@as(usize, config.core.order) + 1);
 
         r.solver = try Solver.init(gpa, config, &r.mesh);
-        r.solver.initializeU();
+        try r.solver.initializeU();
     }
 
     pub fn deinit(r: *Run) void {
@@ -112,6 +114,10 @@ pub const Run = struct {
                 try r.writeSolution(w);
             }
 
+            if (o.error_freq != 0 and s.current_iter % o.error_freq == 0) {
+                try r.writeError(w);
+            }
+
             const due = o.report_freq != 0 and s.current_iter % o.report_freq == 0;
             if (due or t.res_tol > 0.0) {
                 // `divf_spts` holds one residual per RK stage; stage 0 is the one
@@ -142,6 +148,10 @@ pub const Run = struct {
         }
 
         try w.print("\n {s} after {d} steps, t = {e:.6}\n", .{ reason, s.current_iter, s.flow_time });
+
+        // Worth having whatever the cadence was: the error at the end is the
+        // number a convergence study is after.
+        if (o.error_freq != 0) try r.writeError(w);
         try w.flush();
 
         // Reported first, so the numbers that led here are on screen.
@@ -236,6 +246,25 @@ pub const Run = struct {
         for (0..s.n_vars) |n| try w.print("{e:>14.4}", .{res[n]});
         try w.print("{d:>10.2}\n", .{secs});
         try w.flush();
+    }
+
+    /// L2 error against the exact solution, when the case has one.
+    fn writeError(r: *Run, w: *Io.Writer) !void {
+        const err = r.solver.l2Error(r.gpa) catch |e| switch (e) {
+            // A case with no exact solution is a legitimate thing to run; say
+            // so once rather than failing the run or repeating every interval.
+            error.NoExactSolution, error.NoQuadraturePoints => {
+                if (r.warned_no_error) return;
+                r.warned_no_error = true;
+                try w.print("\n note: error_freq is set, but this case has no exact solution ({t})\n\n", .{e});
+                return;
+            },
+            else => return e,
+        };
+        try w.print("          L2 error[{s}] = {e:.6}\n", .{
+            varName(r.config.equation.equation, r.solver.n_dims, r.config.test_case.err_field),
+            err,
+        });
     }
 
     /// Write the solution for ParaView, if the config asked for it.

@@ -30,8 +30,14 @@ pub const Error = error{
     NegativeJacobian,
     /// `mesh.setupGlobalFpts` was not run, or was run for a different order
     ConnectivityNotProcessed,
+    /// `l2Error` needs a quadrature rule, which `test_case.n_qpts_1d` sets and
+    /// `Loader.initialize` zeroes when `output.error_freq` is 0
+    NoQuadraturePoints,
+    /// The configured test case has no exact solution, or `err_field` names a
+    /// variable this equation set does not have
+    NoExactSolution,
     NotImplemented,
-} || faces_mod.Error;
+} || faces_mod.Error || testcase.Error;
 
 /// Explicit Runge-Kutta tableau.
 ///
@@ -496,16 +502,145 @@ pub const Solver = struct {
 
     // ---- Initialization ----
 
-    /// Set a uniform freestream state everywhere.
-    pub fn initializeU(s: *Solver) void {
+    /// Apply the initial condition `test_case.test_case` selects.
+    ///
+    /// The solution is *collocated* at the solution points, not projected onto
+    /// the basis. That is what ZEFR does and it costs one order in the initial
+    /// error, which does not change the asymptotic rate.
+    pub fn initializeU(s: *Solver) Error!void {
         const ele = &s.quad.ele;
-        const state = s.params.freestreamState(2, s.config.equation.equation);
+        const tc = try testcase.TestCase.fromConfig(s.config);
 
+        if (!tc.isAnalytic()) {
+            const state = s.params.freestreamState(2, s.config.equation.equation);
+            for (0..ele.n_spts) |spt| {
+                for (0..s.n_vars) |n| {
+                    for (0..s.n_eles) |e| s.u_spts.at(spt, n, e).* = state[n];
+                }
+            }
+            return;
+        }
+
+        const bounds = s.meshBounds();
         for (0..ele.n_spts) |spt| {
-            for (0..s.n_vars) |n| {
-                for (0..s.n_eles) |e| s.u_spts.at(spt, n, e).* = state[n];
+            for (0..s.n_eles) |e| {
+                const state = testcase.exactState(
+                    tc,
+                    s.params,
+                    s.coord_spts.get(spt, 0, e),
+                    s.coord_spts.get(spt, 1, e),
+                    0.0,
+                    .{ bounds[0], bounds[1] },
+                );
+                for (0..s.n_vars) |n| s.u_spts.at(spt, n, e).* = state[n];
             }
         }
+    }
+
+    /// L2 norm of the error in variable `test_case.err_field`, against the
+    /// exact solution at the current `flow_time`.
+    ///
+    /// Measured at a separate Gauss-Legendre rule (`test_case.n_qpts_1d`)
+    /// rather than at the solution points: the scheme is exact *at* its own
+    /// collocation points to within its own consistency, so sampling there
+    /// flatters it. `Loader.initialize` zeroes `n_qpts_1d` when `error_freq` is
+    /// 0, so a case that never asks for error pays nothing for the points.
+    ///
+    /// Normalized by the domain volume, making it an RMS error: the value is
+    /// comparable across meshes, which is the whole point of a refinement study.
+    pub fn l2Error(s: *const Solver, gpa: std.mem.Allocator) Error!f64 {
+        const ele = &s.quad.ele;
+        if (ele.n_qpts == 0) return error.NoQuadraturePoints;
+
+        const tc = try testcase.TestCase.fromConfig(s.config);
+        if (!tc.isAnalytic()) return error.NoExactSolution;
+
+        const n = s.config.test_case.err_field;
+        if (n >= s.n_vars) return error.NoExactSolution;
+
+        var u_qpts = try Array3(f64).init(gpa, ele.n_qpts, s.n_vars, s.n_eles);
+        defer u_qpts.deinit(gpa);
+        gemm(
+            ele.n_qpts,
+            s.n_vars * s.n_eles,
+            ele.n_spts,
+            ele.oppE_qpts.data,
+            s.u_spts.data,
+            u_qpts.data,
+            .overwrite,
+        );
+
+        const nd = s.n_dims;
+        const bounds = s.meshBounds();
+
+        var dshape = try Matrix(f64).init(gpa, ele.n_nodes, nd, null);
+        defer dshape.deinit(gpa);
+        const shape = try gpa.alloc(f64, ele.n_nodes);
+        defer gpa.free(shape);
+
+        var sq_error: f64 = 0.0;
+        var volume: f64 = 0.0;
+
+        for (0..ele.n_qpts) |qpt| {
+            const loc = Element.locRow(&ele.loc_qpts, qpt, nd);
+            try ele.vtable.calcShape(ele, loc, shape);
+            try ele.vtable.calcDShape(ele, loc, &dshape);
+
+            for (0..s.n_eles) |e| {
+                var coord: [2]f64 = .{ 0, 0 };
+                for (0..nd) |d| {
+                    var sum: f64 = 0.0;
+                    for (0..ele.n_nodes) |node| sum += shape[node] * s.nodes.get(node, d, e);
+                    coord[d] = sum;
+                }
+
+                // |J| at the quadrature point, so the integral is over physical
+                // space rather than reference space
+                var jaco: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
+                for (0..nd) |dr| {
+                    for (0..nd) |dp| {
+                        var sum: f64 = 0.0;
+                        for (0..ele.n_nodes) |node| {
+                            sum += dshape.get(node, dr) * s.nodes.get(node, dp, e);
+                        }
+                        jaco[dr][dp] = sum;
+                    }
+                }
+                const det = jaco[0][0] * jaco[1][1] - jaco[0][1] * jaco[1][0];
+
+                const exact = testcase.exactState(
+                    tc,
+                    s.params,
+                    coord[0],
+                    coord[1],
+                    s.flow_time,
+                    .{ bounds[0], bounds[1] },
+                );
+
+                const err = exact[n] - u_qpts.get(qpt, n, e);
+                const w = ele.weights_qpts[qpt] * det;
+                sq_error += w * err * err;
+                volume += w;
+            }
+        }
+
+        return @sqrt(sq_error / volume);
+    }
+
+    /// Bounding box of the mesh nodes, as `[dim][lo, hi]`.
+    pub fn meshBounds(s: *const Solver) [3][2]f64 {
+        var out: [3][2]f64 = @splat(.{ std.math.inf(f64), -std.math.inf(f64) });
+        for (0..s.n_eles) |e| {
+            for (0..s.quad.ele.n_nodes) |node| {
+                for (0..s.n_dims) |d| {
+                    const v = s.nodes.get(node, d, e);
+                    out[d][0] = @min(out[d][0], v);
+                    out[d][1] = @max(out[d][1], v);
+                }
+            }
+        }
+        for (s.n_dims..3) |d| out[d] = .{ 0, 0 };
+        return out;
     }
 
     // ---- Operator applications ----
@@ -849,15 +984,9 @@ pub const Solver = struct {
         };
         if (recorded > 0.0) return recorded;
 
-        var lo = std.math.inf(f64);
-        var hi = -std.math.inf(f64);
-        for (0..s.n_eles) |e| {
-            for (0..s.quad.ele.n_nodes) |node| {
-                const v = s.nodes.get(node, d, e);
-                lo = @min(lo, v);
-                hi = @max(hi, v);
-            }
-        }
+        const b = s.meshBounds()[d];
+        const lo = b[0];
+        const hi = b[1];
         return hi - lo;
     }
 
@@ -1083,6 +1212,7 @@ const Geo = geo_mod.Geo;
 const Element = @import("element.zig").Element;
 const Quad = @import("eles/quads.zig").Quad;
 const faces_mod = @import("faces.zig");
+const testcase = @import("testcase.zig");
 const Faces = faces_mod.Faces;
 
 const Matrix = @import("util/matrix.zig").Matrix;

@@ -9,6 +9,7 @@ pub const faces = @import("faces.zig");
 pub const solver = @import("solver.zig");
 pub const driver = @import("driver.zig");
 pub const vtu = @import("vtu.zig");
+pub const testcase = @import("testcase.zig");
 pub const points = @import("points.zig");
 pub const polynomials = @import("math/polynomials.zig");
 
@@ -28,4 +29,5 @@ test {
     _ = @import("solver_test.zig");
     _ = @import("driver_test.zig");
     _ = @import("vtu_test.zig");
+    _ = @import("testcase_test.zig");
 }

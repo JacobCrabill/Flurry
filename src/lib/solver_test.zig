@@ -443,7 +443,7 @@ test "uniform flow has exactly zero residual" {
             var s = try Solver.init(gpa, &config, &mesh);
             defer s.deinit();
 
-            s.initializeU();
+            try s.initializeU();
             s.extrapolateU();
             s.computeFluxSpts();
             s.computeDivFSpts(0);
@@ -723,7 +723,7 @@ test "free-stream is preserved on cells away from the boundary" {
             var s = try Solver.init(gpa, &config, &mesh);
             defer s.deinit();
 
-            s.initializeU();
+            try s.initializeU();
 
             // computeResidual itself still stops at applyBcs, so drive the
             // chain directly.
@@ -848,7 +848,7 @@ test "free-stream is preserved on a periodic mesh" {
             var s = try Solver.init(gpa, &config, &mesh);
             defer s.deinit();
 
-            s.initializeU();
+            try s.initializeU();
             try s.computeResidual(0);
 
             const ele = &s.quad.ele;
@@ -988,7 +988,7 @@ test "a direction is only periodic if its boundary faces say so" {
 
     try testing.expect(s.fptPairingErrorPeriodic() < 1e-12);
 
-    s.initializeU();
+    try s.initializeU();
     try s.computeResidual(0);
 
     const ele = &s.quad.ele;
@@ -1027,7 +1027,7 @@ test "free-stream is preserved over the whole domain" {
             var s = try Solver.init(gpa, &config, &mesh);
             defer s.deinit();
 
-            s.initializeU();
+            try s.initializeU();
             try s.computeResidual(0);
 
             const ele = &s.quad.ele;
@@ -1074,7 +1074,7 @@ test "a slip wall reflects without generating mass" {
     var s = try Solver.init(gpa, &config, &mesh);
     defer s.deinit();
 
-    s.initializeU();
+    try s.initializeU();
     try s.computeResidual(0);
 
     const ele = &s.quad.ele;
@@ -1136,7 +1136,7 @@ test "computeResidual and update run end to end" {
 
     var s = try Solver.init(gpa, &config, &mesh);
     defer s.deinit();
-    s.initializeU();
+    try s.initializeU();
 
     try testing.expect(s.faces.n_gfpts_bnd > 0);
     try s.computeResidual(0);
@@ -1607,7 +1607,7 @@ test "free-stream is preserved on a non-affine mesh" {
             try testing.expect(worst_spread > 1e-3);
             try testing.expect(worst_asym > 1e-2);
 
-            s.initializeU();
+            try s.initializeU();
             s.extrapolateU();
             s.scatterUToFaces();
             s.computeFluxSpts();

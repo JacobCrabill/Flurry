@@ -60,6 +60,27 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // ------ Convergence study ------
+    // Its own executable rather than a test: it wants ReleaseFast and takes
+    // long enough that it has no business in `zig build test`.
+
+    const convergence = b.addExecutable(.{
+        .name = "flurry-convergence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/convergence.zig"),
+            .target = target,
+            .optimize = if (optimize == .debug) .fast else optimize,
+            .imports = &.{
+                .{ .name = "flurry", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(convergence);
+    const conv_cmd = b.addRunArtifact(convergence);
+    conv_cmd.addPassthruArgs();
+    b.step("convergence", "Measure the scheme's order of accuracy")
+        .dependOn(&conv_cmd.step);
+
     // ------ Run ------
 
     const run_step = b.step("run", "Run the app");

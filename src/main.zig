@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer pc.deinit();
 
-    config.Loader.initialize(&pc.value);
+    try config.Loader.initialize(&pc.value);
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writer(io, &stdout_buf);

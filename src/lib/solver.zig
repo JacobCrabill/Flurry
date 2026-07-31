@@ -732,7 +732,7 @@ pub const Solver = struct {
     /// error, which does not change the asymptotic rate.
     pub fn initializeU(s: *Solver) Error!void {
         const ele = &s.quad.ele;
-        const tc = try testcase.TestCase.fromConfig(s.config);
+        const tc = s.config.test_case.test_case;
 
         if (!tc.isAnalytic()) {
             const state = s.params.freestreamState(2, s.config.equation.equation);
@@ -777,7 +777,7 @@ pub const Solver = struct {
         try s.syncToHost();
         if (ele.n_qpts == 0) return error.NoQuadraturePoints;
 
-        const tc = try testcase.TestCase.fromConfig(s.config);
+        const tc = s.config.test_case.test_case;
         if (!tc.isAnalytic()) return error.NoExactSolution;
 
         const n = s.config.test_case.err_field;

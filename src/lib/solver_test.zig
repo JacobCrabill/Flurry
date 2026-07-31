@@ -40,7 +40,7 @@ fn testConfig(
         .advdiff_D = 0.1,
     };
     config.time = .{ .dt_scheme = .rk44, .n_steps = 1, .dt = 1e-3 };
-    config.test_case = .{ .test_case = 0, .err_field = 0, .n_qpts_1d = 0 };
+    config.test_case = .{ .test_case = .uniform, .err_field = 0, .n_qpts_1d = 0 };
     config.flux = .{};
     config.gas_properties = .{};
     config.freestream = .{ .mach_fs = 0.3, .norm_fs = .{ 1.0, 0.0, 0.0 }, .fix_vis = true };

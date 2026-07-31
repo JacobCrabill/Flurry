@@ -11,6 +11,8 @@ pub const DtScheme = enum { euler, rk44, rk54, rkJ, steady };
 pub const FluxConvType = enum { rusanov, roe };
 pub const FluxViscType = enum { ldg };
 
+pub const SolutionPointType = enum { legendre };
+
 pub const BoundaryCondition = enum {
     // zig fmt: off
     none, periodic, characteristic, sup_in, sup_out, slip_wall,
@@ -34,9 +36,6 @@ pub const EquationConfig = struct {
     equation: Equation,
     viscous: bool = false,
     disable_nondim: bool = false,
-    source: bool = false,
-    squeeze: bool = false,
-    s_factor: f64 = 0.0,
     advdiff_A: [3]f64 = undefined,
     advdiff_D: f64 = undefined,
 };
@@ -91,7 +90,7 @@ pub const OutputConfig = struct {
 };
 
 pub const TestCaseConfig = struct {
-    test_case: u32 = 0,
+    test_case: TestCase = .uniform,
     err_field: u32 = 0,
     n_qpts_1d: u32 = 5,
 };
@@ -102,7 +101,7 @@ pub const FluxConfig = struct {
     rus_k: f64 = 0.0,
     ldg_b: f64 = 0.5,
     ldg_tau: f64 = 1.0,
-    spt_type: []const u8 = "Legendre",
+    spt_type: SolutionPointType = .legendre,
 };
 
 pub const GasPropertiesConfig = struct {
@@ -128,6 +127,27 @@ pub const WallConditionsConfig = struct {
     mach_wall: f64 = 0.0,
     T_wall: f64 = 300.0,
     norm_wall: [3]f64 = .{ 1.0, 0.0, 0.0 },
+};
+
+/// Which analytic solution `config.test_case.test_case` selects.
+pub const TestCase = enum(u32) {
+    /// A uniform freestream. Not analytic in any interesting sense, but it is
+    /// an exact steady solution, which is what the free-stream checks rely on.
+    uniform = 0,
+    /// Shu's isentropic Euler vortex, riding on a stream of (1, 1)
+    shu_vortex = 1,
+    /// `sin(pi x) sin(pi y)` advected by `advdiff_A` and damped by `advdiff_D`.
+    /// Exactly periodic on `[-1, 1]^2`, so unlike the vortices it carries no
+    /// modelling error of its own -- which makes it the case to trust when a
+    /// measured rate is in doubt.
+    sine_wave = 2,
+    /// The isentropic vortex of Vincent et al., riding on a stream of (0, 1)
+    vincent_vortex = 3,
+
+    /// Whether this case has an exact solution to measure error against.
+    pub fn isAnalytic(tc: TestCase) bool {
+        return tc != .uniform;
+    }
 };
 
 /// Map from mesh boundary name -> BC enum. Ziggy dictionaries (`{"name": val, ...}`)
@@ -294,10 +314,11 @@ pub const Loader = struct {
         w.interface.flush() catch return;
     }
 
-    /// Post-parse init from CONFIG_PLAN.md "Init / Validation Logic".
-    pub fn initialize(cfg: *Config) void {
+    /// Post-Process and validate the configuration
+    pub fn initialize(cfg: *Config) !void {
         validateDimensions(cfg);
         applyReportingDefaults(cfg);
+        try validateTestCase(cfg);
     }
 
     fn validateDimensions(cfg: *Config) void {
@@ -313,3 +334,12 @@ pub const Loader = struct {
 
     pub const Error = error{ OutOfMemory, FileNotFound, ParseError };
 };
+
+pub fn validateTestCase(cfg: *const Config) !void {
+    const ok = switch (cfg.test_case.test_case) {
+        .uniform => true,
+        .sine_wave => cfg.equation.equation == .adv_diff,
+        .shu_vortex, .vincent_vortex => cfg.equation.equation == .euler_ns,
+    };
+    if (!ok) return error.UnsupportedTestCase;
+}

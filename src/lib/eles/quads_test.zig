@@ -21,7 +21,7 @@ const points = @import("../points.zig");
 fn testConfig(n_qpts_1d: u32) cfg.Config {
     var config: cfg.Config = undefined;
     config.core = .{ .n_dims = 2, .mesh_file = "", .order = 3 };
-    config.test_case = .{ .test_case = 0, .err_field = 0, .n_qpts_1d = n_qpts_1d };
+    config.test_case = .{ .test_case = .uniform, .err_field = 0, .n_qpts_1d = n_qpts_1d };
     return config;
 }
 

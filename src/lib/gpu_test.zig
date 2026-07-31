@@ -190,7 +190,7 @@ fn testConfig(order: u8, n: u32) cfg.Config {
     config.time = .{ .dt_scheme = .rk44, .n_steps = 0, .dt = 1e-3 };
     config.restart = null;
     config.output = .{ .output_prefix = "gpu", .write_freq = 0, .report_freq = 0 };
-    config.test_case = .{ .test_case = 1, .err_field = 0, .n_qpts_1d = 0 };
+    config.test_case = .{ .test_case = .shu_vortex, .err_field = 0, .n_qpts_1d = 0 };
     config.flux = .{};
     config.gas_properties = .{};
     config.freestream = .{};
@@ -371,7 +371,7 @@ test "a case with a CPU fallback keeps host-visible arrays" {
     // stale block, so those runs stay host-visible and pay for it.
     var config = testConfig(2, 4);
     config.equation.equation = .adv_diff;
-    config.test_case.test_case = 2;
+    config.test_case.test_case = .sine_wave;
     config.create_mesh.?.xmin = -1.0;
     config.create_mesh.?.xmax = 1.0;
     config.create_mesh.?.ymin = -1.0;

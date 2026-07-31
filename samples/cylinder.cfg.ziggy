@@ -9,8 +9,6 @@
       .equation = .euler_ns,
       .viscous = true,
       .disable_nondim = false,
-      .source = false,
-      .squeeze = false,
   },
 
   .time = .{
@@ -31,7 +29,7 @@
   },
 
   .test_case = .{
-      .test_case = 0,
+      .test_case = .uniform,
       .err_field = 0,
       .n_qpts_1d = 5,
   },

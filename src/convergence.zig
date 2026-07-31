@@ -48,7 +48,7 @@ const cfl = 0.1;
 /// One case in the study: what it is, and the domain it is exactly periodic on.
 const Study = struct {
     name: []const u8,
-    test_case: u32,
+    test_case: cfg.TestCase,
     equation: cfg.Equation,
     /// Half-width of the square domain
     half: f64,
@@ -67,7 +67,7 @@ const studies = [_]Study{
     // measured rate is in doubt, this is the one to believe.
     .{
         .name = "advected sine wave",
-        .test_case = 2,
+        .test_case = .sine_wave,
         .equation = .adv_diff,
         .half = 1.0,
         .speed = 1.5,
@@ -78,7 +78,7 @@ const studies = [_]Study{
     // the Riemann solver all participate.
     .{
         .name = "Shu isentropic vortex",
-        .test_case = 1,
+        .test_case = .shu_vortex,
         .equation = .euler_ns,
         .half = domain,
         .speed = 3.0,
@@ -90,7 +90,7 @@ const studies = [_]Study{
     // not the Euler path they share.
     .{
         .name = "Vincent isentropic vortex",
-        .test_case = 3,
+        .test_case = .vincent_vortex,
         .equation = .euler_ns,
         .half = 10.0,
         .speed = 3.5,

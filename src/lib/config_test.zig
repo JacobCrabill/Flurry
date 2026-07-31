@@ -140,7 +140,7 @@ test "steady scheme → dt = null" {
     var pc = try parseTest(std.testing.io, src);
     defer pc.deinit();
 
-    Loader.initialize(&pc.value);
+    try Loader.initialize(&pc.value);
 
     try testing.expect(pc.value.time.dt == null);
 }
@@ -150,7 +150,7 @@ test "rk44 scheme → dt present" {
     var pc = try parseTest(std.testing.io, src);
     defer pc.deinit();
 
-    Loader.initialize(&pc.value);
+    try Loader.initialize(&pc.value);
 
     try testing.expect(pc.value.time.dt != null);
 }
@@ -160,7 +160,7 @@ test "n_qpts_1d auto-set to 0 when error_freq == 0" {
     var pc = try parseTest(std.testing.io, src);
     defer pc.deinit();
 
-    Loader.initialize(&pc.value);
+    try Loader.initialize(&pc.value);
 
     try testing.expectEqual(@as(u32, 0), pc.value.test_case.n_qpts_1d);
 }

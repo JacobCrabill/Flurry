@@ -16,7 +16,7 @@ const driver = @import("driver.zig");
 const flux = @import("flux.zig");
 const testcase = @import("testcase.zig");
 
-fn testConfig(order: u8, n: u32, tc: u32, equation: cfg.Equation, half: f64) cfg.Config {
+fn testConfig(order: u8, n: u32, tc: cfg.TestCase, equation: cfg.Equation, half: f64) cfg.Config {
     var config: cfg.Config = undefined;
     config.core = .{ .n_dims = 2, .mesh_file = "", .order = order };
     config.equation = .{
@@ -61,7 +61,7 @@ test "the isentropic vortex is isentropic" {
     const p: flux.FlowParams = .{ .gamma = 1.4 };
     const bounds: [2][2]f64 = .{ .{ -5, 5 }, .{ -5, 5 } };
 
-    for ([_]testcase.TestCase{ .shu_vortex, .vincent_vortex }) |tc| {
+    for ([_]cfg.TestCase{ .shu_vortex, .vincent_vortex }) |tc| {
         var reference: ?f64 = null;
         for ([_][2]f64{ .{ 0, 0 }, .{ 0.5, -0.3 }, .{ 1.5, 1.0 }, .{ -2.0, 3.0 } }) |xy| {
             const u = testcase.exactState(tc, p, xy[0], xy[1], 0.0, bounds);
@@ -109,26 +109,23 @@ test "a case belongs to one equation set" {
     // A vortex under advection-diffusion, or a sine wave under Euler, is a
     // configuration mistake -- better to say so than to quietly run the wrong
     // initial condition.
-    var euler = testConfig(2, 4, 1, .euler_ns, 5.0);
-    try testing.expectEqual(testcase.TestCase.shu_vortex, try testcase.TestCase.fromConfig(&euler));
+    var euler = testConfig(2, 4, .shu_vortex, .euler_ns, 5.0);
+    try cfg.validateTestCase(&euler);
 
     euler.equation.equation = .adv_diff;
-    try testing.expectError(error.UnsupportedTestCase, testcase.TestCase.fromConfig(&euler));
+    try testing.expectError(error.UnsupportedTestCase, cfg.validateTestCase(&euler));
 
-    var advdiff = testConfig(2, 4, 2, .adv_diff, 1.0);
-    try testing.expectEqual(testcase.TestCase.sine_wave, try testcase.TestCase.fromConfig(&advdiff));
+    var advdiff = testConfig(2, 4, .sine_wave, .adv_diff, 1.0);
+    try cfg.validateTestCase(&advdiff);
 
     advdiff.equation.equation = .euler_ns;
-    try testing.expectError(error.UnsupportedTestCase, testcase.TestCase.fromConfig(&advdiff));
+    try testing.expectError(error.UnsupportedTestCase, cfg.validateTestCase(&advdiff));
 
     // A uniform state suits either
-    var uniform = testConfig(2, 4, 0, .euler_ns, 1.0);
-    try testing.expectEqual(testcase.TestCase.uniform, try testcase.TestCase.fromConfig(&uniform));
+    var uniform = testConfig(2, 4, .uniform, .euler_ns, 1.0);
+    try cfg.validateTestCase(&uniform);
     uniform.equation.equation = .adv_diff;
-    try testing.expectEqual(testcase.TestCase.uniform, try testcase.TestCase.fromConfig(&uniform));
-
-    uniform.test_case.test_case = 7;
-    try testing.expectError(error.UnsupportedTestCase, testcase.TestCase.fromConfig(&uniform));
+    try cfg.validateTestCase(&uniform);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +140,7 @@ test "l2Error is zero when the solution is the exact one" {
     // `oppE_qpts` and the coordinate mapping agree with each other.
     // The residue is the interpolation error of the initial collocation, which
     // a high order over a small domain makes very small indeed.
-    const config = testConfig(5, 8, 2, .adv_diff, 1.0);
+    const config = testConfig(5, 8, .sine_wave, .adv_diff, 1.0);
 
     var run: driver.Run = undefined;
     try run.init(gpa, testing.io, &config, .{});
@@ -157,7 +154,7 @@ test "l2Error measures the size of a deliberate offset" {
 
     // Shifting the whole solution by a constant must show up as exactly that
     // constant in an RMS norm, which pins the volume normalization.
-    const config = testConfig(3, 4, 2, .adv_diff, 1.0);
+    const config = testConfig(3, 4, .sine_wave, .adv_diff, 1.0);
 
     var run: driver.Run = undefined;
     try run.init(gpa, testing.io, &config, .{});
@@ -177,7 +174,7 @@ test "l2Error measures the size of a deliberate offset" {
 test "a case with no exact solution says so" {
     const gpa = testing.allocator;
 
-    const config = testConfig(2, 4, 0, .euler_ns, 1.0);
+    const config = testConfig(2, 4, .uniform, .euler_ns, 1.0);
 
     var run: driver.Run = undefined;
     try run.init(gpa, testing.io, &config, .{});
@@ -191,7 +188,7 @@ test "measuring error without a quadrature rule says so" {
 
     // `Loader.initialize` zeroes n_qpts_1d when error_freq is 0, so this is the
     // state a case that never asks for error ends up in.
-    var config = testConfig(2, 4, 2, .adv_diff, 1.0);
+    var config = testConfig(2, 4, .sine_wave, .adv_diff, 1.0);
     config.test_case.n_qpts_1d = 0;
 
     var run: driver.Run = undefined;
@@ -225,7 +222,7 @@ test "the scheme converges at its design order" {
     for (cases) |c| {
         var errors: [2]f64 = undefined;
         for ([_]u32{ 4, 8 }, 0..) |n, i| {
-            var config = testConfig(c.order, n, 2, .adv_diff, 1.0);
+            var config = testConfig(c.order, n, .sine_wave, .adv_diff, 1.0);
 
             // One dt for both meshes, sized for the finer, so the temporal
             // error is identical and cannot be mistaken for a spatial rate.

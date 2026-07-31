@@ -39,8 +39,7 @@
   },
 
   .test_case = .{
-      // 1 = Shu vortex; 3 is the Vincent et al. vortex, on a stream of (0, 1)
-      .test_case = 1,
+      .test_case = .shu_vortex,
       // Density: on a finite domain the vortex still carries ~2e-5 of velocity
       // perturbation at the boundary but only ~1e-11 of density, so density is
       // the variable whose error is the scheme's rather than the domain's

@@ -16,49 +16,6 @@ pub const Error = error{
     UnsupportedTestCase,
 };
 
-/// Which analytic solution `config.test_case.test_case` selects. 0, 1 and 3 are
-/// ZEFR's numbering, so its case files carry over unchanged. ZEFR has no number
-/// for the advected sine wave -- it applies that whenever the equation is
-/// advection-diffusion, which leaves no way to ask for a uniform state -- so 2,
-/// which it does not use, names it here.
-pub const TestCase = enum(u32) {
-    /// A uniform freestream. Not analytic in any interesting sense, but it is
-    /// an exact steady solution, which is what the free-stream checks rely on.
-    uniform = 0,
-    /// Shu's isentropic Euler vortex, riding on a stream of (1, 1)
-    shu_vortex = 1,
-    /// `sin(pi x) sin(pi y)` advected by `advdiff_A` and damped by `advdiff_D`.
-    /// Exactly periodic on `[-1, 1]^2`, so unlike the vortices it carries no
-    /// modelling error of its own -- which makes it the case to trust when a
-    /// measured rate is in doubt.
-    sine_wave = 2,
-    /// The isentropic vortex of Vincent et al., riding on a stream of (0, 1)
-    vincent_vortex = 3,
-
-    pub fn fromConfig(config: *const cfg.Config) Error!TestCase {
-        const tc: TestCase = switch (config.test_case.test_case) {
-            0 => .uniform,
-            1 => .shu_vortex,
-            2 => .sine_wave,
-            3 => .vincent_vortex,
-            else => return error.UnsupportedTestCase,
-        };
-        // Each case belongs to one equation set; asking for the other is a
-        // configuration mistake, not something to silently reinterpret.
-        const ok = switch (tc) {
-            .uniform => true,
-            .sine_wave => config.equation.equation == .adv_diff,
-            .shu_vortex, .vincent_vortex => config.equation.equation == .euler_ns,
-        };
-        return if (ok) tc else error.UnsupportedTestCase;
-    }
-
-    /// Whether this case has an exact solution to measure error against.
-    pub fn isAnalytic(tc: TestCase) bool {
-        return tc != .uniform;
-    }
-};
-
 /// Conserved state of the exact solution at `(x, y)` and time `t`.
 ///
 /// `bounds` is the periodic domain as `{ {xlo, xhi}, {ylo, yhi} }`: the vortex
@@ -164,3 +121,5 @@ const pi = std.math.pi;
 
 const cfg = @import("config.zig");
 const flux = @import("flux.zig");
+
+const TestCase = cfg.TestCase;

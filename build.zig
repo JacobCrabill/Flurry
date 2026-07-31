@@ -99,8 +99,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(convergence);
     const conv_cmd = b.addRunArtifact(convergence);
     conv_cmd.addPassthruArgs();
-    b.step("convergence", "Measure the scheme's order of accuracy")
-        .dependOn(&conv_cmd.step);
+    b.step("convergence", "Measure the scheme's order of accuracy").dependOn(&conv_cmd.step);
 
     // ------ Run ------
 

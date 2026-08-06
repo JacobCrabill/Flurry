@@ -16,11 +16,17 @@ pub const Error = error{
     UnsupportedTestCase,
 };
 
-/// Conserved state of the exact solution at `(x, y)` and time `t`.
+/// Conserved state of the exact solution at `x` and time `t`.
 ///
-/// `bounds` is the periodic domain as `{ {xlo, xhi}, {ylo, yhi} }`: the vortex
-/// convects out of one side and back in the other, so the upstream point has to
-/// be folded back in.
+/// `bounds` is the periodic domain as `{ {xlo, xhi}, ... }` per dimension: the
+/// solution convects out of one side and back in the other, so the upstream
+/// point has to be folded back in.
+///
+/// In 3D the two vortices are the same solutions extended along z -- invariant
+/// in it, with no velocity through it -- which is an exact solution of the 3D
+/// Euler equations, though one that only exercises the third direction's metric
+/// terms rather than its physics. The sine wave is genuinely three-dimensional,
+/// so it is the one to refine under for a 3D order-of-accuracy study.
 ///
 /// Note that a vortex on a finite periodic domain is only an exact solution up
 /// to the perturbation it still carries at the boundary. For the Shu vortex on
@@ -28,36 +34,58 @@ pub const Error = error{
 /// density is the variable worth measuring error in -- and why `err_field`
 /// defaults to 0.
 pub fn exactState(
+    comptime nd: usize,
     tc: TestCase,
     p: flux.FlowParams,
-    x: f64,
-    y: f64,
+    x: [nd]f64,
     t: f64,
-    bounds: [2][2]f64,
-) [4]f64 {
+    bounds: [nd][2]f64,
+) [nd + 2]f64 {
     // Velocity of the frame each solution is steady in, so the exact solution
     // at time `t` is the initial condition at `x - vel t`. The sine wave also
     // decays, which is handled in its own branch.
-    const vel: [2]f64 = switch (tc) {
-        .uniform => .{ 0, 0 },
-        .shu_vortex => .{ 1, 1 },
-        .vincent_vortex => .{ 0, 1 },
-        .sine_wave => .{ p.adv_vel[0], p.adv_vel[1] },
-    };
-    const xs = wrap(x - vel[0] * t, bounds[0]);
-    const ys = wrap(y - vel[1] * t, bounds[1]);
+    var vel: [nd]f64 = @splat(0.0);
+    switch (tc) {
+        .uniform => {},
+        .shu_vortex => {
+            vel[0] = 1;
+            vel[1] = 1;
+        },
+        .vincent_vortex => vel[1] = 1,
+        .sine_wave => for (0..nd) |d| {
+            vel[d] = p.adv_vel[d];
+        },
+    }
+
+    var xs: [nd]f64 = undefined;
+    for (0..nd) |d| xs[d] = wrap(x[d] - vel[d] * t, bounds[d]);
 
     return switch (tc) {
-        .uniform => p.freestreamState(2, .euler_ns),
-        .shu_vortex => shuVortex(p.gamma, xs, ys),
-        .vincent_vortex => vincentVortex(p.gamma, xs, ys),
-        .sine_wave => .{
-            @exp(-2.0 * p.diff_coeff * pi * pi * t) * @sin(pi * xs) * @sin(pi * ys),
-            0,
-            0,
-            0,
+        .uniform => p.freestreamState(nd, .euler_ns),
+        .shu_vortex => widen(nd, shuVortex(p.gamma, xs[0], xs[1])),
+        .vincent_vortex => widen(nd, vincentVortex(p.gamma, xs[0], xs[1])),
+        .sine_wave => blk: {
+            // The Laplacian of a product of sines picks up one -pi^2 per
+            // dimension, so the decay rate follows the dimension count.
+            const nd_f: f64 = @floatFromInt(nd);
+            var u: [nd + 2]f64 = @splat(0.0);
+            var amp = @exp(-nd_f * p.diff_coeff * pi * pi * t);
+            for (0..nd) |d| amp *= @sin(pi * xs[d]);
+            u[0] = amp;
+            break :blk u;
         },
     };
+}
+
+/// Widen a 2D conserved state to `nd` dimensions, leaving the extra momentum
+/// zero. Energy moves to the end, where it lives for every `nd`.
+fn widen(comptime nd: usize, flat: [4]f64) [nd + 2]f64 {
+    var u: [nd + 2]f64 = @splat(0.0);
+    u[0] = flat[0];
+    u[1] = flat[1];
+    u[2] = flat[2];
+    u[nd + 1] = flat[3];
+    return u;
 }
 
 /// Fold `v` back into `[lo, hi)`.

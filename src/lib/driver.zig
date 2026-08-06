@@ -189,7 +189,7 @@ pub const Run = struct {
     fn writeSummary(r: *Run, w: *Io.Writer) !void {
         const c = r.config;
         const s = &r.solver;
-        const ele = &s.quad.ele;
+        const ele = s.element();
 
         try w.print("\n flurry -- flux reconstruction\n\n", .{});
 

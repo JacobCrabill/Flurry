@@ -16,6 +16,7 @@ pub const polynomials = @import("math/polynomials.zig");
 
 pub const eles = struct {
     pub const Quad = @import("eles/quads.zig").Quad;
+    pub const Hex = @import("eles/hexes.zig").Hex;
 };
 
 test {
@@ -27,6 +28,7 @@ test {
     _ = @import("util/array4.zig");
     _ = @import("config_test.zig");
     _ = @import("eles/quads_test.zig");
+    _ = @import("eles/hexes_test.zig");
     _ = @import("solver_test.zig");
     _ = @import("driver_test.zig");
     _ = @import("vtu_test.zig");

@@ -18,8 +18,9 @@ pub const Error = error{
     UnsupportedOrder,
 } || std.mem.Allocator.Error;
 
-/// VTK cell type for a bilinear quadrilateral.
+/// VTK cell types: a bilinear quadrilateral and a trilinear hexahedron.
 const vtk_quad: u8 = 9;
+const vtk_hexahedron: u8 = 12;
 
 /// VTK always wants three components per point, whatever the mesh dimension.
 const vtk_dims = 3;
@@ -38,7 +39,7 @@ pub fn writeSolution(
     prefix: []const u8,
     path_buf: *[std.fs.max_path_bytes]u8,
 ) ![]const u8 {
-    const ele = &s.quad.ele;
+    const ele = s.element();
     if (ele.n_spts_1d < 2) return error.UnsupportedOrder;
 
     // ZEFR puts every write for a case in a directory named after the case, so
@@ -67,12 +68,17 @@ pub fn writeSolution(
 
 /// Emit the whole document to `w`.
 pub fn write(s: *const Solver, gpa: std.mem.Allocator, w: *Io.Writer) !void {
-    const ele = &s.quad.ele;
+    const ele = s.element();
     if (ele.n_spts_1d < 2) return error.UnsupportedOrder;
 
     const n_ppts = ele.n_ppts;
     const n_sub_1d = ele.n_spts_1d - 1;
-    const n_sub = n_sub_1d * n_sub_1d;
+
+    // A cell is drawn as a patch of linear sub-cells over its plot points:
+    // squares in 2D, cubes in 3D.
+    const n_sub = std.math.pow(usize, n_sub_1d, s.n_dims);
+    const verts_per_cell: usize = if (s.n_dims == 3) 8 else 4;
+    const cell_type: u8 = if (s.n_dims == 3) vtk_hexahedron else vtk_quad;
 
     const n_points = s.n_eles * n_ppts;
     const n_cells = s.n_eles * n_sub;
@@ -128,7 +134,7 @@ pub fn write(s: *const Solver, gpa: std.mem.Allocator, w: *Io.Writer) !void {
         "<DataArray type=\"UInt32\" Name=\"connectivity\" format=\"appended\" offset=\"{d}\"/>\n",
         .{offset},
     );
-    offset += @sizeOf(u32) + n_cells * 4 * @sizeOf(u32);
+    offset += @sizeOf(u32) + n_cells * verts_per_cell * @sizeOf(u32);
 
     try w.print(
         "<DataArray type=\"UInt32\" Name=\"offsets\" format=\"appended\" offset=\"{d}\"/>\n",
@@ -163,17 +169,34 @@ pub fn write(s: *const Solver, gpa: std.mem.Allocator, w: *Io.Writer) !void {
         }
     }
 
-    // Sub-cell corners, counter-clockwise, in each cell's own point block
-    try writeCount(w, n_cells * 4 * @sizeOf(u32));
+    // Sub-cell corners in each cell's own point block. Plot points run x
+    // fastest, then y, then z, so a step in the next index up is a factor of
+    // n_spts_1d further along -- which is what `corner` below walks.
+    const n = ele.n_spts_1d;
+    try writeCount(w, n_cells * verts_per_cell * @sizeOf(u32));
     for (0..s.n_eles) |e| {
         const base = e * n_ppts;
-        for (0..n_sub_1d) |i| {
+        // A 2D mesh has one layer, so the k loop runs once and contributes
+        // nothing to the index.
+        const n_layers = if (s.n_dims == 3) n_sub_1d else 1;
+        for (0..n_layers) |k| {
             for (0..n_sub_1d) |j| {
-                // Plot points run x-fastest, so a row step is n_spts_1d
-                const lo = i * ele.n_spts_1d + j;
-                const hi = lo + ele.n_spts_1d;
-                for ([_]usize{ lo, lo + 1, hi + 1, hi }) |p| {
-                    try w.writeInt(u32, @intCast(base + p), endian);
+                for (0..n_sub_1d) |i| {
+                    const corner = struct {
+                        fn at(nn: usize, a: usize, b: usize, c: usize) usize {
+                            return a + nn * (b + nn * c);
+                        }
+                    }.at;
+
+                    // VTK's own corner order: the low face counter-clockwise,
+                    // then the high one, which is also Gmsh's hex ordering.
+                    const lo = [4][2]usize{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+                    for (0..verts_per_cell) |v| {
+                        const d = lo[v % 4];
+                        const dk: usize = if (v < 4) 0 else 1;
+                        const p = corner(n, i + d[0], j + d[1], k + dk);
+                        try w.writeInt(u32, @intCast(base + p), endian);
+                    }
                 }
             }
         }
@@ -181,10 +204,10 @@ pub fn write(s: *const Solver, gpa: std.mem.Allocator, w: *Io.Writer) !void {
 
     // Running end-of-cell index into the connectivity array
     try writeCount(w, n_cells * @sizeOf(u32));
-    for (1..n_cells + 1) |c| try w.writeInt(u32, @intCast(4 * c), endian);
+    for (1..n_cells + 1) |c| try w.writeInt(u32, @intCast(verts_per_cell * c), endian);
 
     try writeCount(w, n_cells * @sizeOf(u8));
-    for (0..n_cells) |_| try w.writeByte(vtk_quad);
+    for (0..n_cells) |_| try w.writeByte(cell_type);
 
     try w.writeAll("\n</AppendedData>\n</VTKFile>\n");
 }

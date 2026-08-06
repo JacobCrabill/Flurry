@@ -63,7 +63,7 @@ test "a run builds its mesh and solver from the config alone" {
     try testing.expectEqual(@as(usize, 16), r.mesh.n_eles);
     try testing.expectEqual(@as(usize, 0), r.mesh.n_bnd_faces);
 
-    try testing.expectEqual(@as(usize, 16), r.solver.quad.ele.n_spts);
+    try testing.expectEqual(@as(usize, 16), r.solver.element().n_spts);
     try testing.expectEqual(@as(usize, 4), r.solver.n_vars);
     try testing.expectEqual(@as(f64, 1e-3), r.solver.dt);
 }
@@ -100,7 +100,7 @@ test "free-stream survives a whole time integration" {
 
     try runQuiet(&r);
 
-    for (0..s.quad.ele.n_spts) |spt| {
+    for (0..s.element().n_spts) |spt| {
         for (0..s.n_vars) |n| {
             for (0..s.n_eles) |e| {
                 try testing.expectApproxEqAbs(initial[n], s.u_spts.get(spt, n, e), 1e-11);

@@ -173,6 +173,16 @@ pub const Geo = struct {
     /// Type for each face: internal, boundary, MPI
     face_type: std.ArrayList(FaceType) = .empty,
 
+    /// `vert_canon[iv]` is the representative of `iv`'s periodic equivalence
+    /// class, so that a vertex and its image across a periodic boundary compare
+    /// equal. Empty on a mesh with no periodicity, where every vertex is its
+    /// own representative; use `canonVert`, which handles both.
+    ///
+    /// Kept past `processConnectivity` because `setupGlobalFpts` has to line up
+    /// the two sides of an interface by their corner vertices, and on a
+    /// periodic face those are two different vertices of the same class.
+    vert_canon: []usize = &.{},
+
     // ---- Global flux points ----
     // Built by `setupGlobalFpts`. Every face carries `n_fpts_per_face` *global*
     // flux points (gfpts), the points at which the two sides of an interface
@@ -239,10 +249,18 @@ pub const Geo = struct {
         for (geo.bc_faces.items) |*mat| mat.deinit(gpa);
         geo.bc_faces.deinit(gpa);
 
+        gpa.free(geo.vert_canon);
+
         geo.fpt2gfpt.deinit(gpa);
         geo.fpt2gfpt_slot.deinit(gpa);
         geo.gfpt2bnd.deinit(gpa);
         geo.gfpt2face.deinit(gpa);
+    }
+
+    /// Periodic-class representative of vertex `iv`; `iv` itself when the mesh
+    /// has no periodic boundaries.
+    pub fn canonVert(geo: *const Geo, iv: usize) usize {
+        return if (geo.vert_canon.len != 0) geo.vert_canon[iv] else iv;
     }
 
     /// Read a Gmsh `.msh` file (ASCII format 2.x or 4.x) and populate the
@@ -1039,6 +1057,13 @@ pub const Geo = struct {
         const pm = try geo.buildPeriodicVertexMap(arena);
         const canon: ?[]const usize = if (pm) |m| m.canon else null;
 
+        // `canon` lives in the arena; `setupGlobalFpts` runs after this returns
+        // and needs it to pair up the two sides of a periodic face.
+        if (canon) |c| {
+            geo.gpa.free(geo.vert_canon);
+            geo.vert_canon = try geo.gpa.dupe(usize, c);
+        }
+
         switch (geo.n_dims) {
             2 => try geo.processConn2D(arena, canon),
             3 => try geo.processConn3D(arena, canon),
@@ -1060,26 +1085,30 @@ pub const Geo = struct {
     }
 
     /// Build the global flux point map, given how many flux points an element
-    /// puts on each face (`order + 1` for a tensor-product element).
+    /// puts along one edge of a face (`order + 1` for a tensor-product element).
+    /// A 2D face carries that many, a 3D face its square.
     ///
     /// Call after `processConnectivity`. The element's local flux points must be
-    /// stored face by face, in the same face order as `localFaces`, each face
-    /// traversed counter-clockwise -- which is what `eles/quads.zig` does.
+    /// stored face by face, in the same face order as `localFaces`, and within a
+    /// face starting at that face's first listed vertex and running toward its
+    /// second, then its last -- which is what `eles/quads.zig` and
+    /// `eles/hexes.zig` do.
     ///
-    /// Two cells sharing a face both traverse it counter-clockwise *from their
-    /// own side*, so they walk it in opposite directions: the left cell's flux
-    /// point `j` sits on top of the right cell's `n_fpts_per_face - 1 - j`. That
-    /// holds exactly because the 1D flux point distribution is symmetric about
-    /// the face midpoint. `Solver` checks it geometrically once it knows the
-    /// physical flux point locations.
+    /// The two sides of an interface list the same corner vertices in different
+    /// orders, and lining those up is what lines the flux points up; see
+    /// `FaceOrient`. `Solver.fptPairingError` checks the result geometrically
+    /// once it knows the physical flux point locations.
     ///
-    /// ZEFR relies on the same reversal, then runs `orient_fpts` to re-sort by
-    /// physical coordinate for the cases where it does not hold (3D face
-    /// rotations). A 2D conforming mesh needs no such fixup.
-    pub fn setupGlobalFpts(geo: *Geo, n_fpts_per_face: usize) !void {
+    /// ZEFR instead assumes a plain reversal and then runs `orient_fpts` to
+    /// re-sort by physical coordinate where that does not hold. Deriving the
+    /// correspondence from the vertex lists needs no second pass and no
+    /// coordinate comparison.
+    pub fn setupGlobalFpts(geo: *Geo, n_fpts_1d: usize) !void {
         const gpa = geo.gpa;
 
         if (geo.n_faces == 0) return error.ConnectivityNotProcessed;
+
+        const n_fpts_per_face = if (geo.n_dims == 3) n_fpts_1d * n_fpts_1d else n_fpts_1d;
 
         var max_nf: usize = 0;
         for (geo.c2nf.items) |nf| max_nf = @max(max_nf, nf);
@@ -1098,7 +1127,7 @@ pub const Geo = struct {
 
         var gfpt: usize = 0;
 
-        // --- Interior faces: both sides, second one reversed ---
+        // --- Interior faces: both sides, the second one reoriented ---
         for (geo.int_faces.items) |ff| {
             const ic_l = geo.f2c.get(ff, 0);
             const ic_r = geo.f2c.get(ff, 1);
@@ -1108,15 +1137,24 @@ pub const Geo = struct {
             const fpt0_l = lf_l * n_fpts_per_face;
             const fpt0_r = lf_r * n_fpts_per_face;
 
-            for (0..n_fpts_per_face) |j| {
-                const jr = n_fpts_per_face - 1 - j;
-                geo.fpt2gfpt.at(fpt0_l + j, ic_l).* = gfpt;
-                geo.fpt2gfpt_slot.at(fpt0_l + j, ic_l).* = 0;
-                geo.fpt2gfpt.at(fpt0_r + jr, ic_r).* = gfpt;
-                geo.fpt2gfpt_slot.at(fpt0_r + jr, ic_r).* = 1;
+            const orient = try geo.faceOrient(ic_l, lf_l, ic_r, lf_r, n_fpts_1d);
 
-                geo.gfpt2face.items[gfpt] = ff;
-                gfpt += 1;
+            // `j` is the slow face index and `i` the fast one; in 2D there is
+            // only `i` and the loop over `j` runs once.
+            const n_slow = if (geo.n_dims == 3) n_fpts_1d else 1;
+            for (0..n_slow) |j| {
+                for (0..n_fpts_1d) |i| {
+                    const fpt_l = i + n_fpts_1d * j;
+                    const fpt_r = orient.at(i, j);
+
+                    geo.fpt2gfpt.at(fpt0_l + fpt_l, ic_l).* = gfpt;
+                    geo.fpt2gfpt_slot.at(fpt0_l + fpt_l, ic_l).* = 0;
+                    geo.fpt2gfpt.at(fpt0_r + fpt_r, ic_r).* = gfpt;
+                    geo.fpt2gfpt_slot.at(fpt0_r + fpt_r, ic_r).* = 1;
+
+                    geo.gfpt2face.items[gfpt] = ff;
+                    gfpt += 1;
+                }
             }
         }
 
@@ -1142,6 +1180,102 @@ pub const Geo = struct {
             "Geo: {d} global flux points ({d} interior, {d} boundary)\n",
             .{ geo.n_gfpts, geo.n_gfpts_int, geo.n_gfpts_bnd },
         );
+    }
+
+    /// Work out how the right cell numbers the flux points of a shared face,
+    /// given how the left cell numbers them.
+    ///
+    /// Both cells list the face's corner vertices in their own order, and both
+    /// lay their flux points out in the frame those vertices define: the fast
+    /// index runs from vertex 0 toward vertex 1, the slow index from vertex 0
+    /// toward the last. Finding where the left face's vertices 0, 1 and last sit
+    /// in the right face's list therefore pins the whole correspondence, with no
+    /// coordinates involved.
+    fn faceOrient(
+        geo: *const Geo,
+        ic_l: usize,
+        lf_l: usize,
+        ic_r: usize,
+        lf_r: usize,
+        n_fpts_1d: usize,
+    ) !FaceOrient {
+        const verts_l = localFaces(geo.ctype.items[ic_l])[lf_l];
+        const verts_r = localFaces(geo.ctype.items[ic_r])[lf_r];
+
+        if (verts_l.len != verts_r.len) {
+            report(
+                "Geo: cells {d} and {d} give their shared face different vertex counts\n",
+                .{ ic_l, ic_r },
+            );
+            return error.InconsistentCellType;
+        }
+
+        // Under periodicity the two sides hold different vertices of the same
+        // class, so compare representatives rather than IDs.
+        var right: [max_face_verts]usize = undefined;
+        for (verts_r, 0..) |lv, i| right[i] = geo.canonVert(geo.c2v.get(ic_r, lv));
+
+        // Where each of the left face's own corners sits in the right's list
+        const nv = verts_l.len;
+        var slot: [max_face_verts]usize = undefined;
+        for (verts_l, 0..) |lv, i| {
+            const v = geo.canonVert(geo.c2v.get(ic_l, lv));
+            slot[i] = for (right[0..nv], 0..) |r, j| {
+                if (r == v) break j;
+            } else {
+                // The two cells do not agree on which vertices the face has,
+                // so there is no correspondence to derive. A collapsed cell
+                // (a tet stored as a hex) lands here.
+                report(
+                    "Geo: cells {d} and {d} disagree about the vertices of their shared face\n",
+                    .{ ic_l, ic_r },
+                );
+                return error.InconsistentCellType;
+            };
+        }
+
+        // Index into the right face's grid of each of its corners, in its own
+        // cyclic order. In 2D a "face" is an edge with just the two ends.
+        const m = n_fpts_1d - 1;
+        const grid: [4]usize = if (geo.n_dims == 3)
+            .{ 0, m, m + n_fpts_1d * m, n_fpts_1d * m }
+        else
+            .{ 0, m, 0, 0 };
+
+        // Both cells walk the same quad, so the left face's second and last
+        // vertices have to land either side of its first in the right face's
+        // cycle. Anything else is a malformed mesh, and would divide inexactly
+        // below rather than reporting itself.
+        if (nv == 4) {
+            const ahead = (slot[0] + 1) % 4;
+            const behind = (slot[0] + 3) % 4;
+            const paired = (slot[1] == ahead and slot[3] == behind) or
+                (slot[1] == behind and slot[3] == ahead);
+            if (!paired) {
+                report(
+                    "Geo: cells {d} and {d} traverse their shared face inconsistently\n",
+                    .{ ic_l, ic_r },
+                );
+                return error.InconsistentCellType;
+            }
+        }
+
+        const origin = grid[slot[0]];
+        if (m == 0) return .{ .origin = origin, .d_fast = 0, .d_slow = 0 };
+
+        const step = struct {
+            fn of(from: usize, to: usize, span: usize) isize {
+                const a: isize = @intCast(from);
+                const b: isize = @intCast(to);
+                return @divExact(b - a, @as(isize, @intCast(span)));
+            }
+        }.of;
+
+        return .{
+            .origin = origin,
+            .d_fast = step(origin, grid[slot[1]], m),
+            .d_slow = if (geo.n_dims == 3) step(origin, grid[slot[nv - 1]], m) else 0,
+        };
     }
 
     /// Which of cell `ic`'s faces is global face `ff`.
@@ -1657,6 +1791,28 @@ fn orderUsize(key: usize, mid: usize) std.math.Order {
 /// supported cell type needs (a hex face); a 2D "face" is an edge, with two.
 const max_face_verts = 4;
 
+/// Where the right cell of an interface numbers a flux point that the left cell
+/// numbers `(i, j)` -- `i` along the face's fast index, `j` along its slow one.
+///
+/// The map is affine because both cells lay their flux points out on the same
+/// grid, just entered from a different corner and possibly with the axes
+/// swapped: an edge can be met one of two ways and a quad face one of eight.
+pub const FaceOrient = struct {
+    /// Right-side index of the left side's first flux point
+    origin: usize = 0,
+    /// Right-side step per step along the left face's fast index
+    d_fast: isize = 1,
+    /// ... and along its slow index. Always zero in 2D, where there is none.
+    d_slow: isize = 0,
+
+    pub fn at(o: FaceOrient, i: usize, j: usize) usize {
+        const base: isize = @intCast(o.origin);
+        const fast: isize = @intCast(i);
+        const slow: isize = @intCast(j);
+        return @intCast(base + o.d_fast * fast + o.d_slow * slow);
+    }
+};
+
 /// A face's identity: its corner vertices, sorted ascending and de-duplicated,
 /// with the unused slots set to `none`.
 ///
@@ -1757,17 +1913,30 @@ fn unite(parent: []usize, a: usize, b: usize) void {
 /// Corner-vertex indices of each face of a cell, in cyclic order. In 2D a
 /// "face" is an edge.
 ///
-/// The hex ordering is Flurry-cpp's `ct2fv[HEX]`, which carries a
-/// "FIX ORDERING FOR FUTURE USE" note upstream -- it is not necessarily the
-/// face ordering the solver's flux points assume.
+/// Two things about this table are load-bearing, and the element
+/// implementations depend on both:
+///
+///   - The *order* of the faces. A cell's flux points are stored face by face
+///     in this order, so `local_face * n_fpts_per_face` is where a face's block
+///     starts. See `eles/quads.zig` and `eles/hexes.zig`.
+///
+///   - The *cycle* within a face, which fixes the face's own coordinate system:
+///     the first flux-point index runs from vertex 0 toward vertex 1, and the
+///     second from vertex 0 toward the last vertex. In 2D that only says which
+///     end an edge starts at; in 3D it is what will let two hexes that meet in
+///     any of eight relative orientations pair their flux points up.
+///
+/// Flurry-cpp's `ct2fv[HEX]` carried a "FIX ORDERING FOR FUTURE USE" note and
+/// had faces 1 and 2 cycling the opposite way round from the rest. The hex
+/// entries below are ZEFR's `face_nodesBT[HEX]`, which is consistent.
 fn localFaces(ct: CellType) []const []const u8 {
     return switch (ct) {
         .tri => &.{ &.{ 0, 1 }, &.{ 1, 2 }, &.{ 2, 0 } },
         .quad => &.{ &.{ 0, 1 }, &.{ 1, 2 }, &.{ 2, 3 }, &.{ 3, 0 } },
         .hex => &.{
             &.{ 0, 1, 2, 3 }, // Bottom (zmin)
-            &.{ 4, 5, 6, 7 }, // Top    (zmax)
-            &.{ 3, 0, 4, 7 }, // Left   (xmin)
+            &.{ 5, 4, 7, 6 }, // Top    (zmax)
+            &.{ 0, 3, 7, 4 }, // Left   (xmin)
             &.{ 2, 1, 5, 6 }, // Right  (xmax)
             &.{ 1, 0, 4, 5 }, // Front  (ymin)
             &.{ 3, 2, 6, 7 }, // Back   (ymax)

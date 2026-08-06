@@ -64,7 +64,7 @@ test "the isentropic vortex is isentropic" {
     for ([_]cfg.TestCase{ .shu_vortex, .vincent_vortex }) |tc| {
         var reference: ?f64 = null;
         for ([_][2]f64{ .{ 0, 0 }, .{ 0.5, -0.3 }, .{ 1.5, 1.0 }, .{ -2.0, 3.0 } }) |xy| {
-            const u = testcase.exactState(tc, p, xy[0], xy[1], 0.0, bounds);
+            const u = testcase.exactState(2, tc, p, xy, 0.0, bounds);
 
             const rho = u[0];
             const ke = 0.5 * (u[1] * u[1] + u[2] * u[2]) / rho;
@@ -92,14 +92,14 @@ test "the exact solution convects without changing shape" {
     for ([_]f64{ 0.7, 3.0, 10.0, 23.0 }) |t| {
         for ([_][2]f64{ .{ 0, 0 }, .{ 0.8, -1.2 }, .{ 2.0, 2.0 } }) |xy| {
             const now = testcase.exactState(
+                2,
                 .shu_vortex,
                 p,
-                xy[0] + vel[0] * t,
-                xy[1] + vel[1] * t,
+                .{ xy[0] + vel[0] * t, xy[1] + vel[1] * t },
                 t,
                 bounds,
             );
-            const start = testcase.exactState(.shu_vortex, p, xy[0], xy[1], 0.0, bounds);
+            const start = testcase.exactState(2, .shu_vortex, p, xy, 0.0, bounds);
             for (0..4) |n| try testing.expectApproxEqAbs(start[n], now[n], 1e-13);
         }
     }
@@ -162,7 +162,7 @@ test "l2Error measures the size of a deliberate offset" {
 
     const s = &run.solver;
     const offset = 0.25;
-    for (0..s.quad.ele.n_spts) |spt| {
+    for (0..s.element().n_spts) |spt| {
         for (0..s.n_eles) |e| s.u_spts.at(spt, 0, e).* += offset;
     }
 

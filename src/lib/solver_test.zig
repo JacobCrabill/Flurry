@@ -277,7 +277,7 @@ test "transforms on a uniform Cartesian mesh" {
     var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
     try testing.expectEqual(@as(usize, nx * ny), s.n_eles);
     try testing.expectEqual(@as(usize, 4), s.n_vars);
 
@@ -331,7 +331,7 @@ test "face normals and areas" {
     var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
     const dx = 2.0 / @as(f64, nx);
     const dy = 3.0 / @as(f64, ny);
 
@@ -370,21 +370,31 @@ test "face normals and areas" {
 test "solver rejects meshes it has no element for" {
     const gpa = testing.allocator;
 
-    // 3D needs hexes, which are not implemented
+    // Only 2D and 3D exist
     {
         var config = testConfig(2, .euler_ns, false, 2, 2);
-        config.core.n_dims = 3;
         var mesh = try testMesh(gpa, &config);
         defer mesh.deinit();
+        config.core.n_dims = 4;
         try testing.expectError(error.UnsupportedDimension, Solver.init(gpa, &config, &mesh, .{}));
     }
 
-    // Triangles have no element type yet either
+    // Triangles have no element type yet
     {
         var config = testConfig(2, .euler_ns, false, 2, 2);
         var mesh = try testMesh(gpa, &config);
         defer mesh.deinit();
         mesh.ctype.items[0] = .tri;
+        try testing.expectError(error.UnsupportedCellType, Solver.init(gpa, &config, &mesh, .{}));
+    }
+
+    // 3D wants hexes, and a quad is not one
+    {
+        var config = testConfig(2, .euler_ns, false, 2, 2);
+        config.core.n_dims = 3;
+        var mesh = try testMesh(gpa, &config);
+        defer mesh.deinit();
+        mesh.ctype.items[0] = .quad;
         try testing.expectError(error.UnsupportedCellType, Solver.init(gpa, &config, &mesh, .{}));
     }
 }
@@ -400,7 +410,7 @@ test "solver rejects meshes it has no element for" {
 /// For a smooth flux this is exactly what any consistent Riemann solver returns,
 /// so it lets the residual chain be checked without the face plumbing.
 fn fillExactFComm(s: *Solver, comptime nd: usize) void {
-    const ele = &s.quad.ele;
+    const ele = s.element();
     const n_vars = s.n_vars;
 
     for (0..ele.n_fpts) |fpt| {
@@ -452,7 +462,7 @@ test "uniform flow has exactly zero residual" {
 
             // Uniform state, uniform flux, zero divergence. The interior term
             // alone is *not* zero -- it takes the DFR correction to cancel it.
-            const ele = &s.quad.ele;
+            const ele = s.element();
             for (0..ele.n_spts) |spt| {
                 for (0..s.n_vars) |n| {
                     for (0..s.n_eles) |e| {
@@ -479,7 +489,7 @@ test "linear flow reproduces its analytic divergence" {
     var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
     for (0..ele.n_spts) |spt| {
         for (0..s.n_eles) |e| {
             const x = s.coord_spts.get(spt, 0, e);
@@ -516,7 +526,7 @@ test "extrapolateU matches applying oppE by hand" {
     var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
 
     // Distinct values everywhere, so a transposed index would show up
     var seed: u64 = 12345;
@@ -551,7 +561,7 @@ test "extrapolateU matches applying oppE by hand" {
 /// Stand in for a residual of exactly `c` in physical space. `divf_spts` holds
 /// the reference-space divergence, so it carries a factor of |J|.
 fn setConstantResidual(s: *Solver, stage: usize, c: f64) void {
-    const ele = &s.quad.ele;
+    const ele = s.element();
     for (0..ele.n_spts) |spt| {
         for (0..s.n_vars) |n| {
             for (0..s.n_eles) |e| {
@@ -575,7 +585,7 @@ test "RK stages integrate du/dt = -c exactly" {
         var s = try Solver.init(gpa, &config, &mesh, .{});
         defer s.deinit();
 
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const c: f64 = 3.0;
         @memset(s.u_spts.data, 5.0);
 
@@ -661,10 +671,9 @@ test "global flux points cover every element face exactly once" {
 test "the two sides of every interface meet at the same point" {
     const gpa = testing.allocator;
 
-    // This is the assumption `setupGlobalFpts` makes: two cells sharing a face
-    // traverse it in opposite directions, so the right side's flux points are
-    // the left side's reversed. Checked geometrically, at several orders and on
-    // a mesh with a non-unit cell aspect ratio.
+    // `setupGlobalFpts` pairs the two sides from their corner vertex lists
+    // alone; this is the geometric check on the result. At several orders, and
+    // on a mesh with a non-unit cell aspect ratio.
     for ([_]u8{ 1, 2, 3, 4 }) |order| {
         var config = testConfig(order, .euler_ns, false, 4, 3);
         var mesh = try testMesh(gpa, &config);
@@ -735,7 +744,7 @@ test "free-stream is preserved on cells away from the boundary" {
             try s.gatherCommonFFromFaces();
             try s.computeDivFFpts(0);
 
-            const ele = &s.quad.ele;
+            const ele = s.element();
             var n_interior: usize = 0;
             for (0..s.n_eles) |e| {
                 var on_bnd = false;
@@ -851,7 +860,7 @@ test "free-stream is preserved on a periodic mesh" {
             try s.initializeU();
             try s.computeResidual(0);
 
-            const ele = &s.quad.ele;
+            const ele = s.element();
             for (0..s.n_eles) |e| {
                 for (0..ele.n_spts) |spt| {
                     for (0..s.n_vars) |n| {
@@ -882,7 +891,7 @@ test "a periodic mesh conserves mass exactly" {
     defer s.deinit();
 
     // A non-uniform state, so the fluxes are genuinely doing something
-    const ele = &s.quad.ele;
+    const ele = s.element();
     for (0..ele.n_spts) |spt| {
         for (0..s.n_eles) |e| {
             const x = s.coord_spts.get(spt, 0, e);
@@ -991,7 +1000,7 @@ test "a direction is only periodic if its boundary faces say so" {
     try s.initializeU();
     try s.computeResidual(0);
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
     for (0..s.n_eles) |e| {
         for (0..ele.n_spts) |spt| {
             for (0..s.n_vars) |n| {
@@ -1030,7 +1039,7 @@ test "free-stream is preserved over the whole domain" {
             try s.initializeU();
             try s.computeResidual(0);
 
-            const ele = &s.quad.ele;
+            const ele = s.element();
             for (0..s.n_eles) |e| {
                 for (0..ele.n_spts) |spt| {
                     for (0..s.n_vars) |n| {
@@ -1077,7 +1086,7 @@ test "a slip wall reflects without generating mass" {
     try s.initializeU();
     try s.computeResidual(0);
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
     for (0..s.n_eles) |e| {
         for (0..ele.n_spts) |spt| {
             for (0..s.n_vars) |n| {
@@ -1162,7 +1171,7 @@ test "residualNorm is zero for a zero residual and scales linearly" {
     try testing.expectApproxEqAbs(@as(f64, 0.0), norms[0], 1e-15);
 
     // divF carries a factor of |J|, so a residual of |J| * c has norm c
-    const ele = &s.quad.ele;
+    const ele = s.element();
     const c: f64 = 2.5;
     for (0..ele.n_spts) |spt| {
         for (0..s.n_eles) |e| {
@@ -1550,7 +1559,7 @@ test "the metric adjugate satisfies adj . jaco = |J| I" {
     var s = try Solver.init(gpa, &config, &mesh, .{});
     defer s.deinit();
 
-    const ele = &s.quad.ele;
+    const ele = s.element();
     for (0..s.n_eles) |e| {
         for (0..ele.n_spts) |spt| {
             const det = s.jaco_det_spts.get(spt, e);
@@ -1595,7 +1604,7 @@ test "free-stream is preserved on a non-affine mesh" {
             for (0..s.n_eles) |e| {
                 var lo = std.math.inf(f64);
                 var hi = -std.math.inf(f64);
-                for (0..s.quad.ele.n_spts) |spt| {
+                for (0..s.element().n_spts) |spt| {
                     lo = @min(lo, s.jaco_det_spts.get(spt, e));
                     hi = @max(hi, s.jaco_det_spts.get(spt, e));
                     worst_asym = @max(worst_asym, @abs(
@@ -1616,7 +1625,7 @@ test "free-stream is preserved on a non-affine mesh" {
             try s.gatherCommonFFromFaces();
             try s.computeDivFFpts(0);
 
-            const ele = &s.quad.ele;
+            const ele = s.element();
             for (0..s.n_eles) |e| {
                 var on_bnd = false;
                 for (0..mesh.c2nf.items[e]) |j| {
@@ -1658,4 +1667,226 @@ test "interfaces pair up on a non-affine mesh" {
     for (0..mesh.n_gfpts_int) |gf| {
         try testing.expectApproxEqRel(s.faces.d_a.get(0, gf), s.faces.d_a.get(1, gf), 1e-11);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 3D
+// ---------------------------------------------------------------------------
+
+/// A config for a Cartesian hex mesh over [0, 2] x [0, 3] x [0, 1].
+fn testConfig3D(order: u8, equation: cfg.Equation, nx: u32, ny: u32, nz: u32) cfg.Config {
+    var config = testConfig(order, equation, false, nx, ny);
+    config.core.n_dims = 3;
+    config.create_mesh.?.nz = nz;
+    config.create_mesh.?.zmin = 0.0;
+    config.create_mesh.?.zmax = 1.0;
+    return config;
+}
+
+/// Same idea as `testMeshDistorted`, in three dimensions: every displacement
+/// depends on all three coordinates, so no cell stays a parallelepiped and the
+/// Jacobian varies within each one.
+fn testMesh3DDistorted(gpa: std.mem.Allocator, config: *const cfg.Config) !Geo {
+    var mesh: Geo = .{ .gpa = gpa, .io = undefined, .config = config.* };
+    errdefer mesh.deinit();
+    try mesh.createMesh();
+
+    for (0..mesh.n_verts) |iv| {
+        const x = mesh.xv.get(iv, 0);
+        const y = mesh.xv.get(iv, 1);
+        const z = mesh.xv.get(iv, 2);
+        mesh.xv.at(iv, 0).* = x + 0.06 * @sin(1.3 * x) * @sin(0.9 * y) * @cos(0.8 * z);
+        mesh.xv.at(iv, 1).* = y + 0.06 * @sin(1.1 * x) * @sin(0.7 * y) * @cos(1.2 * z);
+        mesh.xv.at(iv, 2).* = z + 0.06 * @sin(0.9 * x) * @cos(1.4 * y) * @sin(1.1 * z);
+    }
+
+    try mesh.processConnectivity();
+    try mesh.setupGlobalFpts(@as(usize, config.core.order) + 1);
+    return mesh;
+}
+
+test "hex meshes get hex elements and the right flux point counts" {
+    const gpa = testing.allocator;
+
+    for ([_]u8{ 1, 2, 3 }) |order| {
+        var config = testConfig3D(order, .euler_ns, 3, 3, 3);
+        var mesh = try testMesh(gpa, &config);
+        defer mesh.deinit();
+
+        var s = try Solver.init(gpa, &config, &mesh, .{});
+        defer s.deinit();
+
+        const n1d = @as(usize, order) + 1;
+        try testing.expectEqual(geo_mod.CellType.hex, s.element().etype);
+        try testing.expectEqual(@as(usize, 3), s.n_dims);
+        try testing.expectEqual(@as(usize, 5), s.n_vars);
+        try testing.expectEqual(n1d * n1d * n1d, s.element().n_spts);
+        try testing.expectEqual(6 * n1d * n1d, s.element().n_fpts);
+
+        // A 3D face carries the square of what the caller passed
+        try testing.expectEqual(n1d * n1d, mesh.n_fpts_per_face);
+    }
+}
+
+test "the two sides of every 3D interface meet at the same point" {
+    const gpa = testing.allocator;
+
+    // The check that matters most in 3D. Two hexes sharing a quad face can meet
+    // in any of eight relative orientations, and `setupGlobalFpts` picks the
+    // right one from their corner vertex lists alone. Get it wrong and the
+    // solver still runs, on flux points paired with the wrong partners.
+    //
+    // A plain reversal -- what 2D needs, and what this used to do -- fails here:
+    // for two hexes side by side in x only one of the face's two axes flips.
+    for ([_]u8{ 1, 2, 3 }) |order| {
+        for ([_]bool{ false, true }) |distorted| {
+            var config = testConfig3D(order, .euler_ns, 3, 4, 3);
+            var mesh = if (distorted)
+                try testMesh3DDistorted(gpa, &config)
+            else
+                try testMesh(gpa, &config);
+            defer mesh.deinit();
+
+            var s = try Solver.init(gpa, &config, &mesh, .{});
+            defer s.deinit();
+
+            try testing.expect(s.fptPairingError() < 1e-12);
+
+            // Both sides agree on the physical face measure too
+            for (0..mesh.n_gfpts_int) |gf| {
+                try testing.expectApproxEqRel(
+                    s.faces.d_a.get(0, gf),
+                    s.faces.d_a.get(1, gf),
+                    1e-11,
+                );
+            }
+        }
+    }
+}
+
+test "the two sides of every 3D periodic interface meet at the same point" {
+    const gpa = testing.allocator;
+
+    // Periodic partners are a full domain length apart and their corner
+    // vertices are different IDs of the same class, so this exercises the
+    // canonical-vertex path through the orientation match.
+    var config = testConfig3D(3, .euler_ns, 3, 4, 3);
+    config.create_mesh.?.bc_bottom = .periodic;
+    config.create_mesh.?.bc_top = .periodic;
+    config.create_mesh.?.bc_left = .periodic;
+    config.create_mesh.?.bc_right = .periodic;
+    config.create_mesh.?.bc_front = .periodic;
+    config.create_mesh.?.bc_back = .periodic;
+
+    var mesh = try testMesh(gpa, &config);
+    defer mesh.deinit();
+
+    try testing.expectEqual(@as(usize, 0), mesh.n_bnd_faces);
+
+    var s = try Solver.init(gpa, &config, &mesh, .{});
+    defer s.deinit();
+
+    try testing.expect(s.fptPairingErrorPeriodic() < 1e-12);
+}
+
+test "free-stream is preserved over a whole 3D domain" {
+    const gpa = testing.allocator;
+
+    // The 3D counterpart of the 2D whole-domain check: a uniform state on a
+    // hex mesh, characteristic far-field on all six sides, must give exactly
+    // zero residual everywhere. On the distorted mesh it also pins the 3x3
+    // metric adjugate, which a transposed or mis-signed one would fail.
+    for ([_]u8{ 1, 2, 3 }) |order| {
+        for ([_]bool{ false, true }) |distorted| {
+            var config = testConfig3D(order, .euler_ns, 3, 3, 3);
+
+            var mesh = if (distorted)
+                try testMesh3DDistorted(gpa, &config)
+            else
+                try testMesh(gpa, &config);
+            defer mesh.deinit();
+
+            var s = try Solver.init(gpa, &config, &mesh, .{});
+            defer s.deinit();
+
+            try s.initializeU();
+            try s.computeResidual(0);
+
+            const ele = s.element();
+            for (0..s.n_eles) |e| {
+                for (0..ele.n_spts) |spt| {
+                    for (0..s.n_vars) |n| {
+                        try testing.expectApproxEqAbs(
+                            @as(f64, 0.0),
+                            s.divf_spts.get(0, spt, n, e),
+                            1e-9,
+                        );
+                    }
+                }
+            }
+
+            // And a full step leaves it alone
+            const before = try gpa.dupe(f64, s.u_spts.data);
+            defer gpa.free(before);
+            try s.update();
+            for (before, s.u_spts.data) |a, b| {
+                try testing.expectApproxEqAbs(a, b, 1e-11);
+            }
+        }
+    }
+}
+
+test "a 3D periodic mesh conserves mass exactly" {
+    const gpa = testing.allocator;
+
+    // Nothing enters or leaves a triply-periodic box, so the mass integral is
+    // invariant. Note this does *not* catch a mispaired interface -- the two
+    // slots of a global flux point still cancel against each other whichever
+    // points they were paired from, so conservation survives being wrong. The
+    // pairing check above is the one that catches that.
+    var config = testConfig3D(3, .euler_ns, 3, 3, 3);
+    config.create_mesh.?.bc_bottom = .periodic;
+    config.create_mesh.?.bc_top = .periodic;
+    config.create_mesh.?.bc_left = .periodic;
+    config.create_mesh.?.bc_right = .periodic;
+    config.create_mesh.?.bc_front = .periodic;
+    config.create_mesh.?.bc_back = .periodic;
+
+    var mesh = try testMesh(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh, .{});
+    defer s.deinit();
+
+    try s.initializeU();
+
+    // A non-uniform density, so the fluxes are not trivially zero
+    const ele = s.element();
+    for (0..ele.n_spts) |spt| {
+        for (0..s.n_eles) |e| {
+            const x = s.coord_spts.get(spt, 0, e);
+            const y = s.coord_spts.get(spt, 1, e);
+            const z = s.coord_spts.get(spt, 2, e);
+            const bump = 0.1 * @sin(std.math.pi * x) * @sin(std.math.pi * y) * @sin(std.math.pi * z);
+            s.u_spts.at(spt, 0, e).* += bump;
+        }
+    }
+
+    const mass0 = totalMass(&s);
+    for (0..5) |_| try s.update();
+    const mass1 = totalMass(&s);
+
+    try testing.expectApproxEqRel(mass0, mass1, 1e-12);
+}
+
+/// Integral of density over the mesh, by the solution-point quadrature.
+fn totalMass(s: *const Solver) f64 {
+    const ele = s.element();
+    var sum: f64 = 0.0;
+    for (0..s.n_eles) |e| {
+        for (0..ele.n_spts) |spt| {
+            sum += ele.weights_spts[spt] * s.jaco_det_spts.get(spt, e) * s.u_spts.get(spt, 0, e);
+        }
+    }
+    return sum;
 }

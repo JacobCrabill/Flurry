@@ -114,7 +114,9 @@ pub const Element = struct {
     /// Weight per solution point; the spts double as a quadrature rule
     weights_spts: []f64 = &.{},
 
-    /// 1D weights along a face, length `n_fpts_per_face`
+    /// Quadrature weight per flux point on one face, length `n_fpts_per_face`.
+    /// A quad's face is an interval, so this is the 1D rule; a hex's is a
+    /// square, so it is that rule's 2D tensor product.
     weights_fpts: []f64 = &.{},
 
     /// Weight per quadrature point

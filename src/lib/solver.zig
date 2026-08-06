@@ -247,9 +247,11 @@ pub const Solver = struct {
     params: flux.FlowParams,
     rk: RkScheme,
 
-    /// The reference element. One type for now; a mixed mesh needs one of
-    /// these per cell type.
-    quad: Quad,
+    /// The reference element, whose type follows the mesh's. One per solver; a
+    /// mixed mesh would need one of these per cell type. Read it through
+    /// `ele()` rather than unwrapping it -- almost nothing here cares which
+    /// shape it is, only about the operators every element exposes.
+    ele_impl: EleImpl,
     faces: Faces,
 
     n_dims: usize = 0,
@@ -326,6 +328,27 @@ pub const Solver = struct {
     /// Physical coordinates of the flux points, (fpt, dim, ele)
     coord_fpts: Array3(f64) = .empty,
 
+    /// The element implementations the solver can drive. Each owns an
+    /// `Element`, which is the only part the solver actually touches.
+    pub const EleImpl = union(enum) {
+        quad: Quad,
+        hex: Hex,
+
+        fn deinit(impl: *EleImpl) void {
+            switch (impl.*) {
+                inline else => |*e| e.deinit(),
+            }
+        }
+    };
+
+    /// The reference element's geometry-independent half: the point layout and
+    /// the DFR operators, whichever shape is underneath.
+    pub fn element(s: *const Solver) *const Element {
+        return switch (s.ele_impl) {
+            inline else => |*e| &e.ele,
+        };
+    }
+
     /// Create a solver for a mesh that has already been read, had its
     /// connectivity processed, and had its global flux points laid out:
     ///
@@ -348,19 +371,20 @@ pub const Solver = struct {
         opts: InitOptions,
     ) Error!Solver {
         const n_dims: usize = config.core.n_dims;
-        if (n_dims != 2) {
-            // Hex elements are not implemented yet, so 3D cannot be set up.
-            return error.UnsupportedDimension;
-        }
+        if (n_dims != 2 and n_dims != 3) return error.UnsupportedDimension;
+
+        // Quads in 2D, hexes in 3D; triangles and tets have no element type.
+        const want: geo_mod.CellType = if (n_dims == 3) .hex else .quad;
         for (mesh.ctype.items) |ct| {
-            if (ct != .quad) return error.UnsupportedCellType;
+            if (ct != want) return error.UnsupportedCellType;
         }
 
         const params = flux.FlowParams.fromConfig(config);
         const n_vars = flux.nVars(config.equation.equation, n_dims);
         const n_eles = mesh.n_eles;
         const order = config.core.order;
-        const n_nodes = if (n_eles > 0) mesh.c2nv.items[0] else 4;
+        const default_nodes: usize = if (n_dims == 3) 8 else 4;
+        const n_nodes = if (n_eles > 0) mesh.c2nv.items[0] else default_nodes;
 
         var s: Solver = .{
             .gpa = gpa,
@@ -368,7 +392,10 @@ pub const Solver = struct {
             .mesh = mesh,
             .params = params,
             .rk = try RkScheme.fromConfig(config.time.dt_scheme),
-            .quad = Quad.init(gpa, config, order, n_nodes),
+            .ele_impl = switch (want) {
+                .hex => .{ .hex = Hex.init(gpa, config, order, n_nodes) },
+                else => .{ .quad = Quad.init(gpa, config, order, n_nodes) },
+            },
             // Replaced below, once the element's flux point count is known.
             .faces = try Faces.init(gpa, gpa, config, params, 0, 0),
             .n_dims = n_dims,
@@ -378,11 +405,13 @@ pub const Solver = struct {
         };
         errdefer s.deinit();
 
-        try s.quad.ele.setup();
+        switch (s.ele_impl) {
+            inline else => |*e| try e.ele.setup(),
+        }
 
         // The caller owns mesh setup; check that its global flux point layout
         // was built for this element.
-        if (mesh.n_fpts_per_face != s.quad.ele.n_fpts_per_face) {
+        if (mesh.n_fpts_per_face != s.element().n_fpts_per_face) {
             return error.ConnectivityNotProcessed;
         }
 
@@ -393,12 +422,11 @@ pub const Solver = struct {
         // Anything with a CPU fallback in the loop -- advection-diffusion, the
         // viscous terms -- keeps host-visible arrays and pays for them.
         if (opts.device) |dev| {
-            const fully_gpu = config.equation.equation == .euler_ns and
-                !config.equation.viscous;
+            const fully_gpu = physicsKernelsCover(config, n_dims);
             s.gpu_state = try GpuState.create(
                 gpa,
                 dev,
-                &s.quad.ele,
+                s.element(),
                 if (fully_gpu) .device else .host,
             );
             try s.gpu_state.?.uploadConnectivity(gpa, mesh);
@@ -450,7 +478,7 @@ pub const Solver = struct {
         s.coord_fpts.deinit(gpa);
 
         s.faces.deinit();
-        s.quad.deinit();
+        s.ele_impl.deinit();
 
         // Last: the heap owns the memory the arrays above were just freed into
         if (s.gpu_state) |g| g.destroy();
@@ -494,7 +522,7 @@ pub const Solver = struct {
 
     fn allocate(s: *Solver) Error!void {
         const gpa = s.gpa;
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const nv = s.n_vars;
         const ne = s.n_eles;
         const nd = s.n_dims;
@@ -544,7 +572,7 @@ pub const Solver = struct {
     /// the shape derivatives are evaluated per point instead, which keeps the
     /// element's `calcDShape` as the single definition of the mapping.
     pub fn computeTransforms(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const nd = s.n_dims;
         const mesh = s.mesh;
 
@@ -637,7 +665,7 @@ pub const Solver = struct {
     /// way means a normal flux is `(F . norm_unit) * dA`, which is exactly what
     /// `oppDiv_fpts` consumes.
     fn computeFaceNormals(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const nd = s.n_dims;
 
         for (0..s.n_eles) |e| {
@@ -731,34 +759,45 @@ pub const Solver = struct {
     /// the basis. That is what ZEFR does and it costs one order in the initial
     /// error, which does not change the asymptotic rate.
     pub fn initializeU(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        switch (s.n_dims) {
+            2 => s.initializeUDim(2),
+            3 => s.initializeUDim(3),
+            else => return error.UnsupportedDimension,
+        }
+        return s.syncToDevice();
+    }
+
+    fn initializeUDim(s: *Solver, comptime nd: usize) void {
+        const ele = s.element();
         const tc = s.config.test_case.test_case;
 
         if (!tc.isAnalytic()) {
-            const state = s.params.freestreamState(2, s.config.equation.equation);
+            const state = s.params.freestreamState(nd, s.config.equation.equation);
             for (0..ele.n_spts) |spt| {
                 for (0..s.n_vars) |n| {
                     for (0..s.n_eles) |e| s.u_spts.at(spt, n, e).* = state[n];
                 }
             }
-            return s.syncToDevice();
+            return;
         }
 
         const bounds = s.meshBounds();
         for (0..ele.n_spts) |spt| {
             for (0..s.n_eles) |e| {
+                var x: [nd]f64 = undefined;
+                for (0..nd) |d| x[d] = s.coord_spts.get(spt, d, e);
+
                 const state = testcase.exactState(
+                    nd,
                     tc,
                     s.params,
-                    s.coord_spts.get(spt, 0, e),
-                    s.coord_spts.get(spt, 1, e),
+                    x,
                     0.0,
-                    .{ bounds[0], bounds[1] },
+                    bounds[0..nd].*,
                 );
                 for (0..s.n_vars) |n| s.u_spts.at(spt, n, e).* = state[n];
             }
         }
-        return s.syncToDevice();
     }
 
     /// L2 norm of the error in variable `test_case.err_field`, against the
@@ -773,7 +812,15 @@ pub const Solver = struct {
     /// Normalized by the domain volume, making it an RMS error: the value is
     /// comparable across meshes, which is the whole point of a refinement study.
     pub fn l2Error(s: *const Solver, gpa: std.mem.Allocator) Error!f64 {
-        const ele = &s.quad.ele;
+        return switch (s.n_dims) {
+            2 => s.l2ErrorDim(2, gpa),
+            3 => s.l2ErrorDim(3, gpa),
+            else => error.UnsupportedDimension,
+        };
+    }
+
+    fn l2ErrorDim(s: *const Solver, comptime nd: usize, gpa: std.mem.Allocator) Error!f64 {
+        const ele = s.element();
         try s.syncToHost();
         if (ele.n_qpts == 0) return error.NoQuadraturePoints;
 
@@ -795,7 +842,6 @@ pub const Solver = struct {
             .overwrite,
         );
 
-        const nd = s.n_dims;
         const bounds = s.meshBounds();
 
         var dshape = try Matrix(f64).init(gpa, ele.n_nodes, nd, null);
@@ -812,7 +858,7 @@ pub const Solver = struct {
             try ele.vtable.calcDShape(ele, loc, &dshape);
 
             for (0..s.n_eles) |e| {
-                var coord: [2]f64 = .{ 0, 0 };
+                var coord: [nd]f64 = @splat(0.0);
                 for (0..nd) |d| {
                     var sum: f64 = 0.0;
                     for (0..ele.n_nodes) |node| sum += shape[node] * s.nodes.get(node, d, e);
@@ -821,7 +867,7 @@ pub const Solver = struct {
 
                 // |J| at the quadrature point, so the integral is over physical
                 // space rather than reference space
-                var jaco: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
+                var jaco: [nd][nd]f64 = @splat(@splat(0.0));
                 for (0..nd) |dr| {
                     for (0..nd) |dp| {
                         var sum: f64 = 0.0;
@@ -831,15 +877,15 @@ pub const Solver = struct {
                         jaco[dr][dp] = sum;
                     }
                 }
-                const det = jaco[0][0] * jaco[1][1] - jaco[0][1] * jaco[1][0];
+                const det = jacoDet(nd, jaco);
 
                 const exact = testcase.exactState(
+                    nd,
                     tc,
                     s.params,
-                    coord[0],
-                    coord[1],
+                    coord,
                     s.flow_time,
-                    .{ bounds[0], bounds[1] },
+                    bounds[0..nd].*,
                 );
 
                 const err = exact[n] - u_qpts.get(qpt, n, e);
@@ -852,11 +898,19 @@ pub const Solver = struct {
         return @sqrt(sq_error / volume);
     }
 
+    /// Determinant of a small square matrix, for `nd` of 2 or 3.
+    fn jacoDet(comptime nd: usize, j: [nd][nd]f64) f64 {
+        if (nd == 2) return j[0][0] * j[1][1] - j[0][1] * j[1][0];
+        return j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) -
+            j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0]) +
+            j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0]);
+    }
+
     /// Bounding box of the mesh nodes, as `[dim][lo, hi]`.
     pub fn meshBounds(s: *const Solver) [3][2]f64 {
         var out: [3][2]f64 = @splat(.{ std.math.inf(f64), -std.math.inf(f64) });
         for (0..s.n_eles) |e| {
-            for (0..s.quad.ele.n_nodes) |node| {
+            for (0..s.element().n_nodes) |node| {
                 for (0..s.n_dims) |d| {
                     const v = s.nodes.get(node, d, e);
                     out[d][0] = @min(out[d][0], v);
@@ -878,7 +932,7 @@ pub const Solver = struct {
     /// host-mapped, the CPU operations either side of this still read and write
     /// it directly.
     pub fn extrapolateU(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         if (s.gpu_state) |g| {
             return g.dev.gemm(
                 ele.n_fpts,
@@ -907,7 +961,7 @@ pub const Solver = struct {
     /// solver's own arrays because this runs at `write_freq`, not every step.
     pub fn extrapolateToPpts(s: *const Solver, out: *Array3(f64)) Error!void {
         try s.syncToHost();
-        const ele = &s.quad.ele;
+        const ele = s.element();
         gemm(
             ele.n_ppts,
             s.n_vars * s.n_eles,
@@ -925,7 +979,7 @@ pub const Solver = struct {
     /// points, evaluated where the output needs it instead of being carried
     /// around for the whole run.
     pub fn plotPointCoords(s: *const Solver, gpa: std.mem.Allocator, out: *Array3(f64)) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const nd = s.n_dims;
 
         const shape = try gpa.alloc(f64, ele.n_nodes);
@@ -947,7 +1001,7 @@ pub const Solver = struct {
 
     /// Reference-space gradient contribution from the solution points.
     pub fn computeGradSpts(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         gemm(
             ele.n_spts * s.n_dims,
             s.n_vars * s.n_eles,
@@ -961,7 +1015,7 @@ pub const Solver = struct {
 
     /// Gradient correction from the common solution at the flux points.
     pub fn computeGradFpts(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         gemm(
             ele.n_spts * s.n_dims,
             s.n_vars * s.n_eles,
@@ -975,7 +1029,7 @@ pub const Solver = struct {
 
     /// Divergence contribution from the flux at the solution points.
     pub fn computeDivFSpts(s: *Solver, stage: usize) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const per_stage = ele.n_spts * s.n_vars * s.n_eles;
         if (s.gpu_state) |g| {
             return g.dev.gemm(
@@ -1003,7 +1057,7 @@ pub const Solver = struct {
 
     /// Divergence correction from the common normal flux at the flux points.
     pub fn computeDivFFpts(s: *Solver, stage: usize) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const per_stage = ele.n_spts * s.n_vars * s.n_eles;
         if (s.gpu_state) |g| {
             return g.dev.gemm(
@@ -1033,33 +1087,39 @@ pub const Solver = struct {
     /// reference space. For viscous runs the reference-space gradient in
     /// `du_spts` is converted to a physical gradient in place first.
     pub fn computeFluxSpts(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
 
         // The kernel covers the inviscid Euler case only. Advection-diffusion
         // and the viscous terms stay on the CPU until they have kernels of
         // their own; there is no correctness cliff either way, only speed.
-        if (s.gpu_state) |g| {
-            if (s.config.equation.equation == .euler_ns and !s.config.equation.viscous) {
-                return g.dev.fluxEuler(
-                    ele.n_spts,
-                    s.n_eles,
-                    s.n_vars,
-                    s.params.gamma,
-                    try g.bufferFor(s.u_spts.data),
-                    try g.bufferFor(s.inv_jaco_spts.data),
-                    try g.bufferFor(s.f_spts.data),
-                );
-            }
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            return g.dev.fluxEuler(
+                ele.n_spts,
+                s.n_eles,
+                s.n_vars,
+                s.params.gamma,
+                try g.bufferFor(s.u_spts.data),
+                try g.bufferFor(s.inv_jaco_spts.data),
+                try g.bufferFor(s.f_spts.data),
+            );
         }
 
-        switch (s.config.equation.equation) {
-            .adv_diff => s.fluxSpts(2, .adv_diff),
-            .euler_ns => s.fluxSpts(2, .euler_ns),
+        switch (s.n_dims) {
+            2 => switch (s.config.equation.equation) {
+                .adv_diff => s.fluxSpts(2, .adv_diff),
+                .euler_ns => s.fluxSpts(2, .euler_ns),
+            },
+            3 => switch (s.config.equation.equation) {
+                .adv_diff => s.fluxSpts(3, .adv_diff),
+                .euler_ns => s.fluxSpts(3, .euler_ns),
+            },
+            else => return error.UnsupportedDimension,
         }
     }
 
     fn fluxSpts(s: *Solver, comptime nd: usize, comptime equation: cfg.Equation) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const n_vars = comptime flux.nVars(equation, nd);
         const viscous = s.config.equation.viscous;
 
@@ -1127,9 +1187,12 @@ pub const Solver = struct {
     /// The kernel covers the inviscid conditions; a viscous wall has no code and
     /// leaves `bc_code` null, which sends this to the CPU.
     fn applyFaceBcs(s: *Solver) Error!void {
-        if (s.gpu_state) |g| {
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
             if (g.bc_code) |codes| {
                 const f = &s.faces;
+                // 2, not `s.n_dims`: `gpuPhysicsApplies` has already established
+                // that, and the kernel's push constants are sized for it.
                 const u_fs = s.params.freestreamState(2, .euler_ns);
                 return g.dev.faceBcs(.{
                     .n_gfpts = @intCast(f.n_gfpts),
@@ -1149,21 +1212,20 @@ pub const Solver = struct {
 
     /// Rusanov common normal flux at every global flux point.
     fn computeCommonF(s: *Solver) Error!void {
-        if (s.gpu_state) |g| {
-            if (!s.config.equation.viscous) {
-                const f = &s.faces;
-                return g.dev.faceCommonF(
-                    f.n_gfpts,
-                    s.n_vars,
-                    s.params.gamma,
-                    s.config.flux.rus_k,
-                    try g.bufferFor(f.u.data),
-                    try g.bufferFor(f.norm.data),
-                    try g.bufferFor(f.d_a.data),
-                    try g.bufferFor(f.f_comm.data),
-                    try g.bufferFor(f.wave_sp),
-                );
-            }
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            const f = &s.faces;
+            return g.dev.faceCommonF(
+                f.n_gfpts,
+                s.n_vars,
+                s.params.gamma,
+                s.config.flux.rus_k,
+                try g.bufferFor(f.u.data),
+                try g.bufferFor(f.norm.data),
+                try g.bufferFor(f.d_a.data),
+                try g.bufferFor(f.f_comm.data),
+                try g.bufferFor(f.wave_sp),
+            );
         }
         s.faces.computeCommonF();
     }
@@ -1219,14 +1281,34 @@ pub const Solver = struct {
         return s.canBatchResidual();
     }
 
+    /// Whether the kernels that have the equations baked into them apply to
+    /// this case.
+    ///
+    /// `flux_euler`, `face_common_f` and `face_bcs` fix `n_dims = 2` and
+    /// `n_vars = 4` at compile time, deliberately, so their loops unroll. A 3D
+    /// case would therefore get the 2D flux silently rather than fail, which is
+    /// why this is checked at every dispatch site and not just before batching.
+    /// The pure data-movement kernels -- the gemms, the scatter/gather, the RK
+    /// update -- carry no such assumption and run in any dimension.
+    fn gpuPhysicsApplies(s: *const Solver) bool {
+        if (s.gpu_state == null) return false;
+        return physicsKernelsCover(s.config, s.n_dims);
+    }
+
+    /// The same question, answerable before there is a solver to ask it of --
+    /// `init` needs it to decide where the arrays live.
+    fn physicsKernelsCover(config: *const cfg.Config, n_dims: usize) bool {
+        return n_dims == 2 and
+            config.equation.equation == .euler_ns and
+            !config.equation.viscous;
+    }
+
     /// Whether every step of the residual has a GPU path, so the whole thing can
     /// go in one submission.
     fn canBatchResidual(s: *const Solver) bool {
-        const g = s.gpu_state orelse return false;
-        if (s.config.equation.viscous) return false;
-        if (s.config.equation.equation != .euler_ns) return false;
+        if (!s.gpuPhysicsApplies()) return false;
         // Null when some boundary condition has no kernel
-        return g.bc_code != null;
+        return s.gpu_state.?.bc_code != null;
     }
 
     /// The residual as one batch. Same order as `computeResidual`, with a
@@ -1249,7 +1331,7 @@ pub const Solver = struct {
 
     /// Physical solution gradient at the solution points -> flux points.
     pub fn extrapolateGrad(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const per_dim = ele.n_spts * s.n_vars * s.n_eles;
         const per_dim_f = ele.n_fpts * s.n_vars * s.n_eles;
         for (0..s.n_dims) |dim| {
@@ -1272,7 +1354,7 @@ pub const Solver = struct {
 
     /// Element flux-point solution -> the faces' two-sided state.
     pub fn scatterUToFaces(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const mesh = s.mesh;
 
         if (s.gpu_state) |g| {
@@ -1311,7 +1393,7 @@ pub const Solver = struct {
 
     /// Common normal flux -> each element's own flux-point array.
     pub fn gatherCommonFFromFaces(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const mesh = s.mesh;
 
         if (s.gpu_state) |g| {
@@ -1345,7 +1427,7 @@ pub const Solver = struct {
 
     /// Common interface solution -> each element, for the gradient correction.
     pub fn gatherCommonUFromFaces(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const mesh = s.mesh;
 
         for (0..s.n_eles) |e| {
@@ -1365,7 +1447,7 @@ pub const Solver = struct {
 
     /// Element flux-point gradients -> the faces' two-sided gradient.
     pub fn scatterGradToFaces(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const mesh = s.mesh;
 
         for (0..s.n_eles) |e| {
@@ -1405,7 +1487,7 @@ pub const Solver = struct {
     /// both write their own `d_a`, since two cells can disagree about the
     /// reference-space size of a shared face.
     pub fn setFaceGeometry(s: *Solver) void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const mesh = s.mesh;
 
         for (0..s.n_eles) |e| {
@@ -1438,10 +1520,12 @@ pub const Solver = struct {
 
     /// Largest mismatch between the two sides' flux point coordinates.
     ///
-    /// `geo.setupGlobalFpts` pairs the two sides of an interface by reversing
-    /// the right element's traversal, which is exact for a conforming 2D mesh
-    /// but is an *assumption*. This measures it: on a valid mesh the result is
-    /// at roundoff, and anything larger means the pairing is wrong.
+    /// `geo.setupGlobalFpts` pairs the two sides of an interface by lining up
+    /// their corner vertex lists, which is topology rather than geometry. This
+    /// measures the result: on a valid mesh it is at roundoff, and anything
+    /// larger means the pairing is wrong. In 3D that is the check that matters
+    /// most, since a face there can be met in any of eight orientations and a
+    /// wrong one still produces a plausible-looking solution.
     pub fn fptPairingError(s: *const Solver) f64 {
         return s.pairingError(false);
     }
@@ -1454,7 +1538,7 @@ pub const Solver = struct {
             for (0..s.n_dims) |d| period[d] = s.periodInDim(d);
         }
 
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const mesh = s.mesh;
 
         // Left-side coordinates are already in faces.coord; compare the right.
@@ -1520,7 +1604,7 @@ pub const Solver = struct {
 
     /// Keep the solution at the start of the step, for the RK combination.
     fn saveInitialU(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         if (s.gpu_state) |g| {
             // No terms, so the kernel's sum is empty and this is a copy -- done
             // on the device so nothing has to travel to the host and back.
@@ -1543,7 +1627,7 @@ pub const Solver = struct {
     /// reference-space divergence; dividing by `|J|` returns it to physical
     /// space.
     pub fn rkStage(s: *Solver, stage: usize) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         const src = if (s.rk.n_stages > 1) &s.u_ini else &s.u_spts;
         const a = s.rk.alpha[stage];
 
@@ -1574,7 +1658,7 @@ pub const Solver = struct {
 
     /// Final RK combination: `u = u_ini - sum_stage beta dt / |J| divF_stage`.
     pub fn rkCombine(s: *Solver) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
 
         if (s.gpu_state) |g| {
             var coeff: [gpu.rk_update.max_stages]f64 = @splat(0.0);
@@ -1610,7 +1694,7 @@ pub const Solver = struct {
 
     /// L2 norm of the current residual, per variable.
     pub fn residualNorm(s: *Solver, stage: usize, out: []f64) Error!void {
-        const ele = &s.quad.ele;
+        const ele = s.element();
         try s.syncToHost();
         std.debug.assert(out.len >= s.n_vars);
         @memset(out[0..s.n_vars], 0.0);
@@ -1678,6 +1762,7 @@ const geo_mod = @import("geo.zig");
 const Geo = geo_mod.Geo;
 const Element = @import("element.zig").Element;
 const Quad = @import("eles/quads.zig").Quad;
+const Hex = @import("eles/hexes.zig").Hex;
 const faces_mod = @import("faces.zig");
 const testcase = @import("testcase.zig");
 const gpu = @import("gpu.zig");

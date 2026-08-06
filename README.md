@@ -16,15 +16,16 @@ zig build -Doptimize=ReleaseFast
 A case is a single `.cfg.ziggy` file. Either it names a Gmsh file in
 `core.mesh_file`, or it has a `create_mesh` section and the Cartesian mesh is
 generated on the spot — `samples/quadbox.cfg.ziggy` does the latter, so it runs
-with nothing else on disk.
+with nothing else on disk. `core.n_dims` picks quads or hexes;
+`samples/vortex-3d.cfg.ziggy` is the 3D counterpart of `samples/vortex.cfg.ziggy`.
 
 ## Output
 
 With `output.write_freq` set, a run writes `<output_prefix>/<output_prefix>_<iter>.vtu`
 every that many steps — binary VTK XML, ready to open in ParaView. Each
-high-order cell is drawn as a patch of `order²` linear sub-cells over its plot
-points, and cells do not share points, so a discontinuous solution looks
-discontinuous.
+high-order cell is drawn as a patch of linear sub-cells over its plot points —
+`order²` quads in 2D, `order³` hexahedra in 3D — and cells do not share points,
+so a discontinuous solution looks discontinuous.
 
 ## Verification
 
@@ -41,7 +42,8 @@ zig build convergence -- 3     # just order 3
 
 On the advected sine wave — exactly periodic, so the measured rate is the
 discretization's and nothing else — orders 1–4 come out at **2.02, 3.00, 3.98,
-5.00** against a design order of p+1.
+5.00** against a design order of p+1. The same wave in 3D, `sin πx sin πy sin πz`
+on a triply-periodic box, gives **2.04, 3.00, 4.03** at orders 1–3.
 
 The isentropic vortices reach p+1 exactly at t = 0, i.e. for the initial
 collocation, but converge more slowly once integrated in time (~2.4 at order 2,
@@ -66,7 +68,11 @@ arrays. Operands are device-resident, so a dispatch binds them where they lie
 and nothing is copied.
 
 Anything the kernels do not cover falls back rather than failing:
-advection-diffusion, the viscous terms, and the viscous wall conditions.
+advection-diffusion, the viscous terms, the viscous wall conditions, and 3D.
+The three kernels with the equations in them fix `n_dims = 2` and `n_vars = 4`
+at compile time so their loops unroll, so a 3D case runs its physics on the CPU
+and keeps only the dimension-agnostic operators — the gemms, the scatter and
+gather, the RK update — on the device.
 
 The arrays live in the device's own memory, with a host-visible block beside
 each one that they are pushed to and from explicitly — at setup, at the initial
@@ -105,15 +111,40 @@ brings host reads back to parity.
 
 Everything is f64. A device without `shaderFloat64` will not run this.
 
+## 3D
+
+Inviscid flow on hexahedral meshes runs the same path as 2D: the solver holds
+whichever element the mesh's cell type calls for, and everything above it —
+transforms, faces, boundary conditions, the RK update — is written against the
+dimension rather than around it.
+
+The part with no 2D counterpart is pairing flux points across a face. A quad's
+face is an interval, and two cells always meet it reversed; a hex's face is a
+square that two cells can meet in any of eight relative orientations. The mesh
+derives the right one from the two cells' corner-vertex lists — topology, no
+coordinate comparison and no second pass — and every run reports the residual
+geometric mismatch:
+
+```
+ pairing   flux point mismatch 1.790e-15
+```
+
+Two checks that the 3D path is the 2D one and not a parallel reimplementation:
+the Shu vortex extended along z reproduces the 2D run's residuals and L2 error
+to every printed digit, and its z-momentum residual stays at ~1e-15, so nothing
+leaks into the third direction.
+
 ## What works so far
 
-2D inviscid flow on quadrilateral meshes: Gmsh 2.2 and 4.1 input, Cartesian mesh
-generation, periodic boundaries, characteristic/slip-wall/supersonic/symmetry
-boundaries, explicit Euler, RK44 and Jameson-RK time stepping, ParaView output,
-and analytic test cases with error measurement.
+Inviscid flow in 2D on quadrilateral meshes and in 3D on hexahedral ones: Gmsh
+2.2 and 4.1 input, Cartesian mesh generation, periodic boundaries,
+characteristic/slip-wall/supersonic/symmetry boundaries, explicit Euler, RK44 and
+Jameson-RK time stepping, ParaView output, and analytic test cases with error
+measurement.
 
 Not yet: a CFL-derived time step (`time.dt` has to be given), restarts,
-triangles, 3D elements, and the viscous terms — which are written but unverified.
+triangles, tets and prisms, and the viscous terms — which are written but
+unverified. `zig build convergence` sweeps 2D only.
 
 ```sh
 zig build test

@@ -1,0 +1,76 @@
+// Shu's isentropic Euler vortex on a triply-periodic box, extended along z.
+//
+// The vortex is an exact solution of the Euler equations that simply convects,
+// here at (1, 1), so it returns to where it started after t = 10 -- and the
+// difference between what comes back and what was there to begin with is the
+// scheme's error, reported as `L2 error[rho]` every `error_freq` steps.
+//
+// This is the case free-stream preservation cannot stand in for: a constant is
+// in the span of every basis and survives operators that are wrong, whereas a
+// vortex exercises the derivative and divergence operators, the metric terms,
+// the Rusanov flux and the periodic pairing all at once.
+//
+// The vortex is invariant along z with no velocity through it, which is an
+// exact solution of the 3D Euler equations. That makes z-invariance itself part
+// of what is being measured: any leak into the third direction shows up in the
+// error. It does mean the z physics is only exercised through its metric terms,
+// so this is a 3D check of the machinery rather than of three-dimensional flow.
+//
+// For the full refinement sweep, run `zig build convergence`.
+.{
+  .core = .{
+      .n_dims = 3,
+      .mesh_file = "",
+      .order = 3,
+  },
+
+  .equation = .{
+      .equation = .euler_ns,
+      .viscous = false,
+  },
+
+  .time = .{
+      .dt_scheme = .rk44,
+      .n_steps = 10000,
+      .dt = 5e-3,
+  },
+
+  .output = .{
+      .output_prefix = "vortex",
+      .write_freq = 500,
+      .report_freq = 250,
+      // Non-zero, which is also what keeps `test_case.n_qpts_1d` from being
+      // zeroed during post-parse init
+      .error_freq = 500,
+  },
+
+  .test_case = .{
+      .test_case = .shu_vortex,
+      // Density: on a finite domain the vortex still carries ~2e-5 of velocity
+      // perturbation at the boundary but only ~1e-11 of density, so density is
+      // the variable whose error is the scheme's rather than the domain's
+      .err_field = 0,
+      .n_qpts_1d = 6,
+  },
+
+  .create_mesh = .{
+      .nx = 32,
+      .ny = 32,
+      // Thin in z, since nothing varies along it -- but at least three cells,
+      // which is what periodic merging needs to tell a face from its image.
+      .nz = 4,
+      .xmin = -5.0,
+      .xmax = 5.0,
+      .ymin = -5.0,
+      .ymax = 5.0,
+      .zmin = -1.0,
+      .zmax = 1.0,
+      // In 3D `bottom`/`top` are the z faces and `front`/`back` the y ones
+      .bc_bottom = .periodic,
+      .bc_top = .periodic,
+      .bc_left = .periodic,
+      .bc_right = .periodic,
+      .bc_front = .periodic,
+      .bc_back = .periodic,
+  },
+}

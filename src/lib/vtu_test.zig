@@ -241,7 +241,7 @@ test "a field the basis represents exactly reaches the plot points intact" {
     defer run.deinit();
 
     const s = &run.solver;
-    const ele = &s.quad.ele;
+    const ele = s.element();
 
     const field = struct {
         fn at(x: f64, y: f64, n: usize) f64 {

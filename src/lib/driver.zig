@@ -114,6 +114,11 @@ pub const Run = struct {
         try r.writeReportHeader(w);
         try r.writeReport(w, started, &res);
 
+        // Write the initial condition
+        if (o.write_freq != 0 and s.current_iter == 0) {
+            try r.writeSolution(w);
+        }
+
         var last_reported: u32 = s.current_iter;
         var reason: []const u8 = "reached n_steps";
 

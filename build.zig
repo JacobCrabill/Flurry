@@ -56,7 +56,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // Kernels of our own, compiled to SPIR-V by the same route.
-    inline for (.{ "flux_euler", "face_scatter", "face_gather", "face_common_f", "face_bcs", "rk_update" }) |name| {
+    //
+    // These carry no equation and no dimension -- they move data between
+    // layouts, or sum RK stages -- so one build serves every case.
+    inline for (.{ "face_scatter", "face_gather", "rk_update" }) |name| {
         const spv = spock_build.addSpirvKernel(b, .{
             .name = name,
             .root_source_file = b.path("src/lib/kernels/" ++ name ++ ".zig"),
@@ -64,6 +67,32 @@ pub fn build(b: *std.Build) void {
             .spock_dep = spock,
         });
         mod.addAnonymousImport(name ++ ".spv", .{ .root_source_file = spv });
+    }
+
+    // The kernels with the Euler equations in them, one build per dimension.
+    //
+    // `n_dims` has to be comptime inside these: it bounds the loops over the
+    // conserved state and the metric terms, and a runtime bound would leave
+    // those arrays dynamically indexed, which in SPIR-V means private memory
+    // rather than registers. Templating the source keeps one copy of the physics
+    // and still lets each build unroll everything. The host imports the same
+    // files for their push-constant layouts, and gets no `kernel_dims`; see the
+    // guard at the top of each.
+    inline for (.{ 2, 3 }) |nd| {
+        const kernel_dims = b.addOptions();
+        kernel_dims.addOption(u32, "n_dims", nd);
+
+        inline for (.{ "flux_euler", "face_common_f", "face_bcs" }) |name| {
+            const tag = std.fmt.comptimePrint("{s}_{d}d", .{ name, nd });
+            const spv = spock_build.addSpirvKernel(b, .{
+                .name = tag,
+                .root_source_file = b.path("src/lib/kernels/" ++ name ++ ".zig"),
+                .optimize = optimize,
+                .spock_dep = spock,
+                .imports = &.{.{ .name = "kernel_dims", .mod = kernel_dims.createModule() }},
+            });
+            mod.addAnonymousImport(tag ++ ".spv", .{ .root_source_file = spv });
+        }
     }
 
     // ------ Executable ------

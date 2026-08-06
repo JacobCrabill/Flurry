@@ -422,7 +422,7 @@ pub const Solver = struct {
         // Anything with a CPU fallback in the loop -- advection-diffusion, the
         // viscous terms -- keeps host-visible arrays and pays for them.
         if (opts.device) |dev| {
-            const fully_gpu = physicsKernelsCover(config, n_dims);
+            const fully_gpu = physicsKernelsCover(config);
             s.gpu_state = try GpuState.create(
                 gpa,
                 dev,
@@ -1095,6 +1095,7 @@ pub const Solver = struct {
         if (s.gpuPhysicsApplies()) {
             const g = s.gpu_state.?;
             return g.dev.fluxEuler(
+                s.n_dims,
                 ele.n_spts,
                 s.n_eles,
                 s.n_vars,
@@ -1191,10 +1192,22 @@ pub const Solver = struct {
             const g = s.gpu_state.?;
             if (g.bc_code) |codes| {
                 const f = &s.faces;
-                // 2, not `s.n_dims`: `gpuPhysicsApplies` has already established
-                // that, and the kernel's push constants are sized for it.
-                const u_fs = s.params.freestreamState(2, .euler_ns);
-                return g.dev.faceBcs(.{
+
+                // The kernel's push constants are sized for the largest
+                // dimension so one layout serves both builds; it reads the
+                // first `n_dims` and `n_vars` entries and ignores the rest.
+                var vel_fs: [3]f64 = @splat(0.0);
+                var u_fs: [5]f64 = @splat(0.0);
+                for (0..s.n_dims) |d| vel_fs[d] = s.params.vel_fs[d];
+                switch (s.n_dims) {
+                    inline 2, 3 => |nd| {
+                        const state = s.params.freestreamState(nd, .euler_ns);
+                        for (state, 0..) |v, n| u_fs[n] = v;
+                    },
+                    else => return error.UnsupportedDimension,
+                }
+
+                return g.dev.faceBcs(s.n_dims, .{
                     .n_gfpts = @intCast(f.n_gfpts),
                     .n_gfpts_int = @intCast(f.n_gfpts_int),
                     .n_gfpts_bnd = @intCast(f.n_gfpts_bnd),
@@ -1202,7 +1215,7 @@ pub const Solver = struct {
                     .gamma = s.params.gamma,
                     .rho_fs = s.params.rho_fs,
                     .p_fs = s.params.p_fs,
-                    .vel_fs = .{ s.params.vel_fs[0], s.params.vel_fs[1] },
+                    .vel_fs = vel_fs,
                     .u_fs = u_fs,
                 }, try g.bufferFor(f.u.data), try g.bufferFor(f.norm.data), codes.binding());
             }
@@ -1216,6 +1229,7 @@ pub const Solver = struct {
             const g = s.gpu_state.?;
             const f = &s.faces;
             return g.dev.faceCommonF(
+                s.n_dims,
                 f.n_gfpts,
                 s.n_vars,
                 s.params.gamma,
@@ -1284,23 +1298,22 @@ pub const Solver = struct {
     /// Whether the kernels that have the equations baked into them apply to
     /// this case.
     ///
-    /// `flux_euler`, `face_common_f` and `face_bcs` fix `n_dims = 2` and
-    /// `n_vars = 4` at compile time, deliberately, so their loops unroll. A 3D
-    /// case would therefore get the 2D flux silently rather than fail, which is
-    /// why this is checked at every dispatch site and not just before batching.
-    /// The pure data-movement kernels -- the gemms, the scatter/gather, the RK
-    /// update -- carry no such assumption and run in any dimension.
+    /// `flux_euler`, `face_common_f` and `face_bcs` fix `n_dims` and `n_vars` at
+    /// compile time, deliberately, so their loops unroll; `build.zig` compiles
+    /// each once per dimension and the dispatch picks by `n_dims`. What they do
+    /// not cover is the equation set: advection-diffusion and the viscous terms
+    /// have no kernel and fall back. The pure data-movement kernels -- the
+    /// gemms, the scatter/gather, the RK update -- carry no assumption at all
+    /// and run in any case.
     fn gpuPhysicsApplies(s: *const Solver) bool {
         if (s.gpu_state == null) return false;
-        return physicsKernelsCover(s.config, s.n_dims);
+        return physicsKernelsCover(s.config);
     }
 
     /// The same question, answerable before there is a solver to ask it of --
     /// `init` needs it to decide where the arrays live.
-    fn physicsKernelsCover(config: *const cfg.Config, n_dims: usize) bool {
-        return n_dims == 2 and
-            config.equation.equation == .euler_ns and
-            !config.equation.viscous;
+    fn physicsKernelsCover(config: *const cfg.Config) bool {
+        return config.equation.equation == .euler_ns and !config.equation.viscous;
     }
 
     /// Whether every step of the residual has a GPU path, so the whole thing can

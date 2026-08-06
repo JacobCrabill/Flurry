@@ -11,12 +11,19 @@
 //! all, and this will refuse to run on those -- which is the right trade for a
 //! solver whose accuracy claims are the point.
 //!
-//! State of the port: a whole time step, for the inviscid Euler equations in 2D
-//! -- the eight residual dispatches plus the Runge-Kutta update, recorded into
-//! one command buffer and submitted once per stage. Operands are
-//! device-resident, so a dispatch binds them where they lie rather than copying
-//! them in and out; `gemmHost` still exists for callers holding ordinary host
-//! memory.
+//! State of the port: a whole time step, for the inviscid Euler equations in
+//! either dimension -- the eight residual dispatches plus the Runge-Kutta
+//! update, recorded into one command buffer and submitted once per stage.
+//! Operands are device-resident, so a dispatch binds them where they lie rather
+//! than copying them in and out; `gemmHost` still exists for callers holding
+//! ordinary host memory.
+//!
+//! Three of the kernels have the Euler equations in them and so need `n_dims`
+//! at compile time -- a runtime bound would leave the conserved state and the
+//! metric terms dynamically indexed, which SPIR-V puts in private memory rather
+//! than registers. `build.zig` compiles those three once per dimension from one
+//! source, and `Kind.forDims` picks at dispatch. The rest -- the gemms, the
+//! scatter and gather, the RK update -- carry no equation and no dimension.
 //!
 //! What is left on the CPU: the residual norms and the error measure, both of
 //! which run at report intervals rather than every step, and anything the
@@ -37,7 +44,6 @@ const dgemm = spock.kernels.blas.dgemm;
 const dgemm_spv = @embedFile("spock/dgemm.spv");
 
 const flux_euler = @import("kernels/flux_euler.zig");
-const flux_euler_spv = @embedFile("flux_euler.spv");
 
 pub const face_scatter = @import("kernels/face_scatter.zig");
 pub const face_gather = @import("kernels/face_gather.zig");
@@ -47,9 +53,15 @@ pub const rk_update = @import("kernels/rk_update.zig");
 
 const face_scatter_spv = @embedFile("face_scatter.spv");
 const face_gather_spv = @embedFile("face_gather.spv");
-const face_common_f_spv = @embedFile("face_common_f.spv");
-const face_bcs_spv = @embedFile("face_bcs.spv");
 const rk_update_spv = @embedFile("rk_update.spv");
+
+// The kernels with the equations in them are built once per dimension; see the
+// kernel loop in `build.zig`. Each file's host-facing half -- its push-constant
+// layout and workgroup size -- is the same for both, which is why there is still
+// only one import of each above.
+const flux_euler_spv = [2][]const u8{ @embedFile("flux_euler_2d.spv"), @embedFile("flux_euler_3d.spv") };
+const face_common_f_spv = [2][]const u8{ @embedFile("face_common_f_2d.spv"), @embedFile("face_common_f_3d.spv") };
+const face_bcs_spv = [2][]const u8{ @embedFile("face_bcs_2d.spv"), @embedFile("face_bcs_3d.spv") };
 
 /// What the index arrays use for "no global flux point here". The host's
 /// `geo.none` is `maxInt(usize)`; it narrows to this on upload.
@@ -71,15 +83,34 @@ pub const Error = error{
 };
 
 /// The kernels a `Device` owns. A batch may record each at most once.
-/// The kernels a `Device` owns.
+///
+/// The three with the Euler equations in them appear twice, once per dimension:
+/// a run uses one or the other, but a `Device` is built before the case is and
+/// the tests share one across both, so both are compiled in. The cost is three
+/// extra pipelines at startup.
 const Kind = enum {
     dgemm,
-    flux_euler,
+    flux_euler_2d,
+    flux_euler_3d,
     face_scatter,
     face_gather,
-    face_common_f,
-    face_bcs,
+    face_common_f_2d,
+    face_common_f_3d,
+    face_bcs_2d,
+    face_bcs_3d,
     rk_update,
+
+    /// The variant of `kind` for a mesh of `n_dims` dimensions. `kind` must be
+    /// the 2D one, which is how the tables below are keyed.
+    fn forDims(kind: Kind, n_dims: usize) Kind {
+        if (n_dims != 3) return kind;
+        return switch (kind) {
+            .flux_euler_2d => .flux_euler_3d,
+            .face_common_f_2d => .face_common_f_3d,
+            .face_bcs_2d => .face_bcs_3d,
+            else => kind,
+        };
+    }
 };
 
 /// How many times one batch may dispatch each kernel.
@@ -91,11 +122,14 @@ const Kind = enum {
 /// divergences) and two RK updates (saving the solution, then advancing it).
 const pool_sizes = std.enums.EnumArray(Kind, u8).init(.{
     .dgemm = 3,
-    .flux_euler = 1,
+    .flux_euler_2d = 1,
+    .flux_euler_3d = 1,
     .face_scatter = 1,
     .face_gather = 1,
-    .face_common_f = 1,
-    .face_bcs = 1,
+    .face_common_f_2d = 1,
+    .face_common_f_3d = 1,
+    .face_bcs_2d = 1,
+    .face_bcs_3d = 1,
     .rk_update = 2,
 });
 
@@ -184,11 +218,14 @@ pub const Device = struct {
         const specs = std.enums.EnumArray(Kind, Spec).init(.{
             // spock's dgemm names its entry point after itself, not "main"
             .dgemm = .{ dgemm_spv, "dgemm", 3, @sizeOf(dgemm.PushConstants) },
-            .flux_euler = .{ flux_euler_spv, "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
+            .flux_euler_2d = .{ flux_euler_spv[0], "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
+            .flux_euler_3d = .{ flux_euler_spv[1], "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
             .face_scatter = .{ face_scatter_spv, "face_scatter", 4, @sizeOf(face_scatter.PushConstants) },
             .face_gather = .{ face_gather_spv, "face_gather", 4, @sizeOf(face_gather.PushConstants) },
-            .face_common_f = .{ face_common_f_spv, "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
-            .face_bcs = .{ face_bcs_spv, "face_bcs", 3, @sizeOf(face_bcs.PushConstants) },
+            .face_common_f_2d = .{ face_common_f_spv[0], "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
+            .face_common_f_3d = .{ face_common_f_spv[1], "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
+            .face_bcs_2d = .{ face_bcs_spv[0], "face_bcs", 3, @sizeOf(face_bcs.PushConstants) },
+            .face_bcs_3d = .{ face_bcs_spv[1], "face_bcs", 3, @sizeOf(face_bcs.PushConstants) },
             .rk_update = .{ rk_update_spv, "rk_update", 4, @sizeOf(rk_update.PushConstants) },
         });
 
@@ -345,9 +382,10 @@ pub const Device = struct {
     /// Inviscid Euler flux at the solution points, in reference space.
     ///
     /// One thread per `(spt, ele)`; see `kernels/flux_euler.zig` for the layouts
-    /// it assumes. 2D and inviscid only, matching the kernel.
+    /// it assumes. Inviscid only, matching the kernel.
     pub fn fluxEuler(
         d: *Device,
+        n_dims: usize,
         n_spts: usize,
         n_eles: usize,
         n_vars: usize,
@@ -367,7 +405,7 @@ pub const Device = struct {
         const threads: u32 = @intCast(n_spts * n_eles);
         const groups = std.math.divCeil(u32, threads, flux_euler.WgSize.x) catch unreachable;
 
-        try d.run(.flux_euler, .{
+        try d.run(Kind.forDims(.flux_euler_2d, n_dims), .{
             .buffers = &.{ u_spts, inv_jaco, f_spts },
             .push_constant = std.mem.asBytes(&pc),
             .groups = .{ groups, 1, 1 },
@@ -431,6 +469,7 @@ pub const Device = struct {
     /// Rusanov common normal flux at every global flux point.
     pub fn faceCommonF(
         d: *Device,
+        n_dims: usize,
         n_gfpts: usize,
         n_vars: usize,
         gamma: f64,
@@ -448,7 +487,7 @@ pub const Device = struct {
             .gamma = gamma,
             .rus_k = rus_k,
         };
-        try d.run(.face_common_f, .{
+        try d.run(Kind.forDims(.face_common_f_2d, n_dims), .{
             .buffers = &.{ u, norm, d_a, f_comm, wave_sp },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(n_gfpts, face_common_f.WgSize.x), 1, 1 },
@@ -458,13 +497,14 @@ pub const Device = struct {
     /// Ghost states at the boundary flux points.
     pub fn faceBcs(
         d: *Device,
+        n_dims: usize,
         p: face_bcs.PushConstants,
         u: Binding,
         norm: Binding,
         bc_code: Binding,
     ) Error!void {
         if (p.n_gfpts_bnd == 0) return;
-        try d.run(.face_bcs, .{
+        try d.run(Kind.forDims(.face_bcs_2d, n_dims), .{
             .buffers = &.{ u, norm, bc_code },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(p.n_gfpts_bnd, face_bcs.WgSize.x), 1, 1 },

@@ -1,6 +1,6 @@
 //! Rusanov common normal flux at the global flux points.
 //!
-//! The GPU half of `Faces.rusanov`, for the inviscid Euler equations in 2D. One
+//! The GPU half of `Faces.rusanov`, for the inviscid Euler equations. One
 //! thread per global flux point: it reads both sides, forms the upwind flux
 //! between them, and writes the two sides' contributions plus the wave speed.
 //!
@@ -13,6 +13,9 @@
 //!     norm       (dim, gfpt)
 //!     d_a        (slot, gfpt)
 //!     wave_sp    (gfpt)
+//!
+//! Built once per dimension; see `n_dims` below and the kernel loop in
+//! `build.zig`.
 
 comptime {
     if (@import("builtin").target.cpu.arch.isSpirV()) {
@@ -60,23 +63,38 @@ const wave_sp = @extern(*addrspace(.storage_buffer) F64Buf, .{
 
 const pc = @extern(*addrspace(.push_constant) const PushConstants, .{ .name = "pc" });
 
-const n_dims = 2;
-const n_vars = 4;
+/// The dimension this build is for, injected by `build.zig`.
+///
+/// Comptime rather than a push constant so every loop below unrolls and the
+/// state stays in registers. The host imports this file for its push-constant
+/// layout alone and has no `kernel_dims` module, so on that side reaching for
+/// `n_dims` is a compile error rather than a quietly wrong 2.
+const n_dims: usize = if (@import("builtin").target.cpu.arch.isSpirV())
+    @import("kernel_dims").n_dims
+else
+    @compileError("n_dims is device-only; the host half of this file is dimension-independent");
+
+/// Euler carries density, momentum per dimension, and total energy.
+const n_vars = n_dims + 2;
+
+/// Total energy's index in the conserved state, one past the last momentum.
+const i_energy = n_dims + 1;
 
 /// Normal flux and the largest wave speed for one state, both of which the
 /// Rusanov flux needs from each side.
 fn normalFlux(s: [n_vars]f64, nrm: [n_dims]f64, gamma: f64, fn_out: *[n_vars]f64) f64 {
     const inv_rho = 1.0 / s[0];
-    const mom_sq = s[1] * s[1] + s[2] * s[2];
-    const press = (gamma - 1.0) * (s[3] - 0.5 * mom_sq * inv_rho);
-    const enthalpy = (s[3] + press) * inv_rho;
+    var mom_sq: f64 = 0.0;
+    for (0..n_dims) |d| mom_sq += s[1 + d] * s[1 + d];
+    const press = (gamma - 1.0) * (s[i_energy] - 0.5 * mom_sq * inv_rho);
+    const enthalpy = (s[i_energy] + press) * inv_rho;
 
     var vn: f64 = 0.0;
     for (0..n_dims) |d| vn += s[1 + d] * inv_rho * nrm[d];
 
     fn_out[0] = s[0] * vn;
     for (0..n_dims) |d| fn_out[1 + d] = s[1 + d] * vn + press * nrm[d];
-    fn_out[3] = s[0] * vn * enthalpy;
+    fn_out[i_energy] = s[0] * vn * enthalpy;
 
     return @abs(vn) + @sqrt(gamma * press * inv_rho);
 }

@@ -1,7 +1,7 @@
 //! Boundary states at the global flux points.
 //!
-//! The GPU half of `Faces.applyBcsDim`, for the inviscid Euler equations in 2D.
-//! One thread per boundary flux point: it reads the interior side and writes the
+//! The GPU half of `Faces.applyBcsDim`, for the inviscid Euler equations. One
+//! thread per boundary flux point: it reads the interior side and writes the
 //! ghost state the Riemann solver will see opposite it.
 //!
 //! Each point carries its own condition as a `Code`, resolved on the host from
@@ -14,10 +14,19 @@
 //!     u       (slot, var, gfpt)   gfpt fastest; slot 0 in, slot 1 out
 //!     norm    (dim, gfpt)
 //!     bc_code (gfpt - n_gfpts_int)
+//!
+//! Built once per dimension; see `n_dims` below and the kernel loop in
+//! `build.zig`.
 
 comptime {
     if (@import("builtin").target.cpu.arch.isSpirV()) {
         @export(&faceBcs, .{ .name = "face_bcs" });
+    }
+    // Vulkan guarantees only 128 bytes of push-constant range, and this is the
+    // largest of the kernels' -- it carries a whole freestream state. Sizing the
+    // arrays for three dimensions rather than the case's costs 16 bytes of it.
+    if (@sizeOf(PushConstants) > 128) {
+        @compileError("face_bcs push constants exceed the guaranteed 128-byte range");
     }
 }
 
@@ -43,8 +52,10 @@ pub const PushConstants = extern struct {
     gamma: f64,
     rho_fs: f64,
     p_fs: f64,
-    vel_fs: [2]f64,
-    u_fs: [4]f64,
+    /// Sized for the largest dimension so one layout serves both builds; a 2D
+    /// kernel reads the first two, and the first four.
+    vel_fs: [3]f64,
+    u_fs: [5]f64,
 };
 
 pub const WgSize = extern struct {
@@ -73,8 +84,22 @@ const bc_code = @extern(*addrspace(.storage_buffer) const U32Buf, .{
 
 const pc = @extern(*addrspace(.push_constant) const PushConstants, .{ .name = "pc" });
 
-const n_dims = 2;
-const n_vars = 4;
+/// The dimension this build is for, injected by `build.zig`.
+///
+/// Comptime rather than a push constant so every loop below unrolls and the
+/// state stays in registers. The host imports this file for its push-constant
+/// layout alone and has no `kernel_dims` module, so on that side reaching for
+/// `n_dims` is a compile error rather than a quietly wrong 2.
+const n_dims: usize = if (@import("builtin").target.cpu.arch.isSpirV())
+    @import("kernel_dims").n_dims
+else
+    @compileError("n_dims is device-only; the host half of this file is dimension-independent");
+
+/// Euler carries density, momentum per dimension, and total energy.
+const n_vars = n_dims + 2;
+
+/// Total energy's index in the conserved state, one past the last momentum.
+const i_energy = n_dims + 1;
 
 /// Riemann-invariant far field, after PyFR. One incoming and one outgoing
 /// invariant are combined into a state that lets waves leave without
@@ -91,8 +116,9 @@ fn characteristic(ul: [n_vars]f64, nrm: [n_dims]f64) [n_vars]f64 {
         vn_r += pc.vel_fs[d] * nrm[d];
     }
 
-    const mom_sq = ul[1] * ul[1] + ul[2] * ul[2];
-    const press_l = gm1 * (ul[3] - 0.5 * mom_sq / rho_l);
+    var mom_sq: f64 = 0.0;
+    for (0..n_dims) |d| mom_sq += ul[1 + d] * ul[1 + d];
+    const press_l = gm1 * (ul[i_energy] - 0.5 * mom_sq / rho_l);
     const press_r = pc.p_fs;
 
     const c_l = @sqrt(gam * press_l / rho_l);
@@ -133,7 +159,7 @@ fn characteristic(ul: [n_vars]f64, nrm: [n_dims]f64) [n_vars]f64 {
         ke += vel[d] * vel[d];
     }
     const press_b = rho_r / gam * c_star * c_star;
-    ur[3] = press_b / gm1 + 0.5 * rho_r * ke;
+    ur[i_energy] = press_b / gm1 + 0.5 * rho_r * ke;
     return ur;
 }
 
@@ -166,7 +192,7 @@ fn faceBcs() callconv(.{ .spirv_kernel = .{ .x = WgSize.x, .y = WgSize.y, .z = W
         for (0..n_dims) |d| mom_n += ul[1 + d] * nrm[d];
         ur[0] = ul[0];
         for (0..n_dims) |d| ur[1 + d] = ul[1 + d] - 2.0 * mom_n * nrm[d];
-        ur[3] = ul[3];
+        ur[i_energy] = ul[i_energy];
     }
 
     for (0..n_vars) |n| u.data[gf + pc.n_gfpts * (n + pc.n_vars)] = ur[n];

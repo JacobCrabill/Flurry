@@ -626,3 +626,142 @@ test "several steps with boundaries stay together" {
 
     try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-10);
 }
+
+// ---------------------------------------------------------------------------
+// 3D
+// ---------------------------------------------------------------------------
+
+/// The 3D counterpart of `testConfig`: a hex mesh, thin in z so the cell count
+/// stays reasonable, with the vortex extended along it.
+fn testConfig3D(order: u8, n: u32, bc: cfg.BoundaryCondition) cfg.Config {
+    var config = testConfig(order, n);
+    config.core.n_dims = 3;
+    config.create_mesh.?.nz = 3;
+    config.create_mesh.?.zmin = -1.0;
+    config.create_mesh.?.zmax = 1.0;
+    config.create_mesh.?.bc_bottom = bc;
+    config.create_mesh.?.bc_top = bc;
+    config.create_mesh.?.bc_left = bc;
+    config.create_mesh.?.bc_right = bc;
+    config.create_mesh.?.bc_front = bc;
+    config.create_mesh.?.bc_back = bc;
+    return config;
+}
+
+test "the whole 3D residual runs on the device" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The three kernels with the equations in them are built once per dimension
+    // and picked by `n_dims`; before that a 3D case fell back to the CPU. This
+    // is the check that it no longer does -- and, since the fallback was silent,
+    // the one that would have caught the 2D kernel being dispatched at 3D data.
+    const config = testConfig3D(3, 4, .periodic);
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    try testing.expectEqual(@as(usize, 5), run.solver.n_vars);
+    try testing.expect(run.solver.canBatchResidualForTest());
+    // Device-local arrays, which only a case with no CPU step in the loop gets
+    try testing.expect(run.solver.deviceBufferFor(run.solver.u_spts.data) != null);
+}
+
+test "the 3D Euler flux kernel matches the CPU one" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    const config = testConfig3D(3, 4, .periodic);
+
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+
+    try cpu_run.solver.computeFluxSpts();
+    try gpu_run.solver.computeFluxSpts();
+    try gpu_run.solver.syncToHost();
+
+    try expectClose(cpu_run.solver.f_spts.data, gpu_run.solver.f_spts.data, 1e-13);
+}
+
+test "a 3D residual on the device matches the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    const config = testConfig3D(3, 4, .periodic);
+
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+    try cpu_run.solver.computeResidual(0);
+
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+    try gpu_run.solver.computeResidual(0);
+    try gpu_run.solver.syncToHost();
+
+    try expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-11);
+}
+
+test "3D boundary conditions on the device match the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The 3D `face_bcs` build. Its push constants carry `vel_fs` and `u_fs`
+    // sized for three dimensions, and the host fills only the first `n_dims` and
+    // `n_vars` of each -- a mismatch there would show up first as a wrong ghost
+    // state at an inflow.
+    for ([_]cfg.BoundaryCondition{ .characteristic, .sup_in, .sup_out, .slip_wall, .symmetry }) |bc| {
+        const config = testConfig3D(3, 4, bc);
+
+        var cpu_run: driver.Run = undefined;
+        try cpu_run.init(gpa, testing.io, &config, .{});
+        defer cpu_run.deinit();
+
+        var gpu_run: driver.Run = undefined;
+        try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+        defer gpu_run.deinit();
+
+        try testing.expect(gpu_run.solver.faces.n_gfpts_bnd > 0); // or this proves nothing
+
+        try cpu_run.solver.computeResidual(0);
+        try gpu_run.solver.computeResidual(0);
+        try gpu_run.solver.syncToHost();
+
+        expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-10) catch |err| {
+            std.debug.print("3D boundary condition: {t}\n", .{bc});
+            return err;
+        };
+    }
+}
+
+test "several 3D steps on the device stay together" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // Drift, on a mesh where the boundary kernel runs every stage: ten RK44
+    // steps feeding the device's own answer back in each time.
+    const config = testConfig3D(2, 4, .characteristic);
+
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+
+    for (0..10) |_| {
+        try cpu_run.solver.update();
+        try gpu_run.solver.update();
+    }
+    try gpu_run.solver.syncToHost();
+
+    try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-10);
+}

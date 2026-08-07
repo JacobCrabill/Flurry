@@ -480,8 +480,9 @@ test "a batch runs out of dgemm instances rather than reusing one" {
     const gpa = testing.allocator;
     const d = try device();
 
-    // The pool is sized for a residual's three products. Asking for more is the
-    // same silent-overwrite hazard, so it is the same error.
+    // The pool is sized for the most products a residual runs, which is the
+    // viscous 3D one. Asking for more is the same silent-overwrite hazard, so
+    // it is the same error.
     const config = testConfig(2, 4);
 
     var run: driver.Run = undefined;
@@ -492,12 +493,9 @@ test "a batch runs out of dgemm instances rather than reusing one" {
     try d.beginBatch();
     defer d.abortBatch();
 
-    // A residual dispatches dgemm exactly three times, and the pool is sized for
-    // that; the fourth has nothing left to hand out.
-    try s.extrapolateU();
-    try s.computeDivFSpts(0);
-    try s.computeDivFFpts(0);
-    try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFSpts(0));
+    const pool = gpu.dgemmPoolSizeForTest();
+    for (0..pool) |_| try s.extrapolateU();
+    try testing.expectError(error.KernelAlreadyRecorded, s.extrapolateU());
 }
 
 test "a failed batch does not poison the device" {
@@ -515,10 +513,8 @@ test "a failed batch does not poison the device" {
 
     const s = &run.solver;
     try d.beginBatch();
-    try s.extrapolateU();
-    try s.computeDivFSpts(0);
-    try s.computeDivFFpts(0);
-    try testing.expectError(error.KernelAlreadyRecorded, s.computeDivFSpts(0));
+    for (0..gpu.dgemmPoolSizeForTest()) |_| try s.extrapolateU();
+    try testing.expectError(error.KernelAlreadyRecorded, s.extrapolateU());
     d.abortBatch();
 
     try testing.expect(!d.isBatching());
@@ -590,9 +586,11 @@ test "a viscous wall keeps the boundary conditions on the CPU" {
     const d = try device();
 
     // No kernel covers it, so the whole step falls back rather than running a
-    // condition the kernel would silently treat as a slip wall.
+    // condition the kernel would silently treat as a slip wall. `fix_vis` so
+    // that the wall is the reason, not the viscosity law.
     var config = testConfigBc(2, 4, .adiabatic_noslip);
     config.equation.viscous = true;
+    config.freestream.fix_vis = true;
 
     var run: driver.Run = undefined;
     try run.init(gpa, testing.io, &config, .{ .device = d });
@@ -748,6 +746,171 @@ test "several 3D steps on the device stay together" {
     // Drift, on a mesh where the boundary kernel runs every stage: ten RK44
     // steps feeding the device's own answer back in each time.
     const config = testConfig3D(2, 4, .characteristic);
+
+    var cpu_run: driver.Run = undefined;
+    try cpu_run.init(gpa, testing.io, &config, .{});
+    defer cpu_run.deinit();
+
+    var gpu_run: driver.Run = undefined;
+    try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+    defer gpu_run.deinit();
+
+    for (0..10) |_| {
+        try cpu_run.solver.update();
+        try gpu_run.solver.update();
+    }
+    try gpu_run.solver.syncToHost();
+
+    try expectClose(cpu_run.solver.u_spts.data, gpu_run.solver.u_spts.data, 1e-10);
+}
+
+// ---------------------------------------------------------------------------
+// Viscous
+// ---------------------------------------------------------------------------
+
+/// A viscous config, in either dimension. `fix_vis` because the kernels take
+/// viscosity as a push constant.
+fn testConfigVisc(order: u8, n: u32, three_d: bool) cfg.Config {
+    var config = if (three_d) testConfig3D(order, n, .periodic) else testConfig(order, n);
+    config.equation.viscous = true;
+    config.freestream.mach_fs = 0.3;
+    config.freestream.Re_fs = 100.0;
+    config.freestream.fix_vis = true;
+    return config;
+}
+
+test "a viscous case runs its whole residual on the device" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // Before the viscous kernels existed this fell back entirely. The gradient
+    // half is six more dispatches -- the two gradient products, the common
+    // solution and its gather, the extrapolation per dimension, the gradient
+    // scatter -- on top of the inviscid chain.
+    for ([_]bool{ false, true }) |three_d| {
+        const config = testConfigVisc(3, 4, three_d);
+
+        var run: driver.Run = undefined;
+        try run.init(gpa, testing.io, &config, .{ .device = d });
+        defer run.deinit();
+
+        try testing.expect(run.solver.canBatchResidualForTest());
+        // Device-local arrays, which only a case with no CPU step in the loop
+        // gets -- including the gradient arrays, which are new to the heap
+        try testing.expect(run.solver.deviceBufferFor(run.solver.du_spts.data) != null);
+        try testing.expect(run.solver.deviceBufferFor(run.solver.u_comm.data) != null);
+    }
+}
+
+test "Sutherland's law keeps a viscous case on the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The kernels take viscosity as a push constant. Sutherland's law makes it
+    // a function of the local temperature, so a case asking for it has to fall
+    // back rather than quietly run at the freestream value -- which is the
+    // default, so this is the path most viscous cases take.
+    var config = testConfigVisc(3, 4, false);
+    config.freestream.fix_vis = false;
+
+    var run: driver.Run = undefined;
+    try run.init(gpa, testing.io, &config, .{ .device = d });
+    defer run.deinit();
+
+    try testing.expect(!run.solver.canBatchResidualForTest());
+}
+
+test "the viscous gradient on the device matches the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // `computeFluxSpts` leaves `du_spts` holding the *physical* gradient, which
+    // the face path then extrapolates -- so a disagreement here would show up
+    // everywhere downstream, and nowhere obviously.
+    for ([_]bool{ false, true }) |three_d| {
+        const config = testConfigVisc(3, 4, three_d);
+
+        var cpu_run: driver.Run = undefined;
+        try cpu_run.init(gpa, testing.io, &config, .{});
+        defer cpu_run.deinit();
+
+        var gpu_run: driver.Run = undefined;
+        try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+        defer gpu_run.deinit();
+
+        try cpu_run.solver.computeResidual(0);
+        try gpu_run.solver.computeResidual(0);
+        try gpu_run.solver.syncToHost();
+
+        try expectClose(cpu_run.solver.du_spts.data, gpu_run.solver.du_spts.data, 1e-12);
+    }
+}
+
+test "a viscous residual on the device matches the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    for ([_]bool{ false, true }) |three_d| {
+        const config = testConfigVisc(3, 4, three_d);
+
+        var cpu_run: driver.Run = undefined;
+        try cpu_run.init(gpa, testing.io, &config, .{});
+        defer cpu_run.deinit();
+        try cpu_run.solver.computeResidual(0);
+
+        var gpu_run: driver.Run = undefined;
+        try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+        defer gpu_run.deinit();
+        try gpu_run.solver.computeResidual(0);
+        try gpu_run.solver.syncToHost();
+
+        try expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-11);
+    }
+}
+
+test "viscous boundary conditions on the device match the CPU" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // The conditions that have a kernel, on a viscous run: `face_bcs` has to
+    // write the prescribed viscous state beside the ghost state, and
+    // `face_bcs_grad` has to extrapolate the gradient, or the LDG flux at the
+    // boundary reads whatever was left there.
+    for ([_]cfg.BoundaryCondition{ .characteristic, .sup_in, .sup_out }) |bc| {
+        var config = testConfigVisc(3, 4, false);
+        config.create_mesh.?.bc_bottom = bc;
+        config.create_mesh.?.bc_top = bc;
+        config.create_mesh.?.bc_left = bc;
+        config.create_mesh.?.bc_right = bc;
+
+        var cpu_run: driver.Run = undefined;
+        try cpu_run.init(gpa, testing.io, &config, .{});
+        defer cpu_run.deinit();
+
+        var gpu_run: driver.Run = undefined;
+        try gpu_run.init(gpa, testing.io, &config, .{ .device = d });
+        defer gpu_run.deinit();
+
+        try testing.expect(gpu_run.solver.faces.n_gfpts_bnd > 0); // or this proves nothing
+
+        try cpu_run.solver.computeResidual(0);
+        try gpu_run.solver.computeResidual(0);
+        try gpu_run.solver.syncToHost();
+
+        expectClose(cpu_run.solver.divf_spts.data, gpu_run.solver.divf_spts.data, 1e-10) catch |err| {
+            std.debug.print("viscous boundary condition: {t}\n", .{bc});
+            return err;
+        };
+    }
+}
+
+test "several viscous steps on the device stay together" {
+    const gpa = testing.allocator;
+    const d = try device();
+
+    // Drift: ten RK44 steps is forty viscous residuals, each feeding the
+    // device's own answer back in.
+    const config = testConfigVisc(2, 4, false);
 
     var cpu_run: driver.Run = undefined;
     try cpu_run.init(gpa, testing.io, &config, .{});

@@ -58,8 +58,16 @@ pub fn build(b: *std.Build) void {
     // Kernels of our own, compiled to SPIR-V by the same route.
     //
     // These carry no equation and no dimension -- they move data between
-    // layouts, or sum RK stages -- so one build serves every case.
-    inline for (.{ "face_scatter", "face_gather", "rk_update" }) |name| {
+    // layouts, blend two sides of an interface, or sum RK stages -- so one
+    // build serves every case.
+    inline for (.{
+        "face_scatter",
+        "face_scatter_grad",
+        "face_gather",
+        "face_common_u",
+        "face_bcs_grad",
+        "rk_update",
+    }) |name| {
         const spv = spock_build.addSpirvKernel(b, .{
             .name = name,
             .root_source_file = b.path("src/lib/kernels/" ++ name ++ ".zig"),
@@ -78,11 +86,14 @@ pub fn build(b: *std.Build) void {
     // and still lets each build unroll everything. The host imports the same
     // files for their push-constant layouts, and gets no `kernel_dims`; see the
     // guard at the top of each.
+    // `face_bcs` needs only the dimension: the conditions it covers are the
+    // inviscid ones, whose prescribed viscous state is the ghost state.
     inline for (.{ 2, 3 }) |nd| {
         const kernel_dims = b.addOptions();
         kernel_dims.addOption(u32, "n_dims", nd);
+        kernel_dims.addOption(bool, "viscous", false);
 
-        inline for (.{ "flux_euler", "face_common_f", "face_bcs" }) |name| {
+        inline for (.{"face_bcs"}) |name| {
             const tag = std.fmt.comptimePrint("{s}_{d}d", .{ name, nd });
             const spv = spock_build.addSpirvKernel(b, .{
                 .name = tag,
@@ -92,6 +103,31 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "kernel_dims", .mod = kernel_dims.createModule() }},
             });
             mod.addAnonymousImport(tag ++ ".spv", .{ .root_source_file = spv });
+        }
+    }
+
+    // The flux kernels get a second axis. Viscous adds the whole gradient half
+    // -- two more bound arrays and the stress tensor -- so folding it into the
+    // inviscid build behind a runtime flag would cost that build registers it
+    // has no use for. Four small pipelines are cheaper than one slow one.
+    inline for (.{ 2, 3 }) |nd| {
+        inline for (.{ false, true }) |visc| {
+            const kernel_dims = b.addOptions();
+            kernel_dims.addOption(u32, "n_dims", nd);
+            kernel_dims.addOption(bool, "viscous", visc);
+
+            inline for (.{ "flux_euler", "face_common_f" }) |name| {
+                const suffix = if (visc) "_visc" else "";
+                const tag = std.fmt.comptimePrint("{s}_{d}d{s}", .{ name, nd, suffix });
+                const spv = spock_build.addSpirvKernel(b, .{
+                    .name = tag,
+                    .root_source_file = b.path("src/lib/kernels/" ++ name ++ ".zig"),
+                    .optimize = optimize,
+                    .spock_dep = spock,
+                    .imports = &.{.{ .name = "kernel_dims", .mod = kernel_dims.createModule() }},
+                });
+                mod.addAnonymousImport(tag ++ ".spv", .{ .root_source_file = spv });
+            }
         }
     }
 

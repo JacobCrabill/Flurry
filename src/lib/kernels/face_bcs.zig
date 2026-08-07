@@ -12,8 +12,14 @@
 //! Layouts:
 //!
 //!     u       (slot, var, gfpt)   gfpt fastest; slot 0 in, slot 1 out
+//!     u_ldg   (slot, var, gfpt)   the state prescribed to the viscous flux
 //!     norm    (dim, gfpt)
 //!     bc_code (gfpt - n_gfpts_int)
+//!
+//! Every condition here prescribes the same state to both, so `u_ldg` gets the
+//! same ghost state `u` does. They only diverge at a no-slip wall, which has no
+//! code and keeps the whole step on the CPU. An inviscid run has no `u_ldg`
+//! array at all and binds `u` in its place, making the second write a no-op.
 //!
 //! Built once per dimension; see `n_dims` below and the kernel loop in
 //! `build.zig`.
@@ -80,6 +86,10 @@ const norm = @extern(*addrspace(.storage_buffer) const F64Buf, .{
 const bc_code = @extern(*addrspace(.storage_buffer) const U32Buf, .{
     .name = "bc_code",
     .decoration = .{ .descriptor = .{ .set = 0, .binding = 2 } },
+});
+const u_ldg = @extern(*addrspace(.storage_buffer) F64Buf, .{
+    .name = "u_ldg",
+    .decoration = .{ .descriptor = .{ .set = 0, .binding = 3 } },
 });
 
 const pc = @extern(*addrspace(.push_constant) const PushConstants, .{ .name = "pc" });
@@ -195,7 +205,11 @@ fn faceBcs() callconv(.{ .spirv_kernel = .{ .x = WgSize.x, .y = WgSize.y, .z = W
         ur[i_energy] = ul[i_energy];
     }
 
-    for (0..n_vars) |n| u.data[gf + pc.n_gfpts * (n + pc.n_vars)] = ur[n];
+    for (0..n_vars) |n| {
+        const dst = gf + pc.n_gfpts * (n + pc.n_vars);
+        u.data[dst] = ur[n];
+        u_ldg.data[dst] = ur[n];
+    }
 }
 
 const std = @import("std");

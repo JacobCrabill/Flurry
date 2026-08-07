@@ -45,7 +45,7 @@ orders 1–3.
 
 Switching diffusion on — the same wave, `advdiff_D = 0.1` — brings the viscous path into what is
 measured: the corrected gradient, the common solution and the LDG interface flux. Orders 1–3 come
-out at **2.04/1.98, 3.03/2.98, 3.95/3.96** in 2D and **2.13/2.07, 3.05/3.03, 3.93** in 3D, again
+out at **2.04/1.98, 3.03/2.98, 3.95/3.96** in 2D and **2.13/2.07, 3.05/3.03, 3.93/3.95** in 3D, again
 against p+1. Note that diffusion's explicit step limit goes as h² rather than h, so a viscous sweep
 runs a few thousand steps per mesh.
 
@@ -64,26 +64,32 @@ reference the GPU path is checked against.
 ./zig-out/bin/flurry --gpu samples/vortex.cfg.ziggy
 ```
 
-A whole time step runs on the device for inviscid Euler in either dimension: the eight residual
+A whole time step runs on the device for Euler in either dimension, viscous or not: the residual
 dispatches plus the Runge-Kutta update, recorded into one command buffer and submitted once per
 stage. Between reports the CPU touches none of the solution arrays. Operands are device-resident, so
-a dispatch binds them where they lie and nothing is copied.
+a dispatch binds them where they lie and nothing is copied. A viscous residual is fourteen
+dispatches against an inviscid one's eight — the gradient at the solution points and its correction,
+the common solution and its gather, one extrapolation per dimension, and the gradient scatter.
 
 Anything the kernels do not cover falls back rather than failing: advection-diffusion, the viscous
-terms, and the viscous wall conditions.
+wall conditions, and Sutherland's law — the viscous kernels take viscosity as a push constant, so a
+case that wants it to follow the local temperature stays on the CPU rather than quietly running at
+the freestream value.
 
-Three of the kernels — the physical flux, the Rusanov flux and the boundary states — have the
-Euler equations in them, so they need `n_dims` at compile time: a runtime bound would leave the
-conserved state and the metric terms dynamically indexed, and SPIR-V puts a dynamically indexed
-local array in private memory rather than registers. Rather than write each twice, `build.zig`
-compiles those three from one source once per dimension and the dispatch picks by `n_dims`. The rest
-carry no equation and no dimension and are built once.
+The kernels with the Euler equations in them — the physical flux, the Rusanov flux and the boundary
+states — need `n_dims` at compile time: a runtime bound would leave the conserved state and the
+metric terms dynamically indexed, and SPIR-V puts a dynamically indexed local array in private
+memory rather than registers. The two flux kernels carry a second axis for the same reason, since
+viscous binds two more arrays and adds the stress tensor. Rather than write each variant by hand,
+`build.zig` compiles them from one source apiece — four builds of the two flux kernels, two of the
+boundary states — and the dispatch picks. The rest carry no equation and no dimension and are built
+once.
 
 The arrays live in the device's own memory, with a host-visible block beside each one that they are
 pushed to and from explicitly — at setup, at the initial condition, and before the residual norms,
 the error measure or solution output. Between those points the CPU touches nothing. A case with a
-CPU fallback in the step (advection-diffusion, the viscous terms) keeps host-visible arrays instead,
-since a stale block would be read.
+CPU fallback in the step (advection-diffusion, a viscous wall, Sutherland's law) keeps host-visible
+arrays instead, since a stale block would be read.
 
 Performance, 50 steps of the vortex sample at order 3:
 
@@ -96,10 +102,22 @@ Performance, 50 steps of the vortex sample at order 3:
 | 16×16×16 | 4,096  | 23.99 s | **4.45 s**  |
 | 24×24×24 | 13,824 | 83.96 s | **15.18 s** |
 
+
 3D settles at around 5.5×, against 8× for the largest 2D mesh. At equal cell count (64×64 against
 16×16×16) a 3D step costs about 7.5× a 2D one on either processor, which is roughly what the
 shapes predict: an order-3 hex carries 64 solution points to a quad's 16 and five conserved
 variables to four, and the flux kernel reads nine metric terms per point instead of four.
+
+Switching the viscous terms on, same 50 steps at order 3:
+
+| mesh      | cells | CPU     | GPU        |
+| --------- | ----- | ------- | ---------- |
+| 16×16    | 256   | 0.31 s  | **0.08 s** |
+| 16×16×4 | 1,024 | 16.02 s | **3.33 s** |
+
+The speedup holds at about 5×, so the gradient half parallelizes as well as the
+rest. Per cell it costs roughly twice an inviscid step in 2D and three times in
+3D, which is what the extra six dispatches and the gradient arrays buy.
 
 Two things got it there, both measured on the same dgemm — 16×65536 with K=16, the shape the
 solver dispatches:
@@ -149,11 +167,12 @@ characteristic/slip-wall/supersonic/symmetry boundaries, no-slip walls, explicit
 Jameson-RK time stepping, ParaView output, and analytic test cases with error measurement.
 
 The viscous terms are verified in both dimensions: a quadratic field diffuses to its exact analytic
-divergence at roundoff, and the diffusing sine wave converges at p+1. They have no GPU kernel yet,
-so a viscous case runs on the CPU.
+divergence at roundoff, and the diffusing sine wave converges at p+1. They run on the GPU too,
+except with a viscous wall or Sutherland's law.
 
 Not yet: a CFL-derived time step (`time.dt` has to be given), restarts, triangles, tets and prisms,
-and GPU kernels for the viscous path. `zig build convergence` sweeps 2D only.
+GPU kernels for advection-diffusion and for the viscous walls, and Sutherland's law on the device.
+`zig build convergence` sweeps 2D only.
 
 ```sh
 zig build test

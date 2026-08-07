@@ -138,9 +138,9 @@ pub const Faces = struct {
         @memset(f.wave_sp, 0.0);
 
         if (config.equation.viscous) {
-            f.u_comm = try Array3(f64).init(gpa, 2, n_vars, n_gfpts);
-            f.u_ldg = try Array3(f64).init(gpa, 2, n_vars, n_gfpts);
-            f.du = try Array4(f64).init(gpa, 2, n_dims, n_vars, n_gfpts);
+            f.u_comm = try Array3(f64).init(arr, 2, n_vars, n_gfpts);
+            f.u_ldg = try Array3(f64).init(arr, 2, n_vars, n_gfpts);
+            f.du = try Array4(f64).init(arr, 2, n_dims, n_vars, n_gfpts);
         }
 
         return f;
@@ -155,9 +155,9 @@ pub const Faces = struct {
         f.d_a.deinit(arr);
         arr.free(f.wave_sp);
 
-        f.u_comm.deinit(gpa);
-        f.u_ldg.deinit(gpa);
-        f.du.deinit(gpa);
+        f.u_comm.deinit(arr);
+        f.u_ldg.deinit(arr);
+        f.du.deinit(arr);
         f.coord.deinit(gpa);
     }
 

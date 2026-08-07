@@ -46,22 +46,37 @@ const dgemm_spv = @embedFile("spock/dgemm.spv");
 const flux_euler = @import("kernels/flux_euler.zig");
 
 pub const face_scatter = @import("kernels/face_scatter.zig");
+pub const face_scatter_grad = @import("kernels/face_scatter_grad.zig");
 pub const face_gather = @import("kernels/face_gather.zig");
+pub const face_common_u = @import("kernels/face_common_u.zig");
 pub const face_common_f = @import("kernels/face_common_f.zig");
 pub const face_bcs = @import("kernels/face_bcs.zig");
+pub const face_bcs_grad = @import("kernels/face_bcs_grad.zig");
 pub const rk_update = @import("kernels/rk_update.zig");
 
 const face_scatter_spv = @embedFile("face_scatter.spv");
+const face_scatter_grad_spv = @embedFile("face_scatter_grad.spv");
 const face_gather_spv = @embedFile("face_gather.spv");
+const face_common_u_spv = @embedFile("face_common_u.spv");
+const face_bcs_grad_spv = @embedFile("face_bcs_grad.spv");
 const rk_update_spv = @embedFile("rk_update.spv");
 
 // The kernels with the equations in them are built once per dimension; see the
 // kernel loop in `build.zig`. Each file's host-facing half -- its push-constant
 // layout and workgroup size -- is the same for both, which is why there is still
 // only one import of each above.
-const flux_euler_spv = [2][]const u8{ @embedFile("flux_euler_2d.spv"), @embedFile("flux_euler_3d.spv") };
-const face_common_f_spv = [2][]const u8{ @embedFile("face_common_f_2d.spv"), @embedFile("face_common_f_3d.spv") };
 const face_bcs_spv = [2][]const u8{ @embedFile("face_bcs_2d.spv"), @embedFile("face_bcs_3d.spv") };
+
+// The two flux kernels carry a second axis as well: viscous binds the gradient
+// arrays and adds the stress tensor, which the inviscid build has no use for.
+const flux_euler_spv = [2][2][]const u8{
+    .{ @embedFile("flux_euler_2d.spv"), @embedFile("flux_euler_2d_visc.spv") },
+    .{ @embedFile("flux_euler_3d.spv"), @embedFile("flux_euler_3d_visc.spv") },
+};
+const face_common_f_spv = [2][2][]const u8{
+    .{ @embedFile("face_common_f_2d.spv"), @embedFile("face_common_f_2d_visc.spv") },
+    .{ @embedFile("face_common_f_3d.spv"), @embedFile("face_common_f_3d_visc.spv") },
+};
 
 /// What the index arrays use for "no global flux point here". The host's
 /// `geo.none` is `maxInt(usize)`; it narrows to this on upload.
@@ -92,22 +107,36 @@ const Kind = enum {
     dgemm,
     flux_euler_2d,
     flux_euler_3d,
+    flux_euler_2d_visc,
+    flux_euler_3d_visc,
     face_scatter,
+    face_scatter_grad,
     face_gather,
+    face_common_u,
     face_common_f_2d,
     face_common_f_3d,
+    face_common_f_2d_visc,
+    face_common_f_3d_visc,
     face_bcs_2d,
     face_bcs_3d,
+    face_bcs_grad,
     rk_update,
 
-    /// The variant of `kind` for a mesh of `n_dims` dimensions. `kind` must be
-    /// the 2D one, which is how the tables below are keyed.
-    fn forDims(kind: Kind, n_dims: usize) Kind {
-        if (n_dims != 3) return kind;
+    /// The variant of `kind` for a case of `n_dims` dimensions, viscous or not.
+    /// `kind` must be the 2D inviscid one, which is how the tables below are
+    /// keyed.
+    fn forCase(kind: Kind, n_dims: usize, visc: bool) Kind {
+        const three = n_dims == 3;
         return switch (kind) {
-            .flux_euler_2d => .flux_euler_3d,
-            .face_common_f_2d => .face_common_f_3d,
-            .face_bcs_2d => .face_bcs_3d,
+            .flux_euler_2d => switch (visc) {
+                false => if (three) .flux_euler_3d else .flux_euler_2d,
+                true => if (three) .flux_euler_3d_visc else .flux_euler_2d_visc,
+            },
+            .face_common_f_2d => switch (visc) {
+                false => if (three) .face_common_f_3d else .face_common_f_2d,
+                true => if (three) .face_common_f_3d_visc else .face_common_f_2d_visc,
+            },
+            .face_bcs_2d => if (three) .face_bcs_3d else .face_bcs_2d,
             else => kind,
         };
     }
@@ -121,17 +150,35 @@ const Kind = enum {
 /// counts a whole step actually uses: three products (`extrapolateU` and the two
 /// divergences) and two RK updates (saving the solution, then advancing it).
 const pool_sizes = std.enums.EnumArray(Kind, u8).init(.{
-    .dgemm = 3,
+    // A viscous residual runs six products, not three: the gradient at the
+    // solution points and its correction, then the two divergences, plus
+    // `extrapolateU` and one `extrapolateGrad` per dimension.
+    .dgemm = 8,
     .flux_euler_2d = 1,
     .flux_euler_3d = 1,
-    .face_scatter = 1,
-    .face_gather = 1,
+    .flux_euler_2d_visc = 1,
+    .flux_euler_3d_visc = 1,
+    // Twice per viscous residual: the solution, then `u_ldg` beside it
+    .face_scatter = 2,
+    .face_scatter_grad = 1,
+    // Twice per viscous residual: the common solution, then the common flux
+    .face_gather = 2,
+    .face_common_u = 1,
     .face_common_f_2d = 1,
     .face_common_f_3d = 1,
+    .face_common_f_2d_visc = 1,
+    .face_common_f_3d_visc = 1,
     .face_bcs_2d = 1,
     .face_bcs_3d = 1,
+    .face_bcs_grad = 1,
     .rk_update = 2,
 });
+
+/// How many times one batch may record a dgemm. For tests: the count is a
+/// property of the longest residual, not something a caller should hard-code.
+pub fn dgemmPoolSizeForTest() usize {
+    return pool_sizes.get(.dgemm);
+}
 
 /// Instances of one kernel, handed out one per recording in a batch.
 const Pool = struct {
@@ -218,14 +265,21 @@ pub const Device = struct {
         const specs = std.enums.EnumArray(Kind, Spec).init(.{
             // spock's dgemm names its entry point after itself, not "main"
             .dgemm = .{ dgemm_spv, "dgemm", 3, @sizeOf(dgemm.PushConstants) },
-            .flux_euler_2d = .{ flux_euler_spv[0], "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
-            .flux_euler_3d = .{ flux_euler_spv[1], "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
+            .flux_euler_2d = .{ flux_euler_spv[0][0], "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
+            .flux_euler_3d = .{ flux_euler_spv[1][0], "flux_euler", 3, @sizeOf(flux_euler.PushConstants) },
+            .flux_euler_2d_visc = .{ flux_euler_spv[0][1], "flux_euler", 5, @sizeOf(flux_euler.PushConstants) },
+            .flux_euler_3d_visc = .{ flux_euler_spv[1][1], "flux_euler", 5, @sizeOf(flux_euler.PushConstants) },
             .face_scatter = .{ face_scatter_spv, "face_scatter", 4, @sizeOf(face_scatter.PushConstants) },
+            .face_scatter_grad = .{ face_scatter_grad_spv, "face_scatter_grad", 4, @sizeOf(face_scatter_grad.PushConstants) },
             .face_gather = .{ face_gather_spv, "face_gather", 4, @sizeOf(face_gather.PushConstants) },
-            .face_common_f_2d = .{ face_common_f_spv[0], "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
-            .face_common_f_3d = .{ face_common_f_spv[1], "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
-            .face_bcs_2d = .{ face_bcs_spv[0], "face_bcs", 3, @sizeOf(face_bcs.PushConstants) },
-            .face_bcs_3d = .{ face_bcs_spv[1], "face_bcs", 3, @sizeOf(face_bcs.PushConstants) },
+            .face_common_u = .{ face_common_u_spv, "face_common_u", 2, @sizeOf(face_common_u.PushConstants) },
+            .face_common_f_2d = .{ face_common_f_spv[0][0], "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
+            .face_common_f_3d = .{ face_common_f_spv[1][0], "face_common_f", 5, @sizeOf(face_common_f.PushConstants) },
+            .face_common_f_2d_visc = .{ face_common_f_spv[0][1], "face_common_f", 7, @sizeOf(face_common_f.PushConstants) },
+            .face_common_f_3d_visc = .{ face_common_f_spv[1][1], "face_common_f", 7, @sizeOf(face_common_f.PushConstants) },
+            .face_bcs_2d = .{ face_bcs_spv[0], "face_bcs", 4, @sizeOf(face_bcs.PushConstants) },
+            .face_bcs_3d = .{ face_bcs_spv[1], "face_bcs", 4, @sizeOf(face_bcs.PushConstants) },
+            .face_bcs_grad = .{ face_bcs_grad_spv, "face_bcs_grad", 1, @sizeOf(face_bcs_grad.PushConstants) },
             .rk_update = .{ rk_update_spv, "rk_update", 4, @sizeOf(rk_update.PushConstants) },
         });
 
@@ -379,37 +433,84 @@ pub const Device = struct {
         }, "dispatching dgemm");
     }
 
-    /// Inviscid Euler flux at the solution points, in reference space.
+    /// Euler flux at the solution points, in reference space, with the viscous
+    /// terms when `visc` is given.
     ///
     /// One thread per `(spt, ele)`; see `kernels/flux_euler.zig` for the layouts
-    /// it assumes. Inviscid only, matching the kernel.
+    /// it assumes.
     pub fn fluxEuler(
         d: *Device,
         n_dims: usize,
         n_spts: usize,
         n_eles: usize,
-        n_vars: usize,
-        gamma: f64,
+        pc: flux_euler.PushConstants,
         u_spts: Binding,
         inv_jaco: Binding,
         f_spts: Binding,
+        /// Both present for a viscous case, both absent otherwise -- they are
+        /// the two bindings the viscous build adds.
+        visc: ?struct { du_spts: Binding, jaco_det: Binding },
     ) Error!void {
         if (n_spts == 0 or n_eles == 0) return;
 
-        const pc: flux_euler.PushConstants = .{
-            .n_spts = @intCast(n_spts),
-            .n_eles = @intCast(n_eles),
-            .n_vars = @intCast(n_vars),
-            .gamma = gamma,
-        };
         const threads: u32 = @intCast(n_spts * n_eles);
         const groups = std.math.divCeil(u32, threads, flux_euler.WgSize.x) catch unreachable;
+        const kind = Kind.forCase(.flux_euler_2d, n_dims, visc != null);
 
-        try d.run(Kind.forDims(.flux_euler_2d, n_dims), .{
+        if (visc) |v| {
+            return d.run(kind, .{
+                .buffers = &.{ u_spts, inv_jaco, f_spts, v.du_spts, v.jaco_det },
+                .push_constant = std.mem.asBytes(&pc),
+                .groups = .{ groups, 1, 1 },
+            }, "dispatching flux_euler");
+        }
+        try d.run(kind, .{
             .buffers = &.{ u_spts, inv_jaco, f_spts },
             .push_constant = std.mem.asBytes(&pc),
             .groups = .{ groups, 1, 1 },
         }, "dispatching flux_euler");
+    }
+
+    /// Each element's flux-point gradient -> the shared face arrays.
+    pub fn faceScatterGrad(
+        d: *Device,
+        p: face_scatter_grad.PushConstants,
+        du_fpts: Binding,
+        fpt2gfpt: Binding,
+        fpt2slot: Binding,
+        faces_du: Binding,
+    ) Error!void {
+        if (p.n_fpts == 0 or p.n_eles == 0) return;
+        try d.run(.face_scatter_grad, .{
+            .buffers = &.{ du_fpts, fpt2gfpt, fpt2slot, faces_du },
+            .push_constant = std.mem.asBytes(&p),
+            .groups = .{ groupsFor(p.n_fpts * p.n_eles, face_scatter_grad.WgSize.x), 1, 1 },
+        }, "dispatching face_scatter_grad");
+    }
+
+    /// Single-valued interface solution, for the viscous gradient correction.
+    pub fn faceCommonU(
+        d: *Device,
+        p: face_common_u.PushConstants,
+        u_ldg: Binding,
+        u_comm: Binding,
+    ) Error!void {
+        if (p.n_gfpts == 0) return;
+        try d.run(.face_common_u, .{
+            .buffers = &.{ u_ldg, u_comm },
+            .push_constant = std.mem.asBytes(&p),
+            .groups = .{ groupsFor(p.n_gfpts, face_common_u.WgSize.x), 1, 1 },
+        }, "dispatching face_common_u");
+    }
+
+    /// Boundary gradients: every condition with a kernel extrapolates.
+    pub fn faceBcsGrad(d: *Device, p: face_bcs_grad.PushConstants, du: Binding) Error!void {
+        if (p.n_gfpts_bnd == 0) return;
+        try d.run(.face_bcs_grad, .{
+            .buffers = &.{du},
+            .push_constant = std.mem.asBytes(&p),
+            .groups = .{ groupsFor(p.n_gfpts_bnd, face_bcs_grad.WgSize.x), 1, 1 },
+        }, "dispatching face_bcs_grad");
     }
 
     // ---- The face path ----
@@ -470,27 +571,30 @@ pub const Device = struct {
     pub fn faceCommonF(
         d: *Device,
         n_dims: usize,
-        n_gfpts: usize,
-        n_vars: usize,
-        gamma: f64,
-        rus_k: f64,
+        p: face_common_f.PushConstants,
         u: Binding,
         norm: Binding,
         d_a: Binding,
         f_comm: Binding,
         wave_sp: Binding,
+        /// The two bindings the viscous build adds; null for an inviscid case.
+        visc: ?struct { u_ldg: Binding, du: Binding },
     ) Error!void {
-        if (n_gfpts == 0) return;
-        const p: face_common_f.PushConstants = .{
-            .n_gfpts = @intCast(n_gfpts),
-            .n_vars = @intCast(n_vars),
-            .gamma = gamma,
-            .rus_k = rus_k,
-        };
-        try d.run(Kind.forDims(.face_common_f_2d, n_dims), .{
+        if (p.n_gfpts == 0) return;
+        const kind = Kind.forCase(.face_common_f_2d, n_dims, visc != null);
+        const groups = groupsFor(p.n_gfpts, face_common_f.WgSize.x);
+
+        if (visc) |v| {
+            return d.run(kind, .{
+                .buffers = &.{ u, norm, d_a, f_comm, wave_sp, v.u_ldg, v.du },
+                .push_constant = std.mem.asBytes(&p),
+                .groups = .{ groups, 1, 1 },
+            }, "dispatching face_common_f");
+        }
+        try d.run(kind, .{
             .buffers = &.{ u, norm, d_a, f_comm, wave_sp },
             .push_constant = std.mem.asBytes(&p),
-            .groups = .{ groupsFor(n_gfpts, face_common_f.WgSize.x), 1, 1 },
+            .groups = .{ groups, 1, 1 },
         }, "dispatching face_common_f");
     }
 
@@ -502,10 +606,13 @@ pub const Device = struct {
         u: Binding,
         norm: Binding,
         bc_code: Binding,
+        /// The prescribed viscous state. An inviscid case has no such array and
+        /// passes `u`, making the kernel's second write a no-op.
+        u_ldg: Binding,
     ) Error!void {
         if (p.n_gfpts_bnd == 0) return;
-        try d.run(Kind.forDims(.face_bcs_2d, n_dims), .{
-            .buffers = &.{ u, norm, bc_code },
+        try d.run(Kind.forCase(.face_bcs_2d, n_dims, false), .{
+            .buffers = &.{ u, norm, bc_code, u_ldg },
             .push_constant = std.mem.asBytes(&p),
             .groups = .{ groupsFor(p.n_gfpts_bnd, face_bcs.WgSize.x), 1, 1 },
         }, "dispatching face_bcs");

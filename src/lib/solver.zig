@@ -115,6 +115,11 @@ const GpuState = struct {
     opp_e: gpu.Array,
     opp_div: gpu.Array,
     opp_div_fpts: gpu.Array,
+    /// The gradient operators. Null on an inviscid run, which never applies
+    /// them -- there is nothing to gain from a device allocation no dispatch
+    /// binds.
+    opp_d: ?gpu.Array,
+    opp_d_fpts: ?gpu.Array,
 
     /// The element-to-face connectivity the face kernels walk, narrowed from the
     /// mesh's `usize` to `u32`. Constant for the run, like the operators.
@@ -142,6 +147,8 @@ const GpuState = struct {
             .opp_e = undefined,
             .opp_div = undefined,
             .opp_div_fpts = undefined,
+            .opp_d = null,
+            .opp_d_fpts = null,
             .fpt2gfpt = undefined,
             .fpt2slot = undefined,
             .bc_code = null,
@@ -151,6 +158,10 @@ const GpuState = struct {
         g.opp_e = try gpu.Array.upload(dev, ele.oppE.data);
         g.opp_div = try gpu.Array.upload(dev, ele.oppDiv.data);
         g.opp_div_fpts = try gpu.Array.upload(dev, ele.oppDiv_fpts.data);
+        if (ele.config.equation.viscous) {
+            g.opp_d = try gpu.Array.upload(dev, ele.oppD.data);
+            g.opp_d_fpts = try gpu.Array.upload(dev, ele.oppD_fpts.data);
+        }
         return g;
     }
 
@@ -195,6 +206,8 @@ const GpuState = struct {
         g.opp_e.deinit();
         g.opp_div.deinit();
         g.opp_div_fpts.deinit();
+        if (g.opp_d) |*a| a.deinit();
+        if (g.opp_d_fpts) |*a| a.deinit();
         g.fpt2gfpt.deinit();
         g.fpt2slot.deinit();
         if (g.bc_code) |*b| b.deinit();
@@ -422,7 +435,7 @@ pub const Solver = struct {
         // Anything with a CPU fallback in the loop -- advection-diffusion, the
         // viscous terms -- keeps host-visible arrays and pays for them.
         if (opts.device) |dev| {
-            const fully_gpu = physicsKernelsCover(config);
+            const fully_gpu = physicsKernelsCover(config, params);
             s.gpu_state = try GpuState.create(
                 gpa,
                 dev,
@@ -459,12 +472,12 @@ pub const Solver = struct {
         s.u_spts.deinit(arr);
         s.u_fpts.deinit(arr);
         s.u_ini.deinit(arr);
-        s.du_spts.deinit(gpa);
-        s.du_fpts.deinit(gpa);
+        s.du_spts.deinit(arr);
+        s.du_fpts.deinit(arr);
         s.f_spts.deinit(arr);
         s.f_comm.deinit(arr);
         s.divf_spts.deinit(arr);
-        s.u_comm.deinit(gpa);
+        s.u_comm.deinit(arr);
 
         s.nodes.deinit(gpa);
         s.jaco_spts.deinit(gpa);
@@ -545,9 +558,9 @@ pub const Solver = struct {
         }
 
         if (s.config.equation.viscous) {
-            s.du_spts = try Array4(f64).init(gpa, nd, ele.n_spts, nv, ne);
-            s.du_fpts = try Array4(f64).init(gpa, nd, ele.n_fpts, nv, ne);
-            s.u_comm = try Array3(f64).init(gpa, ele.n_fpts, nv, ne);
+            s.du_spts = try Array4(f64).init(dev, nd, ele.n_spts, nv, ne);
+            s.du_fpts = try Array4(f64).init(dev, nd, ele.n_fpts, nv, ne);
+            s.u_comm = try Array3(f64).init(dev, ele.n_fpts, nv, ne);
         }
 
         s.nodes = try Array3(f64).init(gpa, ele.n_nodes, nd, ne);
@@ -1000,8 +1013,20 @@ pub const Solver = struct {
     }
 
     /// Reference-space gradient contribution from the solution points.
-    pub fn computeGradSpts(s: *Solver) void {
+    pub fn computeGradSpts(s: *Solver) Error!void {
         const ele = s.element();
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            return g.dev.gemm(
+                ele.n_spts * s.n_dims,
+                s.n_vars * s.n_eles,
+                ele.n_spts,
+                .whole(g.opp_d.?.raw()),
+                try g.bufferFor(s.u_spts.data),
+                try g.bufferFor(s.du_spts.data),
+                .overwrite,
+            );
+        }
         gemm(
             ele.n_spts * s.n_dims,
             s.n_vars * s.n_eles,
@@ -1014,8 +1039,20 @@ pub const Solver = struct {
     }
 
     /// Gradient correction from the common solution at the flux points.
-    pub fn computeGradFpts(s: *Solver) void {
+    pub fn computeGradFpts(s: *Solver) Error!void {
         const ele = s.element();
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            return g.dev.gemm(
+                ele.n_spts * s.n_dims,
+                s.n_vars * s.n_eles,
+                ele.n_fpts,
+                .whole(g.opp_d_fpts.?.raw()),
+                try g.bufferFor(s.u_comm.data),
+                try g.bufferFor(s.du_spts.data),
+                .accumulate,
+            );
+        }
         gemm(
             ele.n_spts * s.n_dims,
             s.n_vars * s.n_eles,
@@ -1089,20 +1126,31 @@ pub const Solver = struct {
     pub fn computeFluxSpts(s: *Solver) Error!void {
         const ele = s.element();
 
-        // The kernel covers the inviscid Euler case only. Advection-diffusion
-        // and the viscous terms stay on the CPU until they have kernels of
-        // their own; there is no correctness cliff either way, only speed.
+        // The kernel covers Euler, viscous or not. Advection-diffusion stays on
+        // the CPU until it has one of its own; there is no correctness cliff
+        // either way, only speed.
         if (s.gpuPhysicsApplies()) {
             const g = s.gpu_state.?;
+            const viscous = s.config.equation.viscous;
             return g.dev.fluxEuler(
                 s.n_dims,
                 ele.n_spts,
                 s.n_eles,
-                s.n_vars,
-                s.params.gamma,
+                .{
+                    .n_spts = @intCast(ele.n_spts),
+                    .n_eles = @intCast(s.n_eles),
+                    .n_vars = @intCast(s.n_vars),
+                    .gamma = s.params.gamma,
+                    .mu = s.params.mu,
+                    .prandtl = s.params.prandtl,
+                },
                 try g.bufferFor(s.u_spts.data),
                 try g.bufferFor(s.inv_jaco_spts.data),
                 try g.bufferFor(s.f_spts.data),
+                if (viscous) .{
+                    .du_spts = try g.bufferFor(s.du_spts.data),
+                    .jaco_det = try g.bufferFor(s.jaco_det_spts.data),
+                } else null,
             );
         }
 
@@ -1224,7 +1272,10 @@ pub const Solver = struct {
                     .p_fs = s.params.p_fs,
                     .vel_fs = vel_fs,
                     .u_fs = u_fs,
-                }, try g.bufferFor(f.u.data), try g.bufferFor(f.norm.data), codes.binding());
+                }, try g.bufferFor(f.u.data), try g.bufferFor(f.norm.data), codes.binding(), if (s.config.equation.viscous)
+                    try g.bufferFor(f.u_ldg.data)
+                else
+                    try g.bufferFor(f.u.data));
             }
         }
         return s.faces.applyBcs();
@@ -1235,17 +1286,29 @@ pub const Solver = struct {
         if (s.gpuPhysicsApplies()) {
             const g = s.gpu_state.?;
             const f = &s.faces;
+            const viscous = s.config.equation.viscous;
             return g.dev.faceCommonF(
                 s.n_dims,
-                f.n_gfpts,
-                s.n_vars,
-                s.params.gamma,
-                s.config.flux.rus_k,
+                .{
+                    .n_gfpts = @intCast(f.n_gfpts),
+                    .n_vars = @intCast(s.n_vars),
+                    .gamma = s.params.gamma,
+                    .rus_k = s.config.flux.rus_k,
+                    .n_gfpts_int = @intCast(f.n_gfpts_int),
+                    .mu = s.params.mu,
+                    .prandtl = s.params.prandtl,
+                    .ldg_b = s.config.flux.ldg_b,
+                    .ldg_tau = s.config.flux.ldg_tau,
+                },
                 try g.bufferFor(f.u.data),
                 try g.bufferFor(f.norm.data),
                 try g.bufferFor(f.d_a.data),
                 try g.bufferFor(f.f_comm.data),
                 try g.bufferFor(f.wave_sp),
+                if (viscous) .{
+                    .u_ldg = try g.bufferFor(f.u_ldg.data),
+                    .du = try g.bufferFor(f.du.data),
+                } else null,
             );
         }
         s.faces.computeCommonF();
@@ -1276,18 +1339,18 @@ pub const Solver = struct {
         try s.applyFaceBcs();
 
         if (s.config.equation.viscous) {
-            s.computeGradSpts();
-            s.faces.computeCommonU();
-            s.gatherCommonUFromFaces();
-            s.computeGradFpts();
+            try s.computeGradSpts();
+            try s.computeCommonU();
+            try s.gatherCommonUFromFaces();
+            try s.computeGradFpts();
         }
 
         try s.computeFluxSpts();
 
         if (s.config.equation.viscous) {
-            s.extrapolateGrad();
-            s.scatterGradToFaces();
-            try s.faces.applyBcsGrad();
+            try s.extrapolateGrad();
+            try s.scatterGradToFaces();
+            try s.applyBcsGrad();
         }
 
         try s.computeDivFSpts(stage);
@@ -1307,20 +1370,30 @@ pub const Solver = struct {
     ///
     /// `flux_euler`, `face_common_f` and `face_bcs` fix `n_dims` and `n_vars` at
     /// compile time, deliberately, so their loops unroll; `build.zig` compiles
-    /// each once per dimension and the dispatch picks by `n_dims`. What they do
-    /// not cover is the equation set: advection-diffusion and the viscous terms
-    /// have no kernel and fall back. The pure data-movement kernels -- the
-    /// gemms, the scatter/gather, the RK update -- carry no assumption at all
-    /// and run in any case.
+    /// them per dimension, and the two flux kernels per viscous/inviscid as
+    /// well, with the dispatch picking. What they do not cover is
+    /// advection-diffusion, which has no kernel and falls back. The pure
+    /// data-movement kernels -- the gemms, the scatter/gather, the RK update --
+    /// carry no assumption at all and run in any case.
+    ///
+    /// A viscous *wall* is a separate matter: it has no `face_bcs` code, so
+    /// `bc_code` comes back null and `canBatchResidual` keeps the whole step on
+    /// the CPU. See `GpuState.uploadBcCodes`.
     fn gpuPhysicsApplies(s: *const Solver) bool {
         if (s.gpu_state == null) return false;
-        return physicsKernelsCover(s.config);
+        return physicsKernelsCover(s.config, s.params);
     }
 
     /// The same question, answerable before there is a solver to ask it of --
     /// `init` needs it to decide where the arrays live.
-    fn physicsKernelsCover(config: *const cfg.Config) bool {
-        return config.equation.equation == .euler_ns and !config.equation.viscous;
+    fn physicsKernelsCover(config: *const cfg.Config, params: flux.FlowParams) bool {
+        if (config.equation.equation != .euler_ns) return false;
+        // The viscous kernels take viscosity as a push constant. Sutherland's
+        // law makes it a function of the local temperature, which needs a `pow`
+        // per point, so a case asking for it stays on the CPU rather than
+        // quietly running at the freestream value.
+        if (config.equation.viscous and !params.fix_vis) return false;
+        return true;
     }
 
     /// Whether every step of the residual has a GPU path, so the whole thing can
@@ -1342,7 +1415,22 @@ pub const Solver = struct {
         try s.extrapolateU();
         try s.scatterUToFaces();
         try s.applyFaceBcs();
+
+        if (s.config.equation.viscous) {
+            try s.computeGradSpts();
+            try s.computeCommonU();
+            try s.gatherCommonUFromFaces();
+            try s.computeGradFpts();
+        }
+
         try s.computeFluxSpts();
+
+        if (s.config.equation.viscous) {
+            try s.extrapolateGrad();
+            try s.scatterGradToFaces();
+            try s.applyBcsGrad();
+        }
+
         try s.computeDivFSpts(stage);
         try s.computeCommonF();
         try s.gatherCommonFFromFaces();
@@ -1350,10 +1438,30 @@ pub const Solver = struct {
     }
 
     /// Physical solution gradient at the solution points -> flux points.
-    pub fn extrapolateGrad(s: *Solver) void {
+    pub fn extrapolateGrad(s: *Solver) Error!void {
         const ele = s.element();
         const per_dim = ele.n_spts * s.n_vars * s.n_eles;
         const per_dim_f = ele.n_fpts * s.n_vars * s.n_eles;
+
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            // One product per dimension, each over its own slice of the two
+            // arrays -- the gradient's dimension index is outermost, so a
+            // dimension is a contiguous block.
+            for (0..s.n_dims) |dim| {
+                try g.dev.gemm(
+                    ele.n_fpts,
+                    s.n_vars * s.n_eles,
+                    ele.n_spts,
+                    .whole(g.opp_e.raw()),
+                    try g.sliceOf(s.du_spts.data, dim * per_dim, per_dim),
+                    try g.sliceOf(s.du_fpts.data, dim * per_dim_f, per_dim_f),
+                    .overwrite,
+                );
+            }
+            return;
+        }
+
         for (0..s.n_dims) |dim| {
             gemm(
                 ele.n_fpts,
@@ -1377,9 +1485,22 @@ pub const Solver = struct {
         const ele = s.element();
         const mesh = s.mesh;
 
-        if (s.gpu_state) |g| {
-            if (!s.config.equation.viscous) {
-                return g.dev.faceScatter(
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            try g.dev.faceScatter(
+                ele.n_fpts,
+                s.n_eles,
+                s.n_vars,
+                s.faces.n_gfpts,
+                try g.bufferFor(s.u_fpts.data),
+                g.fpt2gfpt.binding(),
+                g.fpt2slot.binding(),
+                try g.bufferFor(s.faces.u.data),
+            );
+            // On an interior face the viscous flux sees the same state; only a
+            // boundary's prescribed state differs, and `applyBcs` writes that.
+            if (s.config.equation.viscous) {
+                try g.dev.faceScatter(
                     ele.n_fpts,
                     s.n_eles,
                     s.n_vars,
@@ -1387,9 +1508,10 @@ pub const Solver = struct {
                     try g.bufferFor(s.u_fpts.data),
                     g.fpt2gfpt.binding(),
                     g.fpt2slot.binding(),
-                    try g.bufferFor(s.faces.u.data),
+                    try g.bufferFor(s.faces.u_ldg.data),
                 );
             }
+            return;
         }
 
         for (0..s.n_eles) |e| {
@@ -1446,9 +1568,25 @@ pub const Solver = struct {
     }
 
     /// Common interface solution -> each element, for the gradient correction.
-    pub fn gatherCommonUFromFaces(s: *Solver) void {
+    pub fn gatherCommonUFromFaces(s: *Solver) Error!void {
         const ele = s.element();
         const mesh = s.mesh;
+
+        if (s.gpuPhysicsApplies()) {
+            // The same operation `gatherCommonFFromFaces` performs, over arrays
+            // of the same two shapes, so it is the same kernel.
+            const g = s.gpu_state.?;
+            return g.dev.faceGather(
+                ele.n_fpts,
+                s.n_eles,
+                s.n_vars,
+                s.faces.n_gfpts,
+                try g.bufferFor(s.faces.u_comm.data),
+                g.fpt2gfpt.binding(),
+                g.fpt2slot.binding(),
+                try g.bufferFor(s.u_comm.data),
+            );
+        }
 
         for (0..s.n_eles) |e| {
             for (0..ele.n_fpts) |fpt| {
@@ -1465,10 +1603,53 @@ pub const Solver = struct {
         }
     }
 
+    /// Single-valued interface solution, for the viscous gradient correction.
+    pub fn computeCommonU(s: *Solver) Error!void {
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            const f = &s.faces;
+            return g.dev.faceCommonU(.{
+                .n_gfpts = @intCast(f.n_gfpts),
+                .n_gfpts_int = @intCast(f.n_gfpts_int),
+                .n_vars = @intCast(s.n_vars),
+                .ldg_b = s.config.flux.ldg_b,
+            }, try g.bufferFor(f.u_ldg.data), try g.bufferFor(f.u_comm.data));
+        }
+        s.faces.computeCommonU();
+    }
+
+    /// Boundary gradients. Every condition with a kernel extrapolates; the
+    /// adiabatic wall does more, and has no kernel, so it never gets here.
+    pub fn applyBcsGrad(s: *Solver) Error!void {
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            const f = &s.faces;
+            return g.dev.faceBcsGrad(.{
+                .n_gfpts = @intCast(f.n_gfpts),
+                .n_gfpts_int = @intCast(f.n_gfpts_int),
+                .n_gfpts_bnd = @intCast(f.n_gfpts_bnd),
+                .n_vars = @intCast(s.n_vars),
+                .n_dims = @intCast(s.n_dims),
+            }, try g.bufferFor(f.du.data));
+        }
+        return s.faces.applyBcsGrad();
+    }
+
     /// Element flux-point gradients -> the faces' two-sided gradient.
-    pub fn scatterGradToFaces(s: *Solver) void {
+    pub fn scatterGradToFaces(s: *Solver) Error!void {
         const ele = s.element();
         const mesh = s.mesh;
+
+        if (s.gpuPhysicsApplies()) {
+            const g = s.gpu_state.?;
+            return g.dev.faceScatterGrad(.{
+                .n_fpts = @intCast(ele.n_fpts),
+                .n_eles = @intCast(s.n_eles),
+                .n_vars = @intCast(s.n_vars),
+                .n_gfpts = @intCast(s.faces.n_gfpts),
+                .n_dims = @intCast(s.n_dims),
+            }, try g.bufferFor(s.du_fpts.data), g.fpt2gfpt.binding(), g.fpt2slot.binding(), try g.bufferFor(s.faces.du.data));
+        }
 
         for (0..s.n_eles) |e| {
             for (0..ele.n_fpts) |fpt| {

@@ -14,8 +14,15 @@
 //!     d_a        (slot, gfpt)
 //!     wave_sp    (gfpt)
 //!
-//! Built once per dimension; see `n_dims` below and the kernel loop in
-//! `build.zig`.
+//! The viscous build additionally binds
+//!
+//!     u_ldg  (slot, var, gfpt)        the state the viscous flux is evaluated at
+//!     du     (slot, dim, var, gfpt)   the physical gradient on each side
+//!
+//! and accumulates the LDG common viscous flux onto `f_comm`.
+//!
+//! Built once per dimension and once per viscous/inviscid; see `n_dims` and
+//! `viscous` below and the kernel loop in `build.zig`.
 
 comptime {
     if (@import("builtin").target.cpu.arch.isSpirV()) {
@@ -29,6 +36,14 @@ pub const PushConstants = extern struct {
     gamma: f64,
     /// Rusanov blending: 0 is full upwind, 1 is a plain central flux
     rus_k: f64,
+    // Viscous builds only; ignored by the inviscid one.
+    n_gfpts_int: u32 = 0,
+    mu: f64 = 0.0,
+    prandtl: f64 = 0.72,
+    /// LDG bias, applied here as the mirror of `face_common_u`'s
+    ldg_b: f64 = 0.5,
+    /// LDG penalty on the jump in the solution
+    ldg_tau: f64 = 0.0,
 };
 
 pub const WgSize = extern struct {
@@ -60,6 +75,14 @@ const wave_sp = @extern(*addrspace(.storage_buffer) F64Buf, .{
     .name = "wave_sp",
     .decoration = .{ .descriptor = .{ .set = 0, .binding = 4 } },
 });
+const u_ldg = @extern(*addrspace(.storage_buffer) const F64Buf, .{
+    .name = "u_ldg",
+    .decoration = .{ .descriptor = .{ .set = 0, .binding = 5 } },
+});
+const du = @extern(*addrspace(.storage_buffer) const F64Buf, .{
+    .name = "du",
+    .decoration = .{ .descriptor = .{ .set = 0, .binding = 6 } },
+});
 
 const pc = @extern(*addrspace(.push_constant) const PushConstants, .{ .name = "pc" });
 
@@ -73,6 +96,12 @@ const n_dims: usize = if (@import("builtin").target.cpu.arch.isSpirV())
     @import("kernel_dims").n_dims
 else
     @compileError("n_dims is device-only; the host half of this file is dimension-independent");
+
+/// Whether this build adds the LDG common viscous flux.
+const viscous: bool = if (@import("builtin").target.cpu.arch.isSpirV())
+    @import("kernel_dims").viscous
+else
+    @compileError("viscous is device-only");
 
 /// Euler carries density, momentum per dimension, and total energy.
 const n_vars = n_dims + 2;
@@ -125,10 +154,120 @@ fn faceCommonF() callconv(.{ .spirv_kernel = .{ .x = WgSize.x, .y = WgSize.y, .z
     const da_l = d_a.data[gf];
     const da_r = d_a.data[gf + pc.n_gfpts];
 
+    var fc: [n_vars]f64 = undefined;
     for (0..n_vars) |n| {
-        const fc = 0.5 * (fnl[n] + fnr[n]) - dissipation * (ur[n] - ul[n]);
-        f_comm.data[gf + pc.n_gfpts * n] = fc * da_l;
-        f_comm.data[gf + pc.n_gfpts * (n + pc.n_vars)] = -fc * da_r;
+        fc[n] = 0.5 * (fnl[n] + fnr[n]) - dissipation * (ur[n] - ul[n]);
+    }
+
+    if (viscous) ldgAdd(gf, nrm, &fc);
+
+    for (0..n_vars) |n| {
+        f_comm.data[gf + pc.n_gfpts * n] = fc[n] * da_l;
+        f_comm.data[gf + pc.n_gfpts * (n + pc.n_vars)] = -fc[n] * da_r;
+    }
+}
+
+/// Add the common viscous normal flux, by LDG, the same expressions as
+/// `Faces.ldgViscousAdd`.
+///
+/// The bias is the mirror of the one `face_common_u` applies -- where the common
+/// solution leans one way, the common flux leans the other -- and a boundary
+/// takes its prescribed side outright rather than biasing against a side it does
+/// not have.
+fn ldgAdd(gf: u32, nrm: [n_dims]f64, fc: *[n_vars]f64) void {
+    // The states the viscous flux is evaluated at. `u_ldg` rather than `u`,
+    // which differ at a wall that prescribes a velocity but reflects it for the
+    // Riemann solve.
+    var ul: [n_vars]f64 = undefined;
+    var ur: [n_vars]f64 = undefined;
+    for (0..n_vars) |n| {
+        ul[n] = u_ldg.data[gf + pc.n_gfpts * n];
+        ur[n] = u_ldg.data[gf + pc.n_gfpts * (n + pc.n_vars)];
+    }
+
+    const slot = pc.n_gfpts * pc.n_vars * n_dims;
+    var dul: [n_vars][n_dims]f64 = undefined;
+    var dur: [n_vars][n_dims]f64 = undefined;
+    for (0..n_dims) |dim| {
+        for (0..n_vars) |n| {
+            const i = gf + pc.n_gfpts * (n + pc.n_vars * dim);
+            dul[n][dim] = du.data[i];
+            dur[n][dim] = du.data[i + slot];
+        }
+    }
+
+    var fl: [n_vars][n_dims]f64 = @splat(@splat(0.0));
+    var fr: [n_vars][n_dims]f64 = @splat(@splat(0.0));
+    viscFlux(ul, dul, &fl);
+    viscFlux(ur, dur, &fr);
+
+    var fnl: f64 = undefined;
+    var fnr: f64 = undefined;
+
+    // A boundary has already had its gradient prescribed; that is the answer.
+    const interior = gf < pc.n_gfpts_int;
+    const wl: f64 = if (interior) 0.5 - pc.ldg_b else 0.0;
+    const wr: f64 = if (interior) 0.5 + pc.ldg_b else 1.0;
+
+    for (0..n_vars) |n| {
+        fnl = 0.0;
+        fnr = 0.0;
+        for (0..n_dims) |d| {
+            fnl += fl[n][d] * nrm[d];
+            fnr += fr[n][d] * nrm[d];
+        }
+        fc[n] += wl * fnl + wr * fnr + pc.ldg_tau * (ul[n] - ur[n]);
+    }
+}
+
+/// The Navier-Stokes viscous flux, the same expressions as
+/// `flux.viscEulerNSAdd`. Fixed viscosity: Sutherland's law needs a `pow`, and a
+/// case asking for it keeps the step on the CPU.
+fn viscFlux(u_in: [n_vars]f64, dU: [n_vars][n_dims]f64, f: *[n_vars][n_dims]f64) void {
+    const inv_rho = 1.0 / u_in[0];
+
+    var vel: [n_dims]f64 = undefined;
+    var ke: f64 = 0.0;
+    for (0..n_dims) |d| {
+        vel[d] = u_in[1 + d] * inv_rho;
+        ke += vel[d] * vel[d];
+    }
+    const e_int = u_in[i_energy] * inv_rho - 0.5 * ke;
+
+    var dvel: [n_dims][n_dims]f64 = undefined;
+    for (0..n_dims) |d| {
+        for (0..n_dims) |dim| {
+            dvel[d][dim] = (dU[1 + d][dim] - dU[0][dim] * vel[d]) * inv_rho;
+        }
+    }
+
+    var de: [n_dims]f64 = undefined;
+    for (0..n_dims) |dim| {
+        var dke: f64 = 0.0;
+        for (0..n_dims) |d| dke += vel[d] * dvel[d][dim];
+        dke = 0.5 * ke * dU[0][dim] + u_in[0] * dke;
+        de[dim] = (dU[i_energy][dim] - dke - dU[0][dim] * e_int) * inv_rho;
+    }
+
+    var trace: f64 = 0.0;
+    for (0..n_dims) |d| trace += dvel[d][d];
+    const diag = trace / 3.0;
+
+    var tau: [n_dims][n_dims]f64 = undefined;
+    for (0..n_dims) |i| {
+        for (0..n_dims) |j| {
+            tau[i][j] = pc.mu * (dvel[i][j] + dvel[j][i]);
+            if (i == j) tau[i][j] -= 2.0 * pc.mu * diag;
+        }
+    }
+
+    for (0..n_dims) |dim| {
+        var work: f64 = 0.0;
+        for (0..n_dims) |d| {
+            f.*[1 + d][dim] -= tau[d][dim];
+            work += vel[d] * tau[d][dim];
+        }
+        f.*[i_energy][dim] -= work + (pc.mu / pc.prandtl) * pc.gamma * de[dim];
     }
 }
 

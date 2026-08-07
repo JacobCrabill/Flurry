@@ -1139,11 +1139,18 @@ pub const Solver = struct {
                 if (viscous) {
                     const inv_det = 1.0 / s.jaco_det_spts.get(spt, e);
                     for (0..n_vars) |n| {
+                        // Read the whole reference gradient out before writing
+                        // any of it back: every physical component needs every
+                        // reference one, so converting in place would feed the
+                        // second component the first component's answer. On a
+                        // Cartesian mesh the adjugate is diagonal and the cross
+                        // terms are zero, which hides it completely.
+                        var ref: [nd]f64 = undefined;
+                        for (0..nd) |d| ref[d] = s.du_spts.get(d, spt, n, e);
+
                         for (0..nd) |d1| {
                             var sum: f64 = 0.0;
-                            for (0..nd) |d2| {
-                                sum += s.du_spts.get(d2, spt, n, e) * adj[d2][d1];
-                            }
+                            for (0..nd) |d2| sum += ref[d2] * adj[d2][d1];
                             du[n][d1] = sum * inv_det;
                             // Publish the physical gradient: the viscous face
                             // flux and any gradient output both want it.

@@ -155,6 +155,64 @@ test "Euler flux matches its closed form" {
     try testing.expectApproxEqRel(rho * v * h, res.f[3][1], 1e-12);
 }
 
+test "the NS viscous stress is traceless and its heat flux is Fourier's law" {
+    // The parts the shear test above does not reach: Stokes' hypothesis, which
+    // makes the stress deviatoric, and the conduction term. Both in 3D, where
+    // the trace has three terms rather than two.
+    const p: flux.FlowParams = .{ .gamma = 1.4, .prandtl = 0.72, .mu = 2e-3, .fix_vis = true };
+    const rho = 1.2;
+    const state: [5]f64 = .{ rho, 0, 0, 0, 3.0 }; // at rest, so velocity gradients are clean
+
+    // Isotropic expansion: du/dx = dv/dy = dw/dz = a. The trace subtraction
+    // removes it entirely, so a uniformly expanding fluid carries no stress.
+    {
+        const a = 0.7;
+        var du: [5][3]f64 = @splat(@splat(0.0));
+        for (0..3) |d| du[1 + d][d] = rho * a;
+
+        var f: [5][3]f64 = @splat(@splat(0.0));
+        flux.viscEulerNSAdd(3, state, du, &f, p);
+        for (0..3) |i| {
+            for (0..3) |j| try testing.expectApproxEqAbs(@as(f64, 0.0), f[1 + i][j], 1e-14);
+        }
+    }
+
+    // Uniaxial stretching: du/dx = a alone. Then tau_xx = 4/3 mu a and the two
+    // transverse normal stresses are -2/3 mu a each, which sum to zero.
+    {
+        const a = 0.5;
+        var du: [5][3]f64 = @splat(@splat(0.0));
+        du[1][0] = rho * a;
+
+        var f: [5][3]f64 = @splat(@splat(0.0));
+        flux.viscEulerNSAdd(3, state, du, &f, p);
+        // The flux carries -tau
+        try testing.expectApproxEqRel(-4.0 / 3.0 * p.mu * a, f[1][0], 1e-12);
+        try testing.expectApproxEqRel(2.0 / 3.0 * p.mu * a, f[2][1], 1e-12);
+        try testing.expectApproxEqRel(2.0 / 3.0 * p.mu * a, f[3][2], 1e-12);
+
+        var trace: f64 = 0.0;
+        for (0..3) |d| trace += f[1 + d][d];
+        try testing.expectApproxEqAbs(@as(f64, 0.0), trace, 1e-14);
+    }
+
+    // Conduction: at rest with uniform density, the internal energy gradient is
+    // dE/dx / rho, and the energy flux is -(mu/Pr) gamma de/dx.
+    {
+        const dE = 0.9;
+        var du: [5][3]f64 = @splat(@splat(0.0));
+        du[4][1] = dE;
+
+        var f: [5][3]f64 = @splat(@splat(0.0));
+        flux.viscEulerNSAdd(3, state, du, &f, p);
+        const expect = -(p.mu / p.prandtl) * p.gamma * (dE / rho);
+        try testing.expectApproxEqRel(expect, f[4][1], 1e-12);
+        // and nothing in the other directions, nor in the momentum equations
+        try testing.expectApproxEqAbs(@as(f64, 0.0), f[4][0], 1e-14);
+        for (0..3) |d| try testing.expectApproxEqAbs(@as(f64, 0.0), f[1 + d][1], 1e-14);
+    }
+}
+
 test "viscous NS flux vanishes for a uniform state and is symmetric" {
     const p: flux.FlowParams = .{ .gamma = 1.4, .prandtl = 0.72, .mu = 1e-3, .fix_vis = true };
     const state: [4]f64 = .{ 1.0, 0.3, -0.2, 2.5 };
@@ -2073,5 +2131,78 @@ test "viscous: free-stream is preserved with the viscous terms on" {
                 }
             }
         }
+    }
+}
+
+/// A linear physical field on a non-affine mesh: the bilinear (or trilinear)
+/// map sends it to a reference field the space holds exactly, so the physical
+/// gradient must come out exactly `(1, 2, 3)` and the diffusive divergence
+/// exactly zero.
+fn checkGradientOnDistorted(gpa: std.mem.Allocator, comptime nd: usize, order: u8) !void {
+    var config = if (nd == 3)
+        testConfig3D(order, .adv_diff, 4, 4, 4)
+    else
+        testConfig(order, .adv_diff, true, 4, 4);
+    config.equation.viscous = true;
+    config.equation.advdiff_A = .{ 0, 0, 0 };
+    config.equation.advdiff_D = 0.3;
+
+    var mesh = if (nd == 3)
+        try testMesh3DDistorted(gpa, &config)
+    else
+        try testMeshDistorted(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh, .{});
+    defer s.deinit();
+
+    const ele = s.element();
+    for (0..ele.n_spts) |spt| {
+        for (0..s.n_eles) |e| {
+            var u: f64 = 0.0;
+            for (0..nd) |d| {
+                u += @as(f64, @floatFromInt(d + 1)) * s.coord_spts.get(spt, d, e);
+            }
+            s.u_spts.at(spt, 0, e).* = u;
+        }
+    }
+
+    try s.computeResidual(0);
+
+    for (0..s.n_eles) |e| {
+        var on_bnd = false;
+        for (0..mesh.c2nf.items[e]) |j| {
+            if (mesh.c2b.get(e, j) != 0) on_bnd = true;
+        }
+        if (on_bnd) continue;
+
+        for (0..ele.n_spts) |spt| {
+            for (0..nd) |d| {
+                try testing.expectApproxEqAbs(
+                    @as(f64, @floatFromInt(d + 1)),
+                    s.du_spts.get(d, spt, 0, e),
+                    1e-10,
+                );
+            }
+            // A constant gradient diffuses to nothing
+            try testing.expectApproxEqAbs(
+                @as(f64, 0.0),
+                s.divf_spts.get(0, spt, 0, e) / s.jaco_det_spts.get(spt, e),
+                1e-9,
+            );
+        }
+    }
+}
+
+test "viscous: the physical gradient is exact on a non-affine mesh" {
+    // The reference-to-physical conversion contracts the reference gradient
+    // with the metric adjugate, so every physical component needs every
+    // reference one. Converting in place fed the second component the first's
+    // answer -- which a Cartesian mesh hides completely, because there the
+    // adjugate is diagonal and the cross terms are zero. Only a mesh whose
+    // cells are not parallelograms exercises them.
+    for ([_]u8{ 2, 3 }) |order| {
+        try checkGradientOnDistorted(testing.allocator, 2, order);
+        try checkGradientOnDistorted(testing.allocator, 3, order);
     }
 }

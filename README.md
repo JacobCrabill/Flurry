@@ -43,6 +43,12 @@ nothing else — orders 1–4 come out at **2.02, 3.00, 3.98, 5.00** against a d
 The same wave in 3D, `sin πx sin πy sin πz` on a triply-periodic box, gives **2.04, 3.00, 4.03** at
 orders 1–3.
 
+Switching diffusion on — the same wave, `advdiff_D = 0.1` — brings the viscous path into what is
+measured: the corrected gradient, the common solution and the LDG interface flux. Orders 1–3 come
+out at **2.04/1.98, 3.03/2.98, 3.95/3.96** in 2D and **2.13/2.07, 3.05/3.03, 3.93** in 3D, again
+against p+1. Note that diffusion's explicit step limit goes as h² rather than h, so a viscous sweep
+runs a few thousand steps per mesh.
+
 The isentropic vortices reach p+1 exactly at t = 0, i.e. for the initial collocation, but converge
 more slowly once integrated in time (~2.4 at order 2, ~4.3 at orders 3 and 4). That is not explained
 by the time step, the domain size or the error quadrature, all of which were varied and ruled out;
@@ -137,13 +143,17 @@ z-momentum residual stays at ~1e-15, so nothing leaks into the third direction.
 
 ## What works so far
 
-Inviscid flow in 2D on quadrilateral meshes and in 3D on hexahedral ones: Gmsh 2.2 and 4.1 input,
-Cartesian mesh generation, periodic boundaries, characteristic/slip-wall/supersonic/symmetry
-boundaries, explicit Euler, RK44 and Jameson-RK time stepping, ParaView output, and analytic test
-cases with error measurement.
+Inviscid and viscous flow in 2D on quadrilateral meshes and in 3D on hexahedral ones: Gmsh 2.2 and
+4.1 input, Cartesian mesh generation, periodic boundaries,
+characteristic/slip-wall/supersonic/symmetry boundaries, no-slip walls, explicit Euler, RK44 and
+Jameson-RK time stepping, ParaView output, and analytic test cases with error measurement.
+
+The viscous terms are verified in both dimensions: a quadratic field diffuses to its exact analytic
+divergence at roundoff, and the diffusing sine wave converges at p+1. They have no GPU kernel yet,
+so a viscous case runs on the CPU.
 
 Not yet: a CFL-derived time step (`time.dt` has to be given), restarts, triangles, tets and prisms,
-and the viscous terms — which are written but unverified. `zig build convergence` sweeps 2D only.
+and GPU kernels for the viscous path. `zig build convergence` sweeps 2D only.
 
 ```sh
 zig build test

@@ -1296,8 +1296,9 @@ test "common solution is single-valued and biased by ldg_b" {
     f.computeCommonU();
 
     try testing.expectApproxEqRel(@as(f64, 2.0), f.u_comm.get(0, 0, 0), 1e-12);
-    // Both sides see the same value, signed for each one's outward normal
-    try testing.expectApproxEqRel(@as(f64, -2.0), f.u_comm.get(1, 0, 0), 1e-12);
+    // Both sides see the same value, unscaled and unsigned: this is the DFR
+    // interpolant's endpoint, not a normal flux
+    try testing.expectApproxEqRel(@as(f64, 2.0), f.u_comm.get(1, 0, 0), 1e-12);
 
     // Centred biasing averages the two
     config.flux.ldg_b = 0.0;
@@ -1889,4 +1890,188 @@ fn totalMass(s: *const Solver) f64 {
         }
     }
     return sum;
+}
+
+// ---------------------------------------------------------------------------
+// Viscous terms
+// ---------------------------------------------------------------------------
+
+/// A polynomial the solution space represents exactly, its gradient, and its
+/// Laplacian -- so a diffusive residual has a closed form to be checked against.
+///
+/// `u = x^2 + 2 y^2 (+ 3 z^2)`, so `grad u = (2x, 4y, 6z)` and `lap u = 2 + 4 (+ 6)`.
+fn quadratic(comptime nd: usize, x: [3]f64) f64 {
+    var u: f64 = 0.0;
+    for (0..nd) |d| u += @as(f64, @floatFromInt(d + 1)) * x[d] * x[d];
+    return u;
+}
+
+fn quadraticGrad(comptime nd: usize, x: [3]f64, d: usize) f64 {
+    _ = nd;
+    return 2.0 * @as(f64, @floatFromInt(d + 1)) * x[d];
+}
+
+fn quadraticLaplacian(comptime nd: usize) f64 {
+    var sum: f64 = 0.0;
+    for (0..nd) |d| sum += 2.0 * @as(f64, @floatFromInt(d + 1));
+    return sum;
+}
+
+/// Run the full viscous residual on a quadratic field and check both the
+/// physical gradient and the diffusive divergence against their closed forms.
+///
+/// Only cells with no boundary face are checked: the field is not periodic and
+/// the boundary states are not it, so a cell touching one is measuring the
+/// boundary condition rather than the viscous discretization.
+fn checkDiffusionExact(gpa: std.mem.Allocator, comptime nd: usize, order: u8) !void {
+    var config = if (nd == 3)
+        testConfig3D(order, .adv_diff, 4, 4, 4)
+    else
+        testConfig(order, .adv_diff, true, 4, 4);
+    config.equation.viscous = true;
+    config.equation.advdiff_A = .{ 0, 0, 0 };
+    config.equation.advdiff_D = 0.3;
+
+    var mesh = try testMesh(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh, .{});
+    defer s.deinit();
+
+    const ele = s.element();
+    for (0..ele.n_spts) |spt| {
+        for (0..s.n_eles) |e| {
+            var x: [3]f64 = @splat(0.0);
+            for (0..nd) |d| x[d] = s.coord_spts.get(spt, d, e);
+            s.u_spts.at(spt, 0, e).* = quadratic(nd, x);
+        }
+    }
+
+    try s.computeResidual(0);
+
+    // div(-D grad u) = -D lap(u)
+    const exact_div = -config.equation.advdiff_D * quadraticLaplacian(nd);
+
+    var n_interior: usize = 0;
+    for (0..s.n_eles) |e| {
+        var on_bnd = false;
+        for (0..mesh.c2nf.items[e]) |j| {
+            if (mesh.c2b.get(e, j) != 0) on_bnd = true;
+        }
+        if (on_bnd) continue;
+        n_interior += 1;
+
+        for (0..ele.n_spts) |spt| {
+            var x: [3]f64 = @splat(0.0);
+            for (0..nd) |d| x[d] = s.coord_spts.get(spt, d, e);
+
+            // `computeFluxSpts` leaves `du_spts` holding the physical gradient
+            for (0..nd) |d| {
+                try testing.expectApproxEqAbs(
+                    quadraticGrad(nd, x, d),
+                    s.du_spts.get(d, spt, 0, e),
+                    1e-10,
+                );
+            }
+
+            const got = s.divf_spts.get(0, spt, 0, e) / s.jaco_det_spts.get(spt, e);
+            try testing.expectApproxEqAbs(exact_div, got, 1e-9);
+        }
+    }
+    try testing.expect(n_interior > 0); // or this proves nothing
+}
+
+test "viscous: a quadratic's gradient and diffusive divergence are exact in 2D" {
+    // The whole viscous chain at once -- the corrected DFR gradient, the common
+    // solution, and the LDG common flux -- against a field the space represents
+    // exactly, so anything but roundoff is a defect rather than truncation.
+    //
+    // This is what caught both halves of the original break: `computeCommonU`
+    // scaling the common solution as if it were a flux, and `computeCommonF`
+    // having no viscous part at all.
+    for ([_]u8{ 2, 3, 4 }) |order| {
+        try checkDiffusionExact(testing.allocator, 2, order);
+    }
+}
+
+test "viscous: a quadratic's gradient and diffusive divergence are exact in 3D" {
+    for ([_]u8{ 2, 3 }) |order| {
+        try checkDiffusionExact(testing.allocator, 3, order);
+    }
+}
+
+test "viscous: the common flux is single-valued across an interface" {
+    const gpa = testing.allocator;
+
+    // Both sides of a global flux point must see the same physical flux, with
+    // only the sign and each element's own face measure differing. The viscous
+    // part accumulates onto the convective one, so a mistake there shows up as
+    // the two slots disagreeing -- and conservation would be lost with it.
+    var config = testConfig(3, .euler_ns, true, 4, 4);
+    var mesh = try testMesh(gpa, &config);
+    defer mesh.deinit();
+
+    var s = try Solver.init(gpa, &config, &mesh, .{});
+    defer s.deinit();
+
+    try s.initializeU();
+    // Perturb, so the gradients are not all zero
+    const ele = s.element();
+    for (0..ele.n_spts) |spt| {
+        for (0..s.n_eles) |e| {
+            const x = s.coord_spts.get(spt, 0, e);
+            const y = s.coord_spts.get(spt, 1, e);
+            s.u_spts.at(spt, 0, e).* += 0.05 * @sin(x) * @cos(y);
+            s.u_spts.at(spt, 1, e).* += 0.05 * @cos(x) * @sin(y);
+        }
+    }
+    try s.computeResidual(0);
+
+    for (0..mesh.n_gfpts_int) |gf| {
+        for (0..s.n_vars) |n| {
+            const l = s.faces.f_comm.get(0, n, gf) / s.faces.d_a.get(0, gf);
+            const r = s.faces.f_comm.get(1, n, gf) / s.faces.d_a.get(1, gf);
+            try testing.expectApproxEqAbs(l, -r, 1e-12);
+        }
+    }
+}
+
+test "viscous: free-stream is preserved with the viscous terms on" {
+    const gpa = testing.allocator;
+
+    // A uniform state has zero gradient, so every viscous term must vanish and
+    // the residual stay exactly zero -- boundary cells included. A viscous flux
+    // that did not vanish, or a boundary gradient condition that manufactured
+    // one, would show up here.
+    for ([_]u8{ 2, 3 }) |order| {
+        for ([_]bool{ false, true }) |three_d| {
+            var config = if (three_d)
+                testConfig3D(order, .euler_ns, 3, 3, 3)
+            else
+                testConfig(order, .euler_ns, true, 3, 3);
+            config.equation.viscous = true;
+
+            var mesh = try testMesh(gpa, &config);
+            defer mesh.deinit();
+
+            var s = try Solver.init(gpa, &config, &mesh, .{});
+            defer s.deinit();
+
+            try s.initializeU();
+            try s.computeResidual(0);
+
+            const ele = s.element();
+            for (0..s.n_eles) |e| {
+                for (0..ele.n_spts) |spt| {
+                    for (0..s.n_vars) |n| {
+                        try testing.expectApproxEqAbs(
+                            @as(f64, 0.0),
+                            s.divf_spts.get(0, spt, n, e),
+                            1e-9,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

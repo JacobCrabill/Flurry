@@ -258,18 +258,27 @@ pub const Faces = struct {
                     ug[0] = rho;
 
                     var v_sq: f64 = 0.0;
+                    var vw_sq: f64 = 0.0;
                     for (0..nd) |d| {
                         const vl = ul[1 + d] / rho;
                         const v = 2.0 * p.vel_wall[d] - vl;
                         ur[1 + d] = rho * v;
                         ug[1 + d] = rho * p.vel_wall[d];
                         v_sq += v * v;
+                        vw_sq += p.vel_wall[d] * p.vel_wall[d];
                     }
 
-                    // e_int is fixed by the wall temperature
+                    // e_int is fixed by the wall temperature. The prescribed
+                    // state carries the wall's own kinetic energy, matching the
+                    // momentum prescribed alongside it -- the two have to
+                    // describe the same state or the viscous flux sees a
+                    // velocity the energy does not account for. (ZEFR splits
+                    // this into a static and a moving case and drops the term
+                    // from the static one, where the wall velocity is zero and
+                    // it makes no difference.)
                     const cv_t = p.r_ref / (p.gamma - 1.0) * p.t_wall;
                     ur[nd + 1] = rho * (cv_t + 0.5 * v_sq);
-                    ug[nd + 1] = rho * cv_t;
+                    ug[nd + 1] = rho * (cv_t + 0.5 * vw_sq);
                 },
 
                 .adiabatic_noslip => {
@@ -380,10 +389,13 @@ pub const Faces = struct {
                 const ul = f.u_ldg.get(0, n, gf);
                 const ur = f.u_ldg.get(1, n, gf);
                 const uc = (0.5 + b) * ul + (0.5 - b) * ur;
-                // Both sides see the same value, scaled into each one's
-                // reference space and signed for its outward normal.
-                f.u_comm.at(0, n, gf).* = uc * f.d_a.get(0, gf);
-                f.u_comm.at(1, n, gf).* = -uc * f.d_a.get(1, gf);
+                // Both sides see the same value, and it is a *value*: unlike
+                // `f_comm`, which carries a normal flux and so needs the face
+                // measure and each element's own outward sign, this is fed to
+                // `oppD_fpts` as the DFR interpolant's endpoint, where a scaling
+                // or a sign would simply be wrong.
+                f.u_comm.at(0, n, gf).* = uc;
+                f.u_comm.at(1, n, gf).* = uc;
             }
         }
     }
@@ -395,9 +407,94 @@ pub const Faces = struct {
     /// (it already accounts for each element's own outward normal).
     pub fn computeCommonF(f: *Faces) void {
         switch (f.n_dims) {
-            2 => f.rusanov(2),
-            3 => f.rusanov(3),
+            inline 2, 3 => |nd| {
+                f.rusanov(nd);
+                if (f.config.equation.viscous) f.ldgViscousAdd(nd);
+            },
             else => unreachable,
+        }
+    }
+
+    /// Add the common viscous normal flux, by LDG.
+    ///
+    /// Without this the scheme is not just inaccurate but inconsistent: DFR
+    /// builds the flux polynomial from the solution points' flux inside the
+    /// element and the *common* flux at its faces, so a common flux missing its
+    /// viscous half describes a flux field that does not exist.
+    ///
+    /// The bias is the mirror of the one `computeCommonU` applies: where the
+    /// common solution leans toward one side, the common flux leans toward the
+    /// other. That alternation is what makes LDG stable, and it is why `ldg_b`
+    /// appears here with the opposite sign.
+    ///
+    /// `ldg_tau` penalizes the jump in the solution itself. It vanishes wherever
+    /// the solution is continuous, so it costs no accuracy on a converged field.
+    fn ldgViscousAdd(f: *Faces, comptime nd: usize) void {
+        const equation = f.config.equation.equation;
+        const n_vars = f.n_vars;
+        const tau = f.config.flux.ldg_tau;
+        const b = f.config.flux.ldg_b;
+
+        for (0..f.n_gfpts) |gf| {
+            // The states the viscous flux is evaluated at. These are `u_ldg`
+            // rather than `u`: at a no-slip wall the two differ, the ghost state
+            // being reflected so the Riemann average is the wall value while the
+            // viscous flux wants the wall value itself.
+            var ul: [nd + 2]f64 = @splat(0.0);
+            var ur: [nd + 2]f64 = @splat(0.0);
+            for (0..n_vars) |n| {
+                ul[n] = f.u_ldg.get(0, n, gf);
+                ur[n] = f.u_ldg.get(1, n, gf);
+            }
+
+            var dul: [nd + 2][nd]f64 = @splat(@splat(0.0));
+            var dur: [nd + 2][nd]f64 = @splat(@splat(0.0));
+            for (0..nd) |dim| {
+                for (0..n_vars) |n| {
+                    dul[n][dim] = f.du.get(0, dim, n, gf);
+                    dur[n][dim] = f.du.get(1, dim, n, gf);
+                }
+            }
+
+            var fl: [nd + 2][nd]f64 = @splat(@splat(0.0));
+            var fr: [nd + 2][nd]f64 = @splat(@splat(0.0));
+            switch (equation) {
+                .adv_diff => {
+                    var one_l: [1][nd]f64 = @splat(@splat(0.0));
+                    var one_r: [1][nd]f64 = @splat(@splat(0.0));
+                    flux.viscAdvDiffAdd(nd, .{dul[0]}, &one_l, f.params);
+                    flux.viscAdvDiffAdd(nd, .{dur[0]}, &one_r, f.params);
+                    fl[0] = one_l[0];
+                    fr[0] = one_r[0];
+                },
+                .euler_ns => {
+                    flux.viscEulerNSAdd(nd, ul, dul, &fl, f.params);
+                    flux.viscEulerNSAdd(nd, ur, dur, &fr, f.params);
+                },
+            }
+
+            var fnl: [nd + 2]f64 = @splat(0.0);
+            var fnr: [nd + 2]f64 = @splat(0.0);
+            for (0..n_vars) |n| {
+                for (0..nd) |d| {
+                    const nrm = f.norm.get(d, gf);
+                    fnl[n] += fl[n][d] * nrm;
+                    fnr[n] += fr[n][d] * nrm;
+                }
+            }
+
+            // A boundary has no second side to bias against: the condition has
+            // already prescribed the gradient, and that is the answer. This is
+            // ZEFR's `LDG_bias`, which is set for every boundary flux point.
+            const interior = gf < f.n_gfpts_int;
+            const wl: f64 = if (interior) 0.5 - b else 0.0;
+            const wr: f64 = if (interior) 0.5 + b else 1.0;
+
+            for (0..n_vars) |n| {
+                const fc = wl * fnl[n] + wr * fnr[n] + tau * (ul[n] - ur[n]);
+                f.f_comm.at(0, n, gf).* += fc * f.d_a.get(0, gf);
+                f.f_comm.at(1, n, gf).* -= fc * f.d_a.get(1, gf);
+            }
         }
     }
 

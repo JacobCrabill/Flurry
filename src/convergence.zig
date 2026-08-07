@@ -60,6 +60,14 @@ const Study = struct {
     /// 8x8 mesh of a [-5,5] domain it spans 1.6 cells and the measured rate is
     /// pre-asymptotic noise.
     meshes: []const u32,
+    /// Diffusion coefficient. Non-zero turns the viscous terms on, which brings
+    /// the gradient chain and the LDG interface flux into what is measured.
+    diff_coeff: f64 = 0.0,
+    /// Fraction of `tfinal` this study integrates for. Diffusion's explicit
+    /// step limit goes as h^2, so a viscous sweep costs a few thousand steps
+    /// per mesh at t = 1; a quarter of that still decays the wave to 60% of its
+    /// amplitude, which is plenty for the error to be the scheme's.
+    time_scale: f64 = 1.0,
 };
 
 const studies = [_]Study{
@@ -73,6 +81,21 @@ const studies = [_]Study{
         .speed = 1.5,
         .field = "u",
         .meshes = &coarse,
+    },
+    // The same wave with diffusion switched on, which is the only case here
+    // whose exact solution exercises the viscous path: the corrected gradient,
+    // the common solution and the LDG interface flux. Still exactly periodic,
+    // so the rate is again the discretization's alone.
+    .{
+        .name = "diffusing sine wave",
+        .test_case = .sine_wave,
+        .equation = .adv_diff,
+        .half = 1.0,
+        .speed = 1.5,
+        .field = "u",
+        .meshes = &coarse,
+        .diff_coeff = 0.1,
+        .time_scale = 0.25,
     },
     // The real target: a nonlinear system, where the flux, the wave speeds and
     // the Riemann solver all participate.
@@ -136,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
             \\ domain    [-{d}, {d}]^2, periodic
             \\ measured  L2 error in {s} at t = {d}
             \\
-        , .{ study.name, study.half, study.half, study.field, tfinal });
+        , .{ study.name, study.half, study.half, study.field, tfinal * study.time_scale });
 
         var worst_shortfall: f64 = 0.0;
 
@@ -147,10 +170,20 @@ pub fn main(init: std.process.Init) !void {
 
             // Sized for the finest mesh, so every run on this curve shares it
             const h_min = 2.0 * study.half / @as(f64, @floatFromInt(study.meshes[study.meshes.len - 1]));
-            const dt_target = cfl * h_min /
-                (study.speed * @as(f64, @floatFromInt(2 * order + 1)));
-            const n_steps: u32 = if (tfinal <= 0.0) 0 else @intFromFloat(@ceil(tfinal / dt_target));
-            const dt = if (n_steps == 0) dt_target else tfinal / @as(f64, @floatFromInt(n_steps));
+            const p2 = @as(f64, @floatFromInt(2 * order + 1));
+            var dt_target = cfl * h_min / (study.speed * p2);
+            if (study.diff_coeff > 0.0) {
+                // Diffusion's explicit limit goes as h^2, not h, and it is far
+                // the tighter of the two on any mesh worth measuring on. The
+                // 0.5 is a safety factor: at twice this step the order-2 sweep
+                // diverges on its finest mesh, and at half it the measured
+                // error does not move.
+                const dt_diff = 0.5 * cfl * h_min * h_min / (study.diff_coeff * p2 * p2);
+                dt_target = @min(dt_target, dt_diff);
+            }
+            const t_end = tfinal * study.time_scale;
+            const n_steps: u32 = if (t_end <= 0.0) 0 else @intFromFloat(@ceil(t_end / dt_target));
+            const dt = if (n_steps == 0) dt_target else t_end / @as(f64, @floatFromInt(n_steps));
 
             var prev_err: ?f64 = null;
             for (study.meshes) |n| {
@@ -202,10 +235,10 @@ fn studyConfig(study: Study, order: u8, n: u32, dt: f64, n_steps: u32) cfg.Confi
     config.core = .{ .n_dims = 2, .mesh_file = "", .order = order };
     config.equation = .{
         .equation = study.equation,
-        .viscous = false,
+        .viscous = study.diff_coeff > 0.0,
         // Not aligned with the mesh, so the tangential direction is exercised
         .advdiff_A = .{ 1.0, 0.5, 0.0 },
-        .advdiff_D = 0.0,
+        .advdiff_D = study.diff_coeff,
     };
     config.time = .{ .dt_scheme = .rk44, .n_steps = n_steps, .dt = dt };
     config.restart = null;
